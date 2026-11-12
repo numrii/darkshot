@@ -3,6 +3,8 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
@@ -12,6 +14,7 @@ use eframe::egui::{
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_INTERNALPAINT, RDW_UPDATENOW};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -19,7 +22,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowRect, KillTimer, SetForegroundWindow, SetTimer, SetWindowPos,
-    HWND_TOPMOST, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEMOVE, WM_NCDESTROY, WM_TIMER,
+    HWND_TOPMOST, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
 };
 
 use winit::event_loop::{DeviceEvents, EventLoop};
@@ -30,13 +33,31 @@ use crate::AnyResult;
 const GRAB_TOLERANCE: f32 = 6.0;
 const HANDLE_SIZE: f32 = 7.0;
 
-/// Print a timing line (startup phases, then one per frame) when `DARKSHOT_TRACE` is set (debugging aid).
+/// Where trace lines go: `--trace` writes `darkshot-trace.log` in the temp folder,
+/// the `DARKSHOT_TRACE` environment variable writes to stderr. `None` = tracing off.
+fn trace_sink() -> Option<&'static Mutex<Box<dyn Write + Send>>> {
+    static SINK: OnceLock<Option<Mutex<Box<dyn Write + Send>>>> = OnceLock::new();
+    SINK.get_or_init(|| {
+        if std::env::args().any(|a| a == "--trace") {
+            let path = std::env::temp_dir().join("darkshot-trace.log");
+            let file = std::fs::File::create(path).ok()?;
+            Some(Mutex::new(Box::new(std::io::LineWriter::new(file)) as Box<dyn Write + Send>))
+        } else if std::env::var_os("DARKSHOT_TRACE").is_some() {
+            Some(Mutex::new(Box::new(std::io::stderr()) as Box<dyn Write + Send>))
+        } else {
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Record a timing line (startup phases, then one per frame) when tracing is on.
 fn trace(what: &str) {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-    if *ENABLED.get_or_init(|| std::env::var_os("DARKSHOT_TRACE").is_some()) {
-        eprintln!("TRACE {:>9.1}ms {what}", elapsed.as_secs_f64() * 1000.0);
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed();
+    if let Some(sink) = trace_sink() {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let _ = writeln!(sink.lock().unwrap(), "TRACE {ms:>9.1}ms {what}");
     }
 }
 
@@ -66,8 +87,8 @@ pub fn run() -> AnyResult<()> {
                 (b.right - b.left) as f32 / scale,
                 (b.bottom - b.top) as f32 / scale,
             ]),
-        // Present immediately with a one-frame queue: with the default (vsync, two
-        // frames) a dragged selection visibly trails the mouse cursor.
+        // Present immediately with a one-frame queue, for the lowest latency between
+        // the cursor and what is drawn under it.
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration::default().with_surface_config(
             eframe::egui_wgpu::SurfaceConfig {
                 present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
@@ -158,17 +179,52 @@ fn hwnd_of(window: &impl HasWindowHandle) -> Option<HWND> {
 
 /// Minimum time between mouse-move messages passed on to the app (500 per second).
 const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(2);
+/// If the mouse is moving and no frame has been painted for this long, paint one now.
+const MAX_PAINT_DELAY: Duration = Duration::from_millis(5);
 const MOUSE_THROTTLE_ID: usize = 0xDA5C_5407;
 
-/// Window subclass that rate-limits `WM_MOUSEMOVE`.
+/// Message statistics gathered between two frames, for `--trace`.
+#[derive(Clone, Copy, Default)]
+struct MsgStats {
+    moves: u32,
+    moves_forwarded: u32,
+    other: u32,
+    forced_paints: u32,
+    /// The slowest single message: (message id, microseconds).
+    slowest: (u32, u32),
+    /// Duration of the last WM_PAINT (a whole frame including present), microseconds.
+    paint_us: u32,
+}
+
+thread_local! {
+    static LAST_FORWARDED: Cell<Option<Instant>> = const { Cell::new(None) };
+    static LAST_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static PENDING: Cell<Option<(WPARAM, LPARAM)>> = const { Cell::new(None) };
+    static STATS: Cell<MsgStats> = const { Cell::new(MsgStats {
+        moves: 0, moves_forwarded: 0, other: 0, forced_paints: 0, slowest: (0, 0), paint_us: 0,
+    }) };
+}
+
+fn bump(f: impl FnOnce(&mut MsgStats)) {
+    let mut stats = STATS.get();
+    f(&mut stats);
+    STATS.set(stats);
+}
+
+/// Window subclass that keeps the overlay repainting under a flood of mouse input.
 ///
 /// Windows only delivers paint messages when the message queue is otherwise empty. A
-/// mouse polling at up to 8000 Hz keeps a mouse-move pending almost all the time, and
-/// each one costs real work in winit and egui, so repaints get starved and a dragged
-/// selection moves in jerks. Dropping the surplus here, before any of that work, keeps
-/// the queue draining. The latest dropped position is never lost: it is delivered
-/// before any button or wheel message, or by a short timer once the mouse stops.
-unsafe extern "system" fn throttle_mouse_moves(
+/// mouse polling at up to 8000 Hz keeps a mouse-move pending almost all the time, so
+/// during fast movement repaints starve for hundreds of milliseconds and a dragged
+/// selection moves in jerks. Two measures, both applied before winit and egui see
+/// the message:
+///
+/// 1. Rate-limit `WM_MOUSEMOVE`, so most of the flood costs almost nothing. The
+///    latest dropped position is never lost: it is delivered before any button or
+///    wheel message, or by a short timer once the mouse stops.
+/// 2. Do not wait for an idle queue: when a move is passed on and the last frame is
+///    older than `MAX_PAINT_DELAY`, paint synchronously right away.
+unsafe extern "system" fn pump_guard(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -176,13 +232,10 @@ unsafe extern "system" fn throttle_mouse_moves(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    thread_local! {
-        static LAST_FORWARDED: Cell<Option<Instant>> = const { Cell::new(None) };
-        static PENDING: Cell<Option<(WPARAM, LPARAM)>> = const { Cell::new(None) };
-    }
     unsafe {
         match msg {
             WM_MOUSEMOVE => {
+                bump(|s| s.moves += 1);
                 let now = Instant::now();
                 let too_soon = LAST_FORWARDED
                     .get()
@@ -195,6 +248,26 @@ unsafe extern "system" fn throttle_mouse_moves(
                 }
                 LAST_FORWARDED.set(Some(now));
                 PENDING.set(None);
+                bump(|s| s.moves_forwarded += 1);
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+
+                let overdue = LAST_PAINT
+                    .get()
+                    .is_none_or(|last| now.duration_since(last) >= MAX_PAINT_DELAY);
+                if overdue {
+                    bump(|s| s.forced_paints += 1);
+                    // Sends WM_PAINT synchronously; it re-enters this function below.
+                    RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT | RDW_UPDATENOW);
+                }
+                return result;
+            }
+            WM_PAINT => {
+                let start = Instant::now();
+                LAST_PAINT.set(Some(start));
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                let us = start.elapsed().as_micros() as u32;
+                bump(|s| s.paint_us = us);
+                return result;
             }
             WM_TIMER if wparam == MOUSE_THROTTLE_ID => {
                 KillTimer(hwnd, MOUSE_THROTTLE_ID);
@@ -212,11 +285,20 @@ unsafe extern "system" fn throttle_mouse_moves(
                 }
             }
             WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(throttle_mouse_moves), MOUSE_THROTTLE_ID);
+                RemoveWindowSubclass(hwnd, Some(pump_guard), MOUSE_THROTTLE_ID);
             }
             _ => {}
         }
-        DefSubclassProc(hwnd, msg, wparam, lparam)
+        let start = Instant::now();
+        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+        let us = start.elapsed().as_micros() as u32;
+        bump(|s| {
+            s.other += 1;
+            if us > s.slowest.1 {
+                s.slowest = (msg, us);
+            }
+        });
+        result
     }
 }
 
@@ -387,7 +469,7 @@ impl Overlay {
             // something on screen is moving. The window is still hidden at this point.
             let disable: i32 = 1;
             unsafe {
-                SetWindowSubclass(hwnd, Some(throttle_mouse_moves), MOUSE_THROTTLE_ID, 0);
+                SetWindowSubclass(hwnd, Some(pump_guard), MOUSE_THROTTLE_ID, 0);
                 DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_TRANSITIONS_FORCEDISABLED as u32,
@@ -537,7 +619,6 @@ impl eframe::App for Overlay {
                 ));
             }
         }
-        trace("frame");
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
             let area = Rect::from_min_max(to_pt(m.min), to_pt(m.max));
@@ -552,6 +633,22 @@ impl eframe::App for Overlay {
             self.desktop.monitors.iter().position(|m| m.contains(p))
         }) {
             self.current_monitor = i;
+        }
+        if trace_sink().is_some() {
+            // Per frame: where egui thinks the pointer is vs. where Windows says it is
+            // right now (both in desktop pixels), and where the selection was drawn.
+            let mut real = POINT { x: 0, y: 0 };
+            unsafe { GetCursorPos(&mut real) };
+            let b = self.desktop.bounds;
+            let seen = hover.map(to_px).unwrap_or(Pos2::new(-1.0, -1.0));
+            let sel = self.selection.map_or(Pos2::new(-1.0, -1.0), |s| s.min);
+            let m = STATS.take();
+            trace(&format!(
+                "frame egui={:.0},{:.0} real={},{} sel={:.0},{:.0} drag={} moves={} fwd={} other={} forced={} slowest=0x{:04x}:{}us paint={}us",
+                seen.x, seen.y, real.x - b.left, real.y - b.top, sel.x, sel.y,
+                self.drag.is_some() as u8,
+                m.moves, m.moves_forwarded, m.other, m.forced_paints, m.slowest.0, m.slowest.1, m.paint_us
+            ));
         }
 
         if response.drag_started() {

@@ -131,7 +131,13 @@ fn start_capture(overlay: &Mutex<Option<Child>>) {
         }
     }
     let spawned = std::env::current_exe()
-        .and_then(|exe| Command::new(exe).arg("--capture").spawn());
+        .and_then(|exe| {
+            // Pass our own flags (such as `--trace`) on to the overlay.
+            Command::new(exe)
+                .arg("--capture")
+                .args(std::env::args().skip(1).filter(|a| a != "--capture"))
+                .spawn()
+        });
     match spawned {
         Ok(child) => *slot = Some(child),
         Err(e) => {

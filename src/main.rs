@@ -9,6 +9,7 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 /// `darkshot`            sits in the tray and waits for the hotkey.
 /// `darkshot --capture`  takes one capture right now and exits.
+/// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder.
 fn main() -> AnyResult<()> {
     if std::env::args().any(|a| a == "--capture") {
         overlay::run()
