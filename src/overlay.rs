@@ -3,6 +3,8 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -471,7 +473,7 @@ enum Tool {
 }
 
 /// What the current mouse drag is doing.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Action {
     /// Create, move or resize the capture region.
     Region(Drag),
@@ -480,7 +482,8 @@ enum Action {
     MoveShape { index: usize, start: Pos2, orig: Annotation },
     /// Resizing a rectangle or ellipse by one of its handles.
     ResizeBox { index: usize, drag: Drag },
-    /// Dragging one end of a line or arrow; `end_b` = the end (tip) rather than the start.
+    /// Dragging one end of a straight line, arrow, pen or marker stroke; `end_b` = the
+    /// end (tip) rather than the start.
     MoveEnd { index: usize, end_b: bool },
 }
 
@@ -492,6 +495,10 @@ const SWATCHES: [Color32; 4] = [
     Color32::from_rgb(0xFF, 0xB2, 0x24),
 ];
 const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
+/// Default highlighter thickness.
+const MARKER_WIDTH: f32 = 16.0;
+/// Freehand points closer than this to the previous one are skipped while drawing.
+const MIN_POINT_SPACING: f32 = 1.5;
 
 struct Overlay {
     desktop: Desktop,
@@ -515,9 +522,18 @@ struct Overlay {
     dash: Dash,
     head: ArrowHead,
     double_head: bool,
+    /// The highlighter keeps its own thickness, swapped in and out with the tool.
+    other_width: f32,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
+    /// Every point of the pen or marker stroke being drawn, kept even while Shift shows
+    /// it as a straight line, so releasing Shift returns to the freehand path.
+    stroke_points: Vec<Pos2>,
+    /// Finished freehand strokes rasterised for display, so they look on screen exactly
+    /// as in the output (egui would darken the translucent marker where it overlaps
+    /// itself). Keyed by the stroke's content; entries not drawn in a frame are dropped.
+    layers: HashMap<u64, (egui::TextureHandle, Rect)>,
 
     error: Option<String>,
 }
@@ -546,9 +562,12 @@ impl Overlay {
             dash: Dash::Solid,
             head: ArrowHead::Triangle,
             double_head: false,
+            other_width: MARKER_WIDTH,
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
+            stroke_points: Vec::new(),
+            layers: HashMap::new(),
             error: None,
         }
     }
@@ -615,12 +634,14 @@ impl Overlay {
         };
 
         if let Some(index) = self.selected {
-            let shape = self.annotations[index];
+            let shape = &self.annotations[index];
             if shape.is_box() {
                 if let Some((hx, hy)) = handle_at(shape.rect(), p, tol) {
                     let drag = Drag::Resize { start: p, orig: shape.rect(), hx, hy };
                     return Action::ResizeBox { index, drag };
                 }
+            } else if shape.is_freehand() {
+                // Freehand strokes can be moved, but have no handles.
             } else if p.distance(shape.b) <= tol {
                 return Action::MoveEnd { index, end_b: true };
             } else if p.distance(shape.a) <= tol {
@@ -638,7 +659,7 @@ impl Overlay {
         let move_shape = |index: usize| Action::MoveShape {
             index,
             start: p,
-            orig: self.annotations[index],
+            orig: self.annotations[index].clone(),
         };
         match self.tool {
             // Topmost annotation under the pointer, else the region itself.
@@ -671,7 +692,9 @@ impl Overlay {
                     dash: self.dash,
                     head: self.head,
                     double_head: self.double_head,
+                    points: Vec::new(),
                 });
+                self.stroke_points = vec![anchor];
                 self.selected = Some(self.annotations.len() - 1);
             }
             Action::MoveShape { index, .. }
@@ -686,7 +709,7 @@ impl Overlay {
 
     /// Update whatever is being dragged for the pointer at `p`.
     fn apply_action(&mut self, p: Pos2, mods: Modifiers, bounds: Rect) {
-        let Some(action) = self.action else { return };
+        let Some(action) = self.action.clone() else { return };
         match action {
             Action::Region(drag) => {
                 // A stray click outside the region must not replace it with nothing.
@@ -701,6 +724,20 @@ impl Overlay {
                 let Some(shape) = self.annotations.last_mut() else { return };
                 if shape.is_box() {
                     shape.set_rect(Drag::Create { anchor }.apply(p, mods, bounds));
+                } else if matches!(shape.kind, ShapeKind::Pen | ShapeKind::Marker) {
+                    if self.stroke_points.last().is_none_or(|last| last.distance(p) >= MIN_POINT_SPACING) {
+                        self.stroke_points.push(p);
+                    }
+                    // Shift: a straight stroke from the start, in 45-degree steps.
+                    // Releasing Shift goes back to the freehand path drawn so far.
+                    shape.a = anchor;
+                    if mods.shift {
+                        shape.points.clear();
+                        shape.b = annotate::snap_angle(anchor, p);
+                    } else {
+                        shape.points.clone_from(&self.stroke_points);
+                        shape.b = p;
+                    }
                 } else {
                     let end = if mods.shift { annotate::snap_angle(anchor, p) } else { p };
                     shape.a = if mods.alt { anchor - (end - anchor) } else { anchor };
@@ -721,12 +758,12 @@ impl Overlay {
                 self.change(index, moved);
             }
             Action::ResizeBox { index, drag } => {
-                let mut shape = self.annotations[index];
+                let mut shape = self.annotations[index].clone();
                 shape.set_rect(drag.apply(p, mods, bounds));
                 self.change(index, shape);
             }
             Action::MoveEnd { index, end_b } => {
-                let mut shape = self.annotations[index];
+                let mut shape = self.annotations[index].clone();
                 let fixed = if end_b { shape.a } else { shape.b };
                 let end = if mods.shift { annotate::snap_angle(fixed, p) } else { p };
                 if end_b {
@@ -742,6 +779,12 @@ impl Overlay {
     fn end_action(&mut self) {
         match self.action.take() {
             Some(Action::NewShape { .. }) => {
+                self.stroke_points.clear();
+                if let Some(shape) = self.annotations.last_mut() {
+                    if shape.is_freehand() {
+                        shape.points = annotate::simplify(&shape.points, 0.4);
+                    }
+                }
                 // A click without a drag leaves no shape behind, and no undo step.
                 if self.annotations.last().is_some_and(Annotation::is_degenerate) {
                     self.annotations.pop();
@@ -772,9 +815,25 @@ impl Overlay {
 
     // --- Editing commands --------------------------------------------------------------
 
+    /// Switch tools. The highlighter has its own thickness (it needs to be much wider),
+    /// swapped in when switching to it and out when leaving it.
+    fn set_tool(&mut self, tool: Tool) {
+        if tool == self.tool {
+            return;
+        }
+        // Let go of the selected shape first, or the style of the new tool (such as
+        // its thickness) would be applied to it.
+        self.selected = None;
+        let marker = |t: Tool| t == Tool::Shape(ShapeKind::Marker);
+        if marker(self.tool) != marker(tool) {
+            std::mem::swap(&mut self.width, &mut self.other_width);
+        }
+        self.tool = tool;
+    }
+
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
-        let shape = self.annotations[index];
+        let shape = self.annotations[index].clone();
         self.color = shape.color;
         self.width = shape.width;
         self.dash = shape.dash;
@@ -785,7 +844,7 @@ impl Overlay {
     /// Push the current style onto the selected annotation, if it differs.
     fn restyle_selected(&mut self) {
         let Some(index) = self.selected else { return };
-        let mut shape = self.annotations[index];
+        let mut shape = self.annotations[index].clone();
         shape.color = self.color;
         shape.width = self.width;
         shape.dash = self.dash;
@@ -914,11 +973,17 @@ impl Overlay {
                             (Tool::Shape(ShapeKind::Ellipse), Icon::Ellipse, "Ellipse (E)"),
                             (Tool::Shape(ShapeKind::Line), Icon::Line, "Line (L)"),
                             (Tool::Shape(ShapeKind::Arrow), Icon::Arrow, "Arrow (A)"),
+                            (Tool::Shape(ShapeKind::Pen), Icon::Pen, "Pen (P), Shift for a straight line"),
+                            (
+                                Tool::Shape(ShapeKind::Marker),
+                                Icon::Marker,
+                                "Highlighter (M), Shift for a straight line",
+                            ),
                         ];
                         for (tool, icon, tip) in tools {
                             let button = icons::button(ui, icon, self.tool == tool, true);
                             if button.on_hover_text(tip).clicked() {
-                                self.tool = tool;
+                                self.set_tool(tool);
                             }
                         }
 
@@ -958,6 +1023,7 @@ impl Overlay {
                             dash: Dash::Solid,
                             head: ArrowHead::Triangle,
                             double_head: false,
+                            points: Vec::new(),
                         };
                         icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
                             let mut line = sample(ShapeKind::Line, 2.0);
@@ -1032,6 +1098,16 @@ fn setup_text(ctx: &egui::Context) {
         style.visuals.text_options.subpixel_binning = false;
         style.visuals.text_options.font_hinting = true;
     });
+}
+
+/// Identifies a freehand stroke's appearance, for the layer cache.
+fn layer_key(a: &Annotation) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (a.kind, a.dash, a.color, a.width.to_bits()).hash(&mut h);
+    for p in &a.points {
+        (p.x.to_bits(), p.y.to_bits()).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Text on a dark pill so it stays readable over any screenshot.
@@ -1138,7 +1214,7 @@ impl eframe::App for Overlay {
         }
 
         // Cursor reflects what a drag would do from here. Over the toolbar, egui decides.
-        let preview = self.action.or_else(|| {
+        let preview = self.action.clone().or_else(|| {
             let p = hover.filter(|_| response.hovered())?;
             Some(self.pick_action(to_px(p), tol))
         });
@@ -1179,6 +1255,8 @@ impl eframe::App for Overlay {
                 (Key::E, Tool::Shape(ShapeKind::Ellipse)),
                 (Key::L, Tool::Shape(ShapeKind::Line)),
                 (Key::A, Tool::Shape(ShapeKind::Arrow)),
+                (Key::P, Tool::Shape(ShapeKind::Pen)),
+                (Key::M, Tool::Shape(ShapeKind::Marker)),
             ]
             .into_iter()
             .find(|(key, _)| plain && i.key_pressed(*key))
@@ -1229,7 +1307,7 @@ impl eframe::App for Overlay {
                 }
             }
             if let Some(tool) = keys.tool {
-                self.tool = tool;
+                self.set_tool(tool);
             }
             if keys.cancel {
                 // Esc first lets go of the selected annotation, then closes.
@@ -1268,9 +1346,29 @@ impl eframe::App for Overlay {
         self.restyle_selected();
 
         // --- Paint: annotations, dimming, region outline and handles, labels -----------
-        for annotation in &self.annotations {
+        let drawing = matches!(self.action, Some(Action::NewShape { .. }));
+        let last = self.annotations.len().wrapping_sub(1);
+        let mut used = HashSet::new();
+        for (i, annotation) in self.annotations.iter().enumerate() {
+            // The stroke being drawn changes every frame, so it is painted directly.
+            if annotation.is_freehand() && !(drawing && i == last) {
+                let key = layer_key(annotation);
+                if !self.layers.contains_key(&key) {
+                    if let Some((image, area)) = annotation.layer(bounds) {
+                        let texture = ctx.load_texture("stroke", image, egui::TextureOptions::LINEAR);
+                        self.layers.insert(key, (texture, area));
+                    }
+                }
+                if let Some((texture, area)) = self.layers.get(&key) {
+                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                    painter.image(texture.id(), rect_to_pt(*area), uv, Color32::WHITE);
+                    used.insert(key);
+                    continue;
+                }
+            }
             annotation.paint(&painter, to_pt, scale);
         }
+        self.layers.retain(|key, _| used.contains(key));
 
         let dim = Color32::from_black_alpha(130);
         match self.selection {
@@ -1311,8 +1409,11 @@ impl eframe::App for Overlay {
 
         // Handles of the selected annotation, in an accent colour to tell them apart
         // from the region's.
-        if let Some(shape) = self.selected.map(|i| self.annotations[i]) {
-            if shape.is_box() {
+        if let Some(shape) = self.selected.map(|i| &self.annotations[i]) {
+            if shape.is_freehand() {
+                let r = rect_to_pt(shape.path_bounds().expand(shape.width / 2.0 + 3.0));
+                painter.rect_stroke(r, 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Middle);
+            } else if shape.is_box() {
                 let r = rect_to_pt(shape.rect());
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, ACCENT), StrokeKind::Middle);
                 for point in handle_points(r) {
@@ -1329,7 +1430,7 @@ impl eframe::App for Overlay {
         } else if self.selected.is_some() {
             "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect"
         } else {
-            "V select · R rectangle · E ellipse · L line · A arrow · Shift constrain · Alt from centre · Ctrl+Z undo"
+            "V select · R rect · E ellipse · L line · A arrow · P pen · M marker · Shift constrain/straight · Alt from centre · Ctrl+Z undo"
         };
         let monitor = self.desktop.monitors[self.current_monitor];
         let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);

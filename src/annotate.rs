@@ -14,16 +14,23 @@ use image::RgbaImage;
 pub const MIN_WIDTH: f32 = 1.0;
 pub const MAX_WIDTH: f32 = 40.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShapeKind {
     Rect,
     Ellipse,
     Line,
     Arrow,
+    /// Freehand pen stroke.
+    Pen,
+    /// Freehand highlighter: wide and translucent.
+    Marker,
 }
 
+/// How see-through the highlighter is (multiplies the colour's own opacity).
+const MARKER_OPACITY: f32 = 0.4;
+
 /// How a stroke is broken up. Dash lengths scale with the stroke width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
 pub enum Dash {
     #[default]
     Solid,
@@ -57,7 +64,7 @@ impl Dash {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
 pub enum ArrowHead {
     #[default]
     Triangle,
@@ -77,7 +84,9 @@ impl ArrowHead {
 
 /// One editable annotation. For boxes (`Rect`, `Ellipse`) `a` and `b` are opposite
 /// corners; for `Line` and `Arrow` they are the start and the end (the arrow tip).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `Pen` and `Marker` strokes are freehand when `points` holds their path, and straight
+/// from `a` to `b` (drawn with Shift) when it is empty.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Annotation {
     pub kind: ShapeKind,
     pub a: Pos2,
@@ -89,6 +98,8 @@ pub struct Annotation {
     /// Arrows only: the head's style, and whether the start gets one too.
     pub head: ArrowHead,
     pub double_head: bool,
+    /// Freehand path, for `Pen` and `Marker`.
+    pub points: Vec<Pos2>,
 }
 
 /// An open or closed run of connected points.
@@ -109,6 +120,8 @@ pub struct Geometry {
     pub dots: Vec<(Pos2, f32)>,
     /// Corners should be sharp (rectangles) rather than rounded.
     pub miter: bool,
+    /// Round line ends (pen and marker strokes) rather than flat ones.
+    pub round_caps: bool,
 }
 
 impl Annotation {
@@ -128,11 +141,41 @@ impl Annotation {
     pub fn translate(&mut self, d: Vec2) {
         self.a += d;
         self.b += d;
+        for p in &mut self.points {
+            *p += d;
+        }
+    }
+
+    /// A freehand pen or marker stroke (as opposed to a straight one).
+    pub fn is_freehand(&self) -> bool {
+        self.points.len() >= 2
+    }
+
+    /// The colour actually drawn: the highlighter is translucent.
+    pub fn ink(&self) -> Color32 {
+        if self.kind == ShapeKind::Marker {
+            let [r, g, b, a] = self.color.to_srgba_unmultiplied();
+            Color32::from_rgba_unmultiplied(r, g, b, (f32::from(a) * MARKER_OPACITY).round() as u8)
+        } else {
+            self.color
+        }
+    }
+
+    /// Bounding box of the freehand path (or of the two end points).
+    pub fn path_bounds(&self) -> Rect {
+        if self.is_freehand() {
+            Rect::from_points(&self.points)
+        } else {
+            self.rect()
+        }
     }
 
     /// Too small to be a deliberate shape (a stray click rather than a drag).
     pub fn is_degenerate(&self) -> bool {
-        if self.is_box() {
+        if self.is_freehand() {
+            let r = self.path_bounds();
+            r.width() < 3.0 && r.height() < 3.0
+        } else if self.is_box() {
             self.rect().width() < 3.0 && self.rect().height() < 3.0
         } else {
             self.a.distance(self.b) < 3.0
@@ -163,12 +206,19 @@ impl Annotation {
                     .collect();
                 Polyline { points, closed: true }
             }
-            ShapeKind::Line | ShapeKind::Arrow => Polyline { points: vec![self.a, self.b], closed: false },
+            _ if self.is_freehand() => Polyline { points: self.points.clone(), closed: false },
+            ShapeKind::Line | ShapeKind::Arrow | ShapeKind::Pen | ShapeKind::Marker => {
+                Polyline { points: vec![self.a, self.b], closed: false }
+            }
         }
     }
 
     pub fn geometry(&self) -> Geometry {
-        let mut geo = Geometry { miter: self.kind == ShapeKind::Rect, ..Default::default() };
+        let mut geo = Geometry {
+            miter: self.kind == ShapeKind::Rect,
+            round_caps: matches!(self.kind, ShapeKind::Pen | ShapeKind::Marker),
+            ..Default::default()
+        };
         let mut body = self.outline();
 
         if self.kind == ShapeKind::Arrow {
@@ -211,7 +261,8 @@ impl Annotation {
     /// per point.
     pub fn paint(&self, painter: &egui::Painter, to_pt: impl Fn(Pos2) -> Pos2, scale: f32) {
         let geo = self.geometry();
-        let stroke = Stroke::new(self.width / scale, self.color);
+        let ink = self.ink();
+        let stroke = Stroke::new(self.width / scale, ink);
         for line in &geo.strokes {
             let points: Vec<Pos2> = line.points.iter().map(|&p| to_pt(p)).collect();
             painter.add(if line.closed {
@@ -221,11 +272,34 @@ impl Annotation {
             });
         }
         for tri in &geo.fills {
-            painter.add(egui::Shape::convex_polygon(tri.map(&to_pt).to_vec(), self.color, Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(tri.map(&to_pt).to_vec(), ink, Stroke::NONE));
         }
         for &(centre, radius) in &geo.dots {
-            painter.circle_filled(to_pt(centre), radius / scale, self.color);
+            painter.circle_filled(to_pt(centre), radius / scale, ink);
         }
+        // egui has no round line caps; add them for opaque strokes. (Translucent ones
+        // would show the overlap; finished freehand strokes are drawn from a
+        // rasterised layer instead, see `layer`.)
+        if geo.round_caps && ink.a() == 255 {
+            for line in &geo.strokes {
+                for end in [line.points.first(), line.points.last()].into_iter().flatten() {
+                    painter.circle_filled(to_pt(*end), self.width / scale / 2.0, ink);
+                }
+            }
+        }
+    }
+
+    /// Rasterise this annotation on its own, for showing freehand strokes on screen
+    /// exactly as they will be saved. Returns the image and the desktop-pixel area it
+    /// covers, clipped to `clip`.
+    pub fn layer(&self, clip: Rect) -> Option<(egui::ColorImage, Rect)> {
+        let area = self.path_bounds().expand(self.width + 2.0).intersect(clip);
+        let area = Rect::from_min_max(area.min.floor(), area.max.ceil());
+        let (w, h) = (area.width() as u32, area.height() as u32);
+        let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+        self.rasterize(&mut pixmap.as_mut(), area.min);
+        let image = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data());
+        Some((image, area))
     }
 
     /// Draw into `pixmap`, whose top-left pixel is desktop position `origin`.
@@ -233,13 +307,13 @@ impl Annotation {
         use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Transform};
 
         let geo = self.geometry();
-        let [r, g, b, a] = self.color.to_srgba_unmultiplied();
+        let [r, g, b, a] = self.ink().to_srgba_unmultiplied();
         let mut paint = Paint::default();
         paint.set_color_rgba8(r, g, b, a);
         paint.anti_alias = true;
         let stroke = tiny_skia::Stroke {
             width: self.width,
-            line_cap: LineCap::Butt,
+            line_cap: if geo.round_caps { LineCap::Round } else { LineCap::Butt },
             line_join: if geo.miter { LineJoin::Miter } else { LineJoin::Round },
             ..Default::default()
         };
@@ -404,6 +478,33 @@ fn dots_along(line: &Polyline, w: f32) -> Vec<(Pos2, f32)> {
         .collect()
 }
 
+/// Thin out a freehand path: drop points that deviate less than `tolerance` pixels
+/// from the line through their neighbours (Ramer-Douglas-Peucker).
+pub fn simplify(points: &[Pos2], tolerance: f32) -> Vec<Pos2> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+    let mut stack = vec![(0, points.len() - 1)];
+    while let Some((first, last)) = stack.pop() {
+        let (mut worst, mut worst_d) = (0, 0.0);
+        for i in first + 1..last {
+            let d = distance_to_segment(points[i], points[first], points[last]);
+            if d > worst_d {
+                (worst, worst_d) = (i, d);
+            }
+        }
+        if worst_d > tolerance {
+            keep[worst] = true;
+            stack.push((first, worst));
+            stack.push((worst, last));
+        }
+    }
+    points.iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| *p).collect()
+}
+
 /// Draw `annotations` onto `img`, whose top-left pixel is desktop position `origin`.
 pub fn render_onto(img: &mut RgbaImage, origin: Pos2, annotations: &[Annotation]) {
     if annotations.is_empty() {
@@ -542,6 +643,7 @@ mod tests {
             dash: Dash::Solid,
             head: ArrowHead::Triangle,
             double_head: false,
+            points: Vec::new(),
         }
     }
 
@@ -635,6 +737,45 @@ mod tests {
     }
 
     #[test]
+    fn freehand_strokes() {
+        // A wavy pen stroke: hit along its path, moved by translate, simplified.
+        let wave: Vec<Pos2> =
+            (0..=200).map(|x| Pos2::new(x as f32, 50.0 + 10.0 * (x as f32 / 20.0).sin())).collect();
+        let mut pen = shape(ShapeKind::Pen, (0.0, 0.0), (0.0, 0.0));
+        pen.points = simplify(&wave, 0.5);
+        assert!(pen.points.len() < 80 && pen.points.len() > 10, "{}", pen.points.len());
+        assert!(pen.hit(Pos2::new(100.0, 50.0 + 10.0 * 5.0f32.sin()), 1.0));
+        assert!(!pen.hit(Pos2::new(100.0, 90.0), 1.0));
+        pen.translate(vec2(10.0, 0.0));
+        assert_eq!(pen.points[0], Pos2::new(10.0, 50.0));
+        assert!(pen.geometry().round_caps);
+
+        // The marker is translucent; a straight one (no points) runs from a to b.
+        let mut marker = shape(ShapeKind::Marker, (0.0, 10.0), (100.0, 10.0));
+        marker.width = 16.0;
+        assert!(!marker.is_freehand());
+        assert_eq!(marker.ink().a(), 102);
+        assert!(marker.hit(Pos2::new(50.0, 16.0), 0.0));
+
+        // Its on-screen layer matches the output: uniform translucency, even where a
+        // freehand stroke crosses itself.
+        marker.points = vec![
+            Pos2::new(0.0, 10.0),
+            Pos2::new(60.0, 10.0),
+            Pos2::new(60.0, 40.0),
+            Pos2::new(30.0, 40.0),
+            Pos2::new(30.0, 0.0),
+        ];
+        let clip = Rect::from_min_size(Pos2::ZERO, vec2(500.0, 500.0));
+        let (layer, area) = marker.layer(clip).unwrap();
+        let at = |x: f32, y: f32| {
+            layer.pixels[(y - area.min.y) as usize * layer.size[0] + (x - area.min.x) as usize]
+        };
+        assert_eq!(at(30.0, 10.0).a(), at(10.0, 10.0).a()); // crossing vs single pass
+        assert_eq!(at(45.0, 25.0).a(), 0); // inside the loop, not covered
+    }
+
+    #[test]
     fn shift_snaps_lines_to_45_degrees() {
         let o = Pos2::new(100.0, 100.0);
         let near_horizontal = snap_angle(o, Pos2::new(200.0, 110.0));
@@ -652,13 +793,13 @@ mod tests {
         let mut history = History::default();
 
         history.record(&list, None);
-        list.push(a);
+        list.push(a.clone());
         history.record(&list, None);
-        list.push(b);
+        list.push(b.clone());
         assert!(history.undo(&mut list));
-        assert_eq!(list, vec![a]);
+        assert_eq!(list, vec![a.clone()]);
         assert!(history.redo(&mut list));
-        assert_eq!(list, vec![a, b]);
+        assert_eq!(list, vec![a.clone(), b.clone()]);
 
         // Three quick nudges collapse into one undo step.
         for _ in 0..3 {
@@ -724,6 +865,7 @@ fn style_sheet() {
         dash: Dash::Solid,
         head: ArrowHead::Triangle,
         double_head: false,
+        points: Vec::new(),
     };
     for (row, (dash, _)) in Dash::ALL.iter().enumerate() {
         let y = 20.0 + row as f32 * 34.0;

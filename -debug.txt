@@ -1,0 +1,4 @@
+DEBUG Marker width=16 points=36 a=[2090.0 778.0] b=[2390.0 762.0]
+DEBUG Marker width=16 points=0 a=[2090.0 928.0] b=[2390.2 928.0]
+DEBUG Marker width=4 points=36 a=[2090.0 1078.0] b=[2390.0 1065.0]
+DEBUG Pen width=4 points=36 a=[2440.0 928.0] b=[2790.0 915.0]

@@ -10,6 +10,8 @@ pub enum Icon {
     Ellipse,
     Line,
     Arrow,
+    Pen,
+    Marker,
     /// An arrow with a head at both ends.
     DoubleHead,
     Undo,
@@ -203,6 +205,21 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
         Icon::Arrow => {
             line(&[(3.5, 16.5), (13.0, 7.0)]);
             triangle([(17.0, 3.0), (9.6, 5.4), (14.6, 10.4)]);
+        }
+        Icon::Pen => {
+            // A pencil, tip at the bottom left.
+            let body = [(13.0, 3.0), (17.0, 7.0), (7.0, 17.0), (3.0, 17.0), (3.0, 13.0)];
+            painter.add(Shape::closed_line(body.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
+            line(&[(11.0, 5.0), (15.0, 9.0)]);
+            line(&[(3.0, 13.0), (7.0, 17.0)]);
+        }
+        Icon::Marker => {
+            // A highlighter with a chisel tip, over a translucent stroke.
+            let swatch = Rect::from_min_max(p(2.0, 15.5), p(18.0, 19.0));
+            painter.rect_filled(swatch, 1.0, color.gamma_multiply(0.35));
+            let body = [(12.0, 1.5), (17.5, 7.0), (11.0, 13.5), (5.5, 8.0)];
+            painter.add(Shape::closed_line(body.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
+            triangle([(5.5, 8.0), (11.0, 13.5), (4.0, 14.0)]);
         }
         Icon::DoubleHead => {
             line(&[(6.0, 10.0), (14.0, 10.0)]);
