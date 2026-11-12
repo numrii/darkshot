@@ -506,6 +506,10 @@ const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
 /// Default highlighter colour (classic highlighter yellow) and thickness.
 const MARKER_COLOR: Color32 = Color32::from_rgb(0xFF, 0xE6, 0x00);
 const MARKER_WIDTH: f32 = 16.0;
+/// Width of the toolbar's context options: room for the largest set, the arrow's
+/// (stroke style, arrowhead, both-ends toggle), each followed by the toolbar's 2 px
+/// item spacing.
+const OPTIONS_WIDTH: f32 = icons::PICKER_WIDTH * 2.0 + icons::BUTTON + 3.0 * 2.0;
 /// Default text size and blur strength, in pixels.
 const TEXT_SIZE: f32 = 24.0;
 const BLUR_STRENGTH: f32 = 12.0;
@@ -628,7 +632,8 @@ impl Overlay {
             styles: HashMap::from([
                 (StyleSlot::Marker, (MARKER_COLOR, MARKER_WIDTH)),
                 (StyleSlot::Text, (SWATCHES[0], TEXT_SIZE)),
-                (StyleSlot::Blur, (SWATCHES[0], BLUR_STRENGTH)),
+                // Black: the colour of a redaction (pixelate and blur ignore it).
+                (StyleSlot::Blur, (Color32::BLACK, BLUR_STRENGTH)),
             ]),
             editing: None,
             annotations: Vec::new(),
@@ -1162,11 +1167,22 @@ impl Overlay {
     fn blurred(&self, shape: &Annotation) -> Option<(RgbaImage, Rect)> {
         let area = shape.rect().intersect(self.bounds());
         let area = Rect::from_min_max(area.min.round(), area.max.round());
-        let mut img = self.crop_desktop(area)?;
         let strength = shape.width.round().max(1.0) as u32;
+        if shape.effect == Effect::Redact {
+            // Not derived from the capture at all, and always opaque, so nothing
+            // underneath survives (including areas between monitors).
+            let [r, g, b, _] = shape.color.to_srgba_unmultiplied();
+            let (w, h) = (area.width() as u32, area.height() as u32);
+            if w == 0 || h == 0 {
+                return None;
+            }
+            return Some((RgbaImage::from_pixel(w, h, image::Rgba([r, g, b, 255])), area));
+        }
+        let mut img = self.crop_desktop(area)?;
         match shape.effect {
             Effect::Pixelate => effects::pixelate(&mut img, strength),
             Effect::Blur => effects::blur(&mut img, strength),
+            Effect::Redact => unreachable!(),
         }
         Some((img, area))
     }
@@ -1220,6 +1236,59 @@ impl Overlay {
 
     // --- Toolbar -----------------------------------------------------------------------
 
+    /// The style options that apply to `kind`: stroke style for lines and outlines,
+    /// plus arrowheads for arrows, text style for text, the effect for blur regions,
+    /// and nothing when no tool or shape is active.
+    fn context_options(&mut self, ui: &mut egui::Ui, kind: Option<ShapeKind>) {
+        let sample = |kind, width| Annotation {
+            kind,
+            a: Pos2::ZERO,
+            b: Pos2::ZERO,
+            color: Color32::WHITE,
+            width,
+            dash: Dash::Solid,
+            head: ArrowHead::Triangle,
+            double_head: false,
+            points: Vec::new(),
+            text: String::new(),
+            text_style: TextStyle::Plain,
+            effect: Effect::Pixelate,
+        };
+        let Some(kind) = kind else { return };
+        match kind {
+            ShapeKind::Text => {
+                icons::picker(ui, &mut self.text_style, true, &TextStyle::ALL, icons::text_style_preview)
+                    .on_hover_text("Text style");
+            }
+            ShapeKind::Blur => {
+                icons::picker(ui, &mut self.effect, true, &Effect::ALL, icons::effect_preview)
+                    .on_hover_text("Effect");
+            }
+            _ => {
+                icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
+                    let mut line = sample(ShapeKind::Line, 2.0);
+                    (line.a, line.b, line.color, line.dash) =
+                        (area.left_center(), area.right_center(), color, dash);
+                    line.paint(painter, |p| p, 1.0);
+                })
+                .on_hover_text("Stroke style");
+            }
+        }
+        if kind == ShapeKind::Arrow {
+            icons::picker(ui, &mut self.head, true, &ArrowHead::ALL, |painter, area, head, color| {
+                let mut shape = sample(ShapeKind::Arrow, 1.6);
+                (shape.a, shape.b, shape.color, shape.head) =
+                    (area.left_center(), area.right_center(), color, head);
+                shape.paint(painter, |p| p, 1.0);
+            })
+            .on_hover_text("Arrowhead");
+            let both = icons::button(ui, Icon::DoubleHead, self.double_head, true);
+            if both.on_hover_text("Heads on both ends").clicked() {
+                self.double_head = !self.double_head;
+            }
+        }
+    }
+
     fn toolbar(&mut self, ctx: &egui::Context, pos: Pos2, pivot: Align2, within: Rect) -> ToolbarOutput {
         let mut out = ToolbarOutput::default();
         egui::Area::new(egui::Id::unique("darkshot-toolbar"))
@@ -1268,76 +1337,38 @@ impl Overlay {
                         }
                         icons::color_picker_button(ui, &mut self.color)
                             .on_hover_text("Custom colour");
-                        // Fixed width, so the toolbar does not shift when the value
-                        // gains a digit.
                         let kind = self.style_kind();
+                        let redact = kind == Some(ShapeKind::Blur) && self.effect == Effect::Redact;
                         let size_tip = match kind {
+                            _ if redact => "Not used by Redact",
                             Some(ShapeKind::Text) => "Font size (mouse wheel)",
                             Some(ShapeKind::Blur) => "Strength (mouse wheel)",
                             _ => "Thickness (mouse wheel)",
                         };
-                        ui.add_sized(
-                            [52.0, 22.0],
-                            egui::DragValue::new(&mut self.width)
-                                .range(width_range(kind))
-                                .speed(0.25)
-                                .fixed_decimals(0)
-                                .suffix(" px"),
-                        )
-                        .on_hover_text(size_tip);
-
-                        let sample = |kind, width| Annotation {
-                            kind,
-                            a: Pos2::ZERO,
-                            b: Pos2::ZERO,
-                            color: Color32::WHITE,
-                            width,
-                            dash: Dash::Solid,
-                            head: ArrowHead::Triangle,
-                            double_head: false,
-                            points: Vec::new(),
-                            text: String::new(),
-                            text_style: TextStyle::Plain,
-                            effect: Effect::Pixelate,
-                        };
-                        // One slot, same size whatever it shows: text style for text,
-                        // effect for blur regions, stroke style for everything else.
-                        match kind {
-                            Some(ShapeKind::Text) => {
-                                icons::picker(ui, &mut self.text_style, true, &TextStyle::ALL, icons::text_style_preview)
-                                    .on_hover_text("Text style");
-                            }
-                            Some(ShapeKind::Blur) => {
-                                icons::picker(ui, &mut self.effect, true, &Effect::ALL, |painter, area, effect, color| {
-                                    icons::effect_preview(painter, area, effect == Effect::Blur, color);
-                                })
-                                .on_hover_text("Effect");
-                            }
-                            _ => {
-                                icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
-                                    let mut line = sample(ShapeKind::Line, 2.0);
-                                    (line.a, line.b, line.color, line.dash) =
-                                        (area.left_center(), area.right_center(), color, dash);
-                                    line.paint(painter, |p| p, 1.0);
-                                })
-                                .on_hover_text("Stroke style");
-                            }
-                        }
-
-                        // Arrowhead controls stay in place (disabled) for other shapes,
-                        // so the toolbar does not change size when switching tools.
-                        let arrow = self.tool == Tool::Shape(ShapeKind::Arrow)
-                            || self.selected.is_some_and(|i| self.annotations[i].kind == ShapeKind::Arrow);
-                        icons::picker(ui, &mut self.head, arrow, &ArrowHead::ALL, |painter, area, head, color| {
-                            let mut shape = sample(ShapeKind::Arrow, 1.6);
-                            (shape.a, shape.b, shape.color, shape.head) =
-                                (area.left_center(), area.right_center(), color, head);
-                            shape.paint(painter, |p| p, 1.0);
+                        // Fixed width, so the toolbar does not shift when the value
+                        // gains a digit.
+                        ui.add_enabled_ui(!redact, |ui| {
+                            ui.add_sized(
+                                [52.0, 22.0],
+                                egui::DragValue::new(&mut self.width)
+                                    .range(width_range(kind))
+                                    .speed(0.25)
+                                    .fixed_decimals(0)
+                                    .suffix(" px"),
+                            )
                         })
-                        .on_hover_text("Arrowhead");
-                        let both = icons::button(ui, Icon::DoubleHead, self.double_head, arrow);
-                        if both.on_hover_text("Heads on both ends").clicked() {
-                            self.double_head = !self.double_head;
+                        .inner
+                        .on_hover_text(size_tip)
+                        .on_disabled_hover_text(size_tip);
+
+                        // Options for the current tool or selected shape. They sit in an
+                        // area sized for the largest set (the arrow's), so the toolbar
+                        // keeps its size when switching tools.
+                        let start = ui.cursor().min.x;
+                        self.context_options(ui, kind);
+                        let used = ui.cursor().min.x - start;
+                        if used < OPTIONS_WIDTH {
+                            ui.add_space(OPTIONS_WIDTH - used);
                         }
 
                         ui.separator();
@@ -2003,6 +2034,19 @@ mod tests {
         assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
         assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
         assert_eq!(out.get_pixel(75, 35).0, [255, 255, 255, 255]); // desktop x 85
+
+        // Redact: a solid, opaque fill in the shape's colour (black by default),
+        // ignoring the strength.
+        assert_eq!(overlay.annotations[0].color, Color32::BLACK);
+        overlay.annotations[0].effect = Effect::Redact;
+        overlay.annotations[0].color = Color32::from_rgba_unmultiplied(10, 20, 30, 40);
+        let out = overlay.output().unwrap();
+        // The colour's own translucency is ignored: a redaction is always opaque.
+        let [r, g, b, _] = overlay.annotations[0].color.to_srgba_unmultiplied();
+        for (x, y) in [(10, 10), (30, 20), (49, 29)] {
+            assert_eq!(out.get_pixel(x, y).0, [r, g, b, 255]);
+        }
+        assert_ne!(out.get_pixel(51, 20).0, [r, g, b, 255]); // desktop x 61: outside
     }
 
     #[test]

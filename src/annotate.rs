@@ -52,10 +52,14 @@ pub enum Effect {
     #[default]
     Pixelate,
     Blur,
+    /// A solid, fully opaque fill in the annotation's colour. Unlike pixelate and blur,
+    /// nothing of the original can be recovered from it.
+    Redact,
 }
 
 impl Effect {
-    pub const ALL: [(Effect, &'static str); 2] = [(Effect::Pixelate, "Pixelate"), (Effect::Blur, "Blur")];
+    pub const ALL: [(Effect, &'static str); 3] =
+        [(Effect::Pixelate, "Pixelate"), (Effect::Blur, "Blur"), (Effect::Redact, "Redact")];
 }
 
 /// How see-through the highlighter is (multiplies the colour's own opacity).

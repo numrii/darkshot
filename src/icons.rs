@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, vec2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Vec2};
 
-use crate::annotate::TextStyle;
+use crate::annotate::{Effect, TextStyle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
@@ -25,7 +25,9 @@ pub enum Icon {
     Close,
 }
 
-const BUTTON: f32 = 28.0;
+pub const BUTTON: f32 = 28.0;
+/// Width of a dropdown picker button.
+pub const PICKER_WIDTH: f32 = 44.0;
 /// Icons are designed on a 20x20 grid.
 const GRID: f32 = 20.0;
 const STROKE: f32 = 1.6;
@@ -68,7 +70,7 @@ pub fn picker<T: Copy + PartialEq>(
     let popup_id = ui.auto_id_with("picker");
     let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, mut response) = ui.allocate_exact_size(vec2(44.0, BUTTON), sense);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(PICKER_WIDTH, BUTTON), sense);
 
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, open);
@@ -148,10 +150,13 @@ pub fn text_style_preview(painter: &egui::Painter, area: Rect, style: TextStyle,
 }
 
 /// Preview of a blur effect: a grid of blocks (pixelate) or soft rings (blur).
-pub fn effect_preview(painter: &egui::Painter, area: Rect, blur: bool, color: Color32) {
+pub fn effect_preview(painter: &egui::Painter, area: Rect, effect: Effect, color: Color32) {
     let side = area.width().min(area.height());
     let square = Rect::from_center_size(area.center(), Vec2::splat(side));
-    if blur {
+    if effect == Effect::Redact {
+        // A solid bar over two lines of "text".
+        painter.rect_filled(square.shrink(side * 0.05), 1.5, color);
+    } else if effect == Effect::Blur {
         for (i, alpha) in [0.15, 0.3, 0.5, 0.8].into_iter().enumerate() {
             let r = side / 2.0 * (1.0 - i as f32 * 0.22);
             painter.circle_filled(square.center(), r, color.gamma_multiply(alpha));
@@ -276,7 +281,7 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
             line(&[(10.0, 4.5), (10.0, 16.5)]);
             line(&[(7.5, 16.5), (12.5, 16.5)]);
         }
-        Icon::Blur => effect_preview(painter, area.shrink(2.0 * unit), false, color),
+        Icon::Blur => effect_preview(painter, area.shrink(2.0 * unit), Effect::Pixelate, color),
         Icon::DoubleHead => {
             line(&[(6.0, 10.0), (14.0, 10.0)]);
             triangle([(2.0, 10.0), (7.5, 6.0), (7.5, 14.0)]);
