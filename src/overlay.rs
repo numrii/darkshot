@@ -495,7 +495,8 @@ const SWATCHES: [Color32; 4] = [
     Color32::from_rgb(0xFF, 0xB2, 0x24),
 ];
 const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
-/// Default highlighter thickness.
+/// Default highlighter colour (classic highlighter yellow) and thickness.
+const MARKER_COLOR: Color32 = Color32::from_rgb(0xFF, 0xE6, 0x00);
 const MARKER_WIDTH: f32 = 16.0;
 /// Freehand points closer than this to the previous one are skipped while drawing.
 const MIN_POINT_SPACING: f32 = 1.5;
@@ -522,7 +523,9 @@ struct Overlay {
     dash: Dash,
     head: ArrowHead,
     double_head: bool,
-    /// The highlighter keeps its own thickness, swapped in and out with the tool.
+    /// The highlighter keeps its own colour and thickness, swapped with `color` and
+    /// `width` when switching to or from it.
+    other_color: Color32,
     other_width: f32,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
@@ -562,6 +565,7 @@ impl Overlay {
             dash: Dash::Solid,
             head: ArrowHead::Triangle,
             double_head: false,
+            other_color: MARKER_COLOR,
             other_width: MARKER_WIDTH,
             annotations: Vec::new(),
             selected: None,
@@ -815,8 +819,8 @@ impl Overlay {
 
     // --- Editing commands --------------------------------------------------------------
 
-    /// Switch tools. The highlighter has its own thickness (it needs to be much wider),
-    /// swapped in when switching to it and out when leaving it.
+    /// Switch tools. The highlighter has its own colour and thickness (yellow and much
+    /// wider by default), swapped in when switching to it and out when leaving it.
     fn set_tool(&mut self, tool: Tool) {
         if tool == self.tool {
             return;
@@ -827,6 +831,7 @@ impl Overlay {
         let marker = |t: Tool| t == Tool::Shape(ShapeKind::Marker);
         if marker(self.tool) != marker(tool) {
             std::mem::swap(&mut self.width, &mut self.other_width);
+            std::mem::swap(&mut self.color, &mut self.other_color);
         }
         self.tool = tool;
     }
@@ -1515,6 +1520,35 @@ mod tests {
         assert_eq!(edges_at(sel, Pos2::new(200.0, 203.0), 6.0), Some((0, 1)));
         assert_eq!(edges_at(sel, Pos2::new(200.0, 150.0), 6.0), None);
         assert_eq!(keep_inside(rect(900.0, -5.0, 1010.0, 50.0), BOUNDS), rect(890.0, 0.0, 1000.0, 55.0));
+    }
+
+    #[test]
+    fn highlighter_keeps_its_own_colour_and_width() {
+        let desktop = Desktop {
+            shots: vec![RgbaImage::new(4, 4)],
+            bounds: RECT { left: 0, top: 0, right: 4, bottom: 4 },
+            monitors: vec![rect(0.0, 0.0, 4.0, 4.0)],
+            home: 0,
+        };
+        let mut overlay = Overlay::with_desktop(desktop, None);
+        let marker = Tool::Shape(ShapeKind::Marker);
+        let rect_tool = Tool::Shape(ShapeKind::Rect);
+
+        overlay.set_tool(rect_tool);
+        assert_eq!((overlay.color, overlay.width), (SWATCHES[0], 4.0));
+        overlay.set_tool(marker);
+        assert_eq!((overlay.color, overlay.width), (MARKER_COLOR, MARKER_WIDTH));
+
+        // Changes on either side are remembered.
+        overlay.color = SWATCHES[1];
+        overlay.width = 24.0;
+        overlay.set_tool(Tool::Shape(ShapeKind::Pen));
+        assert_eq!((overlay.color, overlay.width), (SWATCHES[0], 4.0));
+        overlay.width = 6.0;
+        overlay.set_tool(marker);
+        assert_eq!((overlay.color, overlay.width), (SWATCHES[1], 24.0));
+        overlay.set_tool(Tool::Select);
+        assert_eq!((overlay.color, overlay.width), (SWATCHES[0], 6.0));
     }
 
     #[test]
