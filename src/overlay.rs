@@ -27,6 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use winit::event_loop::{DeviceEvents, EventLoop};
 
+use crate::annotate::{self, Annotation, History, Repeat, ShapeKind, MAX_WIDTH, MIN_WIDTH};
 use crate::AnyResult;
 
 /// How close (in points) the pointer must be to an edge or handle to grab it.
@@ -437,6 +438,58 @@ fn resize_cursor(hx: i8, hy: i8) -> CursorIcon {
     }
 }
 
+/// Like `edges_at`, but only the eight handle points count. Used for shapes, whose
+/// edges are the stroke itself and must stay grabbable for moving.
+fn handle_at(rect: Rect, p: Pos2, tol: f32) -> Option<(i8, i8)> {
+    let xs = [(rect.left(), -1), (rect.center().x, 0), (rect.right(), 1)];
+    let ys = [(rect.top(), -1), (rect.center().y, 0), (rect.bottom(), 1)];
+    // Corners first, so they win over edge midpoints on small shapes.
+    let mut best: Option<((i8, i8), f32)> = None;
+    for (x, hx) in xs {
+        for (y, hy) in ys {
+            if (hx, hy) == (0, 0) {
+                continue;
+            }
+            let d = p.distance(Pos2::new(x, y)) - if hx != 0 && hy != 0 { 0.5 } else { 0.0 };
+            if d <= tol && best.is_none_or(|(_, b)| d < b) {
+                best = Some(((hx, hy), d));
+            }
+        }
+    }
+    best.map(|(h, _)| h)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    /// Adjust the capture region and select, move or resize existing annotations.
+    Select,
+    /// Drag to draw a new annotation of this kind.
+    Shape(ShapeKind),
+}
+
+/// What the current mouse drag is doing.
+#[derive(Clone, Copy)]
+enum Action {
+    /// Create, move or resize the capture region.
+    Region(Drag),
+    /// Drawing a new annotation (the last one in the list) from `anchor`.
+    NewShape { anchor: Pos2 },
+    MoveShape { index: usize, start: Pos2, orig: Annotation },
+    /// Resizing a rectangle or ellipse by one of its handles.
+    ResizeBox { index: usize, drag: Drag },
+    /// Dragging one end of a line or arrow; `end_b` = the end (tip) rather than the start.
+    MoveEnd { index: usize, end_b: bool },
+}
+
+/// Default annotation colours: red, green, blue, amber.
+const SWATCHES: [Color32; 4] = [
+    Color32::from_rgb(0xE5, 0x48, 0x4D),
+    Color32::from_rgb(0x30, 0xA4, 0x6C),
+    Color32::from_rgb(0x3E, 0x63, 0xDD),
+    Color32::from_rgb(0xFF, 0xB2, 0x24),
+];
+const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
+
 struct Overlay {
     desktop: Desktop,
     /// One texture per monitor, so no texture exceeds the GPU's size limit. Created on
@@ -445,24 +498,55 @@ struct Overlay {
     hwnd: Option<HWND>,
     /// The monitor the pointer was last on; Ctrl+A and the hint bar use it.
     current_monitor: usize,
-    /// Selected region in image pixels.
+    /// The capture region in desktop pixels.
     selection: Option<Rect>,
-    drag: Option<Drag>,
+    action: Option<Action>,
+    /// The annotation list as it was when the current drag began. Recorded in the undo
+    /// history only if the drag actually changes something, so a plain click adds nothing.
+    pending_undo: Option<Vec<Annotation>>,
+
+    tool: Tool,
+    /// Colour and stroke width for new annotations; mirrors the selected one, if any.
+    color: Color32,
+    width: f32,
+    annotations: Vec<Annotation>,
+    selected: Option<usize>,
+    history: History,
+
     error: Option<String>,
 }
 
+/// What the toolbar asked for this frame.
+#[derive(Default)]
+struct ToolbarOutput {
+    copy: bool,
+    save: bool,
+    close: bool,
+}
+
 impl Overlay {
-    fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
-        trace("window created");
-        let overlay = Self {
+    fn with_desktop(desktop: Desktop, hwnd: Option<HWND>) -> Self {
+        Self {
             current_monitor: desktop.home,
             desktop,
             textures: Vec::new(),
-            hwnd: hwnd_of(cc),
+            hwnd,
             selection: None,
-            drag: None,
+            action: None,
+            pending_undo: None,
+            tool: Tool::Select,
+            color: SWATCHES[0],
+            width: 4.0,
+            annotations: Vec::new(),
+            selected: None,
+            history: History::default(),
             error: None,
-        };
+        }
+    }
+
+    fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
+        trace("window created");
+        let overlay = Self::with_desktop(desktop, hwnd_of(cc));
         if let Some(hwnd) = overlay.hwnd {
             // Switch off the window's fade-in. During that animation the live desktop
             // shows through the frozen capture, which looks like ghosting when
@@ -510,16 +594,214 @@ impl Overlay {
         )
     }
 
-    fn begin_drag(&self, p: Pos2, tol: f32) -> Drag {
-        match self.selection {
-            Some(sel) => match edges_at(sel, p, tol) {
-                Some((hx, hy)) => Drag::Resize { start: p, orig: sel, hx, hy },
-                None if sel.contains(p) => Drag::Move { start: p, orig: sel },
-                None => Drag::Create { anchor: p },
+    // --- Mouse interaction -----------------------------------------------------------
+
+    /// What a drag starting at `p` would do. Pure, so it also drives the cursor shape.
+    /// Priority: handles of the selected annotation, then the region's edges, then
+    /// whatever the active tool does at that point.
+    fn pick_action(&self, p: Pos2, tol: f32) -> Action {
+        let Some(sel) = self.selection else {
+            return Action::Region(Drag::Create { anchor: p });
+        };
+
+        if let Some(index) = self.selected {
+            let shape = self.annotations[index];
+            if shape.is_box() {
+                if let Some((hx, hy)) = handle_at(shape.rect(), p, tol) {
+                    let drag = Drag::Resize { start: p, orig: shape.rect(), hx, hy };
+                    return Action::ResizeBox { index, drag };
+                }
+            } else if p.distance(shape.b) <= tol {
+                return Action::MoveEnd { index, end_b: true };
+            } else if p.distance(shape.a) <= tol {
+                return Action::MoveEnd { index, end_b: false };
+            }
+        }
+
+        if let Some((hx, hy)) = edges_at(sel, p, tol) {
+            return Action::Region(Drag::Resize { start: p, orig: sel, hx, hy });
+        }
+        if !sel.contains(p) {
+            return Action::Region(Drag::Create { anchor: p });
+        }
+
+        let move_shape = |index: usize| Action::MoveShape {
+            index,
+            start: p,
+            orig: self.annotations[index],
+        };
+        match self.tool {
+            // Topmost annotation under the pointer, else the region itself.
+            Tool::Select => match self.annotations.iter().rposition(|a| a.hit(p, tol)) {
+                Some(index) => move_shape(index),
+                None => Action::Region(Drag::Move { start: p, orig: sel }),
             },
-            None => Drag::Create { anchor: p },
+            // While drawing, only the selected annotation can be grabbed, so new
+            // shapes can start on top of existing ones.
+            Tool::Shape(_) => match self.selected {
+                Some(index) if self.annotations[index].hit(p, tol) => move_shape(index),
+                _ => Action::NewShape { anchor: p },
+            },
         }
     }
+
+    fn begin_action(&mut self, action: Action) {
+        match action {
+            Action::Region(Drag::Create { .. } | Drag::Move { .. }) => self.selected = None,
+            Action::Region(Drag::Resize { .. }) => {}
+            Action::NewShape { anchor } => {
+                let Tool::Shape(kind) = self.tool else { return };
+                self.history.record(&self.annotations, None);
+                self.annotations.push(Annotation {
+                    kind,
+                    a: anchor,
+                    b: anchor,
+                    color: self.color,
+                    width: self.width,
+                });
+                self.selected = Some(self.annotations.len() - 1);
+            }
+            Action::MoveShape { index, .. }
+            | Action::ResizeBox { index, .. }
+            | Action::MoveEnd { index, .. } => {
+                self.select(index);
+                self.pending_undo = Some(self.annotations.clone());
+            }
+        }
+        self.action = Some(action);
+    }
+
+    /// Update whatever is being dragged for the pointer at `p`.
+    fn apply_action(&mut self, p: Pos2, mods: Modifiers, bounds: Rect) {
+        let Some(action) = self.action else { return };
+        match action {
+            Action::Region(drag) => {
+                // A stray click outside the region must not replace it with nothing.
+                if let Drag::Create { anchor } = drag {
+                    if anchor.distance(p) < 3.0 {
+                        return;
+                    }
+                }
+                self.selection = Some(drag.apply(p, mods, bounds));
+            }
+            Action::NewShape { anchor } => {
+                let Some(shape) = self.annotations.last_mut() else { return };
+                if shape.is_box() {
+                    shape.set_rect(Drag::Create { anchor }.apply(p, mods, bounds));
+                } else {
+                    let end = if mods.shift { annotate::snap_angle(anchor, p) } else { p };
+                    shape.a = if mods.alt { anchor - (end - anchor) } else { anchor };
+                    shape.b = end;
+                }
+            }
+            Action::MoveShape { index, start, orig } => {
+                let mut d = p - start;
+                if mods.shift {
+                    if d.x.abs() > d.y.abs() {
+                        d.y = 0.0;
+                    } else {
+                        d.x = 0.0;
+                    }
+                }
+                let mut moved = orig;
+                moved.translate(d.round());
+                self.change(index, moved);
+            }
+            Action::ResizeBox { index, drag } => {
+                let mut shape = self.annotations[index];
+                shape.set_rect(drag.apply(p, mods, bounds));
+                self.change(index, shape);
+            }
+            Action::MoveEnd { index, end_b } => {
+                let mut shape = self.annotations[index];
+                let fixed = if end_b { shape.a } else { shape.b };
+                let end = if mods.shift { annotate::snap_angle(fixed, p) } else { p };
+                if end_b {
+                    shape.b = end;
+                } else {
+                    shape.a = end;
+                }
+                self.change(index, shape);
+            }
+        }
+    }
+
+    fn end_action(&mut self) {
+        match self.action.take() {
+            Some(Action::NewShape { .. }) => {
+                // A click without a drag leaves no shape behind, and no undo step.
+                if self.annotations.last().is_some_and(Annotation::is_degenerate) {
+                    self.annotations.pop();
+                    self.history.forget_last();
+                    self.selected = None;
+                }
+            }
+            Some(Action::Region(_)) => {
+                if self.selection.is_some_and(|s| s.width() < 1.0 || s.height() < 1.0) {
+                    self.selection = None;
+                }
+            }
+            _ => {}
+        }
+        self.pending_undo = None;
+    }
+
+    /// Replace annotation `index` during a drag, recording the undo step on first change.
+    fn change(&mut self, index: usize, new: Annotation) {
+        if self.annotations[index] == new {
+            return;
+        }
+        if let Some(before) = self.pending_undo.take() {
+            self.history.record(&before, None);
+        }
+        self.annotations[index] = new;
+    }
+
+    // --- Editing commands --------------------------------------------------------------
+
+    fn select(&mut self, index: usize) {
+        self.selected = Some(index);
+        self.color = self.annotations[index].color;
+        self.width = self.annotations[index].width;
+    }
+
+    /// Push the current colour and width onto the selected annotation, if they differ.
+    fn restyle_selected(&mut self) {
+        let Some(index) = self.selected else { return };
+        let mut shape = self.annotations[index];
+        shape.color = self.color;
+        shape.width = self.width;
+        if shape != self.annotations[index] {
+            self.history.record(&self.annotations, Some(Repeat::Style));
+            self.annotations[index] = shape;
+        }
+    }
+
+    fn nudge_selected(&mut self, index: usize, by: Vec2) {
+        self.history.record(&self.annotations, Some(Repeat::Nudge));
+        self.annotations[index].translate(by);
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some(index) = self.selected.take() {
+            self.history.record(&self.annotations, None);
+            self.annotations.remove(index);
+        }
+    }
+
+    fn undo(&mut self) {
+        if self.history.undo(&mut self.annotations) {
+            self.selected = None;
+        }
+    }
+
+    fn redo(&mut self) {
+        if self.history.redo(&mut self.annotations) {
+            self.selected = None;
+        }
+    }
+
+    // --- Output ------------------------------------------------------------------------
 
     /// The pixels inside the current selection, stitched from every monitor it touches.
     /// Areas outside all monitors (possible when monitors differ in size) stay transparent.
@@ -552,7 +834,21 @@ impl Overlay {
         Some(out)
     }
 
+    /// The final image: the cropped capture with every annotation drawn onto it.
+    fn output(&self) -> Option<RgbaImage> {
+        let origin = self.selection?.intersect(self.bounds()).min;
+        let mut img = self.cropped()?;
+        annotate::render_onto(&mut img, origin, &self.annotations);
+        Some(img)
+    }
+
     fn copy_to_clipboard(img: &RgbaImage) -> AnyResult<()> {
+        // Test hook: write the "copied" image to a file instead, so automated checks
+        // can inspect the output without touching the user's clipboard.
+        if let Some(path) = std::env::var_os("DARKSHOT_COPY_TO") {
+            img.save(path)?;
+            return Ok(());
+        }
         arboard::Clipboard::new()?.set_image(arboard::ImageData {
             width: img.width() as usize,
             height: img.height() as usize,
@@ -576,6 +872,75 @@ impl Overlay {
         img.save(path)?;
         Ok(true)
     }
+
+    // --- Toolbar -----------------------------------------------------------------------
+
+    fn toolbar(&mut self, ctx: &egui::Context, pos: Pos2, pivot: Align2, within: Rect) -> ToolbarOutput {
+        let mut out = ToolbarOutput::default();
+        egui::Area::new(egui::Id::unique("darkshot-toolbar"))
+            .order(egui::Order::Foreground)
+            .pivot(pivot)
+            .fixed_pos(pos)
+            .constrain_to(within)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let tools = [
+                            (Tool::Select, "Select", "Select, move and resize (V)"),
+                            (Tool::Shape(ShapeKind::Rect), "Rect", "Rectangle (R)"),
+                            (Tool::Shape(ShapeKind::Ellipse), "Ellipse", "Ellipse (E)"),
+                            (Tool::Shape(ShapeKind::Line), "Line", "Line (L)"),
+                            (Tool::Shape(ShapeKind::Arrow), "Arrow", "Arrow (A)"),
+                        ];
+                        for (tool, name, tip) in tools {
+                            if ui.selectable_label(self.tool == tool, name).on_hover_text(tip).clicked() {
+                                self.tool = tool;
+                            }
+                        }
+
+                        ui.separator();
+                        for swatch in SWATCHES {
+                            let (rect, response) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                            ui.painter().rect_filled(rect.shrink(2.0), 3.0, swatch);
+                            if self.color == swatch {
+                                let ring = Stroke::new(1.5, Color32::WHITE);
+                                ui.painter().rect_stroke(rect, 4.0, ring, StrokeKind::Inside);
+                            }
+                            if response.clicked() {
+                                self.color = swatch;
+                            }
+                        }
+                        ui.color_edit_button_srgba(&mut self.color)
+                            .on_hover_text("Custom colour");
+                        ui.add(
+                            egui::DragValue::new(&mut self.width)
+                                .range(MIN_WIDTH..=MAX_WIDTH)
+                                .speed(0.25)
+                                .fixed_decimals(0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text("Thickness (mouse wheel)");
+
+                        ui.separator();
+                        let undo = ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo"));
+                        if undo.on_hover_text("Ctrl+Z").clicked() {
+                            self.undo();
+                        }
+                        let redo = ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo"));
+                        if redo.on_hover_text("Ctrl+Y").clicked() {
+                            self.redo();
+                        }
+
+                        ui.separator();
+                        out.copy = ui.button("Copy").on_hover_text("Ctrl+C").clicked();
+                        out.save = ui.button("Save").on_hover_text("Ctrl+S").clicked();
+                        out.close = ui.button("Close").on_hover_text("Esc").clicked();
+                    });
+                });
+            });
+        out
+    }
 }
 
 /// Text on a dark pill so it stays readable over any screenshot.
@@ -584,6 +949,20 @@ fn label(painter: &egui::Painter, pos: Pos2, anchor: Align2, text: String, color
     let rect = anchor.anchor_size(pos, galley.size());
     painter.rect_filled(rect.expand2(vec2(6.0, 3.0)), 4.0, Color32::from_black_alpha(200));
     painter.galley(rect.min, galley, color);
+}
+
+/// A small square grab handle centred on `at` (in points).
+fn handle(painter: &egui::Painter, at: Pos2, fill: Color32) {
+    let rect = Rect::from_center_size(at, Vec2::splat(HANDLE_SIZE));
+    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(40)), StrokeKind::Inside);
+}
+
+/// The eight handle positions of a rectangle: corners and edge midpoints.
+fn handle_points(r: Rect) -> impl Iterator<Item = Pos2> {
+    let xs = [r.left(), r.center().x, r.right()];
+    let ys = [r.top(), r.center().y, r.bottom()];
+    (0..9).filter(|i| *i != 4).map(move |i| Pos2::new(xs[i % 3], ys[i / 3]))
 }
 
 impl eframe::App for Overlay {
@@ -605,6 +984,7 @@ impl eframe::App for Overlay {
         let bounds = self.bounds();
         let to_px = |p: Pos2| ((p - screen.min) * scale).to_pos2();
         let to_pt = |p: Pos2| screen.min + p.to_vec2() / scale;
+        let rect_to_pt = |r: Rect| Rect::from_min_max(to_pt(r.min), to_pt(r.max));
         let tol = GRAB_TOLERANCE * scale;
 
         // Frozen screenshot as the backdrop, one textured quad per monitor.
@@ -621,11 +1001,10 @@ impl eframe::App for Overlay {
         }
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
-            let area = Rect::from_min_max(to_pt(m.min), to_pt(m.max));
-            painter.image(texture.id(), area, uv, Color32::WHITE);
+            painter.image(texture.id(), rect_to_pt(*m), uv, Color32::WHITE);
         }
 
-        // --- Mouse: create, move or resize the selection ---------------------------
+        // --- Mouse ---------------------------------------------------------------------
         let (hover, press_origin, mods) =
             ctx.input(|i| (i.pointer.latest_pos(), i.pointer.press_origin(), i.modifiers));
         if let Some(i) = hover.and_then(|p| {
@@ -646,74 +1025,166 @@ impl eframe::App for Overlay {
             trace(&format!(
                 "frame egui={:.0},{:.0} real={},{} sel={:.0},{:.0} drag={} moves={} fwd={} other={} forced={} slowest=0x{:04x}:{}us paint={}us",
                 seen.x, seen.y, real.x - b.left, real.y - b.top, sel.x, sel.y,
-                self.drag.is_some() as u8,
+                self.action.is_some() as u8,
                 m.moves, m.moves_forwarded, m.other, m.forced_paints, m.slowest.0, m.slowest.1, m.paint_us
             ));
         }
 
         if response.drag_started() {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
-                self.drag = Some(self.begin_drag(to_px(origin), tol));
+                let action = self.pick_action(to_px(origin), tol);
+                self.begin_action(action);
                 self.error = None;
             }
         }
         if response.dragged() {
-            if let (Some(drag), Some(p)) = (self.drag, response.interact_pointer_pos()) {
-                self.selection = Some(drag.apply(to_px(p), mods, bounds));
+            if let Some(p) = response.interact_pointer_pos() {
+                self.apply_action(to_px(p), mods, bounds);
             }
         }
         if response.drag_stopped() {
-            self.drag = None;
-            if self.selection.is_some_and(|s| s.width() < 1.0 || s.height() < 1.0) {
-                self.selection = None;
-            }
+            self.end_action();
         }
 
-        // Cursor reflects what a drag would do from here.
-        let preview = self
-            .drag
-            .or_else(|| hover.map(|p| self.begin_drag(to_px(p), tol)));
-        ctx.set_cursor_icon(match preview {
-            Some(Drag::Resize { hx, hy, .. }) => resize_cursor(hx, hy),
-            Some(Drag::Move { .. }) => CursorIcon::Move,
-            _ => CursorIcon::Crosshair,
+        // Cursor reflects what a drag would do from here. Over the toolbar, egui decides.
+        let preview = self.action.or_else(|| {
+            let p = hover.filter(|_| response.hovered())?;
+            Some(self.pick_action(to_px(p), tol))
         });
+        if let Some(action) = preview {
+            ctx.set_cursor_icon(match action {
+                Action::Region(Drag::Resize { hx, hy, .. })
+                | Action::ResizeBox { drag: Drag::Resize { hx, hy, .. }, .. } => resize_cursor(hx, hy),
+                Action::Region(Drag::Move { .. }) | Action::MoveShape { .. } => CursorIcon::Move,
+                Action::MoveEnd { .. } => CursorIcon::Grab,
+                _ => CursorIcon::Crosshair,
+            });
+        }
 
-        // --- Keyboard ----------------------------------------------------------------
-        let (nudge, select_all, copy, save, cancel) = ctx.input(|i| {
+        // --- Keyboard and wheel ----------------------------------------------------------
+        struct Keys {
+            nudge: Vec2,
+            select_all: bool,
+            copy: bool,
+            save: bool,
+            cancel: bool,
+            undo: bool,
+            redo: bool,
+            delete: bool,
+            tool: Option<Tool>,
+            wheel: f32,
+        }
+        let typing = ctx.egui_wants_keyboard_input();
+        let keys = ctx.input(|i| {
             let step = if i.modifiers.shift { 10.0 } else { 1.0 };
             let axis = |neg: Key, pos: Key| {
                 (i.num_presses(pos) as f32 - i.num_presses(neg) as f32) * step
             };
-            (
-                Vec2::new(
+            let ctrl = i.modifiers.command;
+            let plain = !ctrl && !i.modifiers.alt;
+            let tool = [
+                (Key::V, Tool::Select),
+                (Key::R, Tool::Shape(ShapeKind::Rect)),
+                (Key::E, Tool::Shape(ShapeKind::Ellipse)),
+                (Key::L, Tool::Shape(ShapeKind::Line)),
+                (Key::A, Tool::Shape(ShapeKind::Arrow)),
+            ]
+            .into_iter()
+            .find(|(key, _)| plain && i.key_pressed(*key))
+            .map(|(_, tool)| tool);
+            let wheel: f32 = i
+                .events
+                .iter()
+                .map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => delta.y,
+                    _ => 0.0,
+                })
+                .sum();
+            Keys {
+                nudge: Vec2::new(
                     axis(Key::ArrowLeft, Key::ArrowRight),
                     axis(Key::ArrowUp, Key::ArrowDown),
                 ),
-                i.modifiers.command && i.key_pressed(Key::A),
+                select_all: ctrl && i.key_pressed(Key::A),
                 // egui turns Ctrl+C into Event::Copy rather than a key press.
-                i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                copy: i.events.iter().any(|e| matches!(e, egui::Event::Copy))
                     || i.key_pressed(Key::Enter),
-                i.modifiers.command && i.key_pressed(Key::S),
-                i.key_pressed(Key::Escape),
-            )
+                save: ctrl && i.key_pressed(Key::S),
+                cancel: i.key_pressed(Key::Escape),
+                undo: ctrl && !i.modifiers.shift && i.key_pressed(Key::Z),
+                redo: ctrl && (i.key_pressed(Key::Y) || i.modifiers.shift && i.key_pressed(Key::Z)),
+                delete: i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+                tool,
+                wheel,
+            }
         });
 
-        if self.drag.is_none() {
-            if select_all {
+        let mut close = false;
+        if self.action.is_none() && !typing {
+            if keys.undo {
+                self.undo();
+            } else if keys.redo {
+                self.redo();
+            } else if keys.delete {
+                self.delete_selected();
+            } else if keys.select_all {
                 self.selection = Some(self.desktop.monitors[self.current_monitor]);
-            } else if nudge != Vec2::ZERO {
-                if let Some(sel) = self.selection {
-                    self.selection = Some(keep_inside(sel.translate(nudge), bounds));
+            } else if keys.nudge != Vec2::ZERO {
+                // Arrows move the selected annotation if there is one, else the region.
+                if let Some(index) = self.selected {
+                    self.nudge_selected(index, keys.nudge);
+                } else if let Some(sel) = self.selection {
+                    self.selection = Some(keep_inside(sel.translate(keys.nudge), bounds));
+                }
+            }
+            if let Some(tool) = keys.tool {
+                self.tool = tool;
+            }
+            if keys.cancel {
+                // Esc first lets go of the selected annotation, then closes.
+                if self.selected.take().is_none() {
+                    close = true;
                 }
             }
         }
+        if keys.wheel != 0.0 && response.hovered() {
+            self.width = (self.width + keys.wheel.signum()).clamp(MIN_WIDTH, MAX_WIDTH);
+        }
 
-        // --- Paint: dim outside the selection, outline, handles, labels --------------
+        // --- Toolbar -------------------------------------------------------------------
+        let creating_region = matches!(self.action, Some(Action::Region(Drag::Create { .. })));
+        let mut toolbar = ToolbarOutput::default();
+        if let (Some(sel_px), false) = (self.selection, creating_region) {
+            let sel = rect_to_pt(sel_px);
+            // Below the region's bottom-right corner, or tucked inside when the region
+            // reaches the bottom of its monitor.
+            let corner = sel_px.max - vec2(1.0, 1.0);
+            let monitor = self
+                .desktop
+                .monitors
+                .iter()
+                .find(|m| m.contains(corner))
+                .copied()
+                .unwrap_or(self.desktop.monitors[self.current_monitor]);
+            let monitor = rect_to_pt(monitor);
+            let (pos, pivot) = if monitor.bottom() - sel.bottom() > 48.0 {
+                (sel.right_bottom() + vec2(0.0, 8.0), Align2::RIGHT_TOP)
+            } else {
+                (sel.right_bottom() + vec2(-8.0, -8.0), Align2::RIGHT_BOTTOM)
+            };
+            toolbar = self.toolbar(&ctx, pos, pivot, monitor);
+        }
+        self.restyle_selected();
+
+        // --- Paint: annotations, dimming, region outline and handles, labels -----------
+        for annotation in &self.annotations {
+            annotation.paint(&painter, to_pt, scale);
+        }
+
         let dim = Color32::from_black_alpha(130);
         match self.selection {
             Some(sel_px) => {
-                let sel = Rect::from_min_max(to_pt(sel_px.min), to_pt(sel_px.max));
+                let sel = rect_to_pt(sel_px);
                 for rect in [
                     Rect::from_min_max(screen.min, Pos2::new(screen.right(), sel.top())),
                     Rect::from_min_max(Pos2::new(screen.left(), sel.bottom()), screen.max),
@@ -729,24 +1200,8 @@ impl eframe::App for Overlay {
                     painter.rect_filled(rect, 0.0, dim);
                 }
                 painter.rect_stroke(sel, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
-
-                // Eight handles: corners and edge midpoints.
-                let xs = [sel.left(), sel.center().x, sel.right()];
-                let ys = [sel.top(), sel.center().y, sel.bottom()];
-                for (ix, &x) in xs.iter().enumerate() {
-                    for (iy, &y) in ys.iter().enumerate() {
-                        if (ix, iy) == (1, 1) {
-                            continue;
-                        }
-                        let handle = Rect::from_center_size(Pos2::new(x, y), Vec2::splat(HANDLE_SIZE));
-                        painter.rect_filled(handle, 0.0, Color32::WHITE);
-                        painter.rect_stroke(
-                            handle,
-                            0.0,
-                            Stroke::new(1.0, Color32::from_gray(40)),
-                            StrokeKind::Inside,
-                        );
-                    }
+                for point in handle_points(sel) {
+                    handle(&painter, point, Color32::WHITE);
                 }
 
                 // Size readout above the selection, or inside it when there is no room.
@@ -763,10 +1218,27 @@ impl eframe::App for Overlay {
             }
         }
 
-        let hint = if self.selection.is_some() {
-            "Ctrl+C copy · Ctrl+S save · arrows nudge · Shift constrain · Alt from centre · Esc cancel"
-        } else {
+        // Handles of the selected annotation, in an accent colour to tell them apart
+        // from the region's.
+        if let Some(shape) = self.selected.map(|i| self.annotations[i]) {
+            if shape.is_box() {
+                let r = rect_to_pt(shape.rect());
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, ACCENT), StrokeKind::Middle);
+                for point in handle_points(r) {
+                    handle(&painter, point, ACCENT);
+                }
+            } else {
+                handle(&painter, to_pt(shape.a), ACCENT);
+                handle(&painter, to_pt(shape.b), ACCENT);
+            }
+        }
+
+        let hint = if self.selection.is_none() {
             "Drag to select an area · Ctrl+A whole screen · Esc cancel"
+        } else if self.selected.is_some() {
+            "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect"
+        } else {
+            "V select · R rectangle · E ellipse · L line · A arrow · Shift constrain · Alt from centre · Ctrl+Z undo"
         };
         let monitor = self.desktop.monitors[self.current_monitor];
         let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);
@@ -777,18 +1249,19 @@ impl eframe::App for Overlay {
         }
 
         // --- Actions -------------------------------------------------------------------
-        let close = || ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        if cancel {
-            close();
+        let copy = toolbar.copy || keys.copy && !typing;
+        let save = toolbar.save || keys.save && !typing;
+        if close || toolbar.close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if copy || save {
-            if let Some(img) = self.cropped() {
+            if let Some(img) = self.output() {
                 let result = if copy {
                     Self::copy_to_clipboard(&img).map(|()| true)
                 } else {
                     Self::save_to_file(&img, frame)
                 };
                 match result {
-                    Ok(true) => close(),
+                    Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Ok(false) => {} // save dialog cancelled: stay in the overlay
                     Err(e) => self.error = Some(format!("Failed: {e}")),
                 }
@@ -856,20 +1329,16 @@ mod tests {
     fn crop_stitches_across_monitors() {
         // Two 4x4 monitors side by side: left is red, right is blue and sits 2 px lower.
         let solid = |c: [u8; 4]| RgbaImage::from_pixel(4, 4, image::Rgba(c));
-        let overlay = Overlay {
-            desktop: Desktop {
+        let mut overlay = Overlay::with_desktop(
+            Desktop {
                 shots: vec![solid([255, 0, 0, 255]), solid([0, 0, 255, 255])],
                 bounds: RECT { left: -4, top: 0, right: 4, bottom: 6 },
                 monitors: vec![rect(0.0, 0.0, 4.0, 4.0), rect(4.0, 2.0, 8.0, 6.0)],
                 home: 0,
             },
-            textures: Vec::new(),
-            hwnd: None,
-            current_monitor: 0,
-            selection: Some(rect(3.0, 1.0, 6.0, 4.0)),
-            drag: None,
-            error: None,
-        };
+            None,
+        );
+        overlay.selection = Some(rect(3.0, 1.0, 6.0, 4.0));
         let out = overlay.cropped().unwrap();
         assert_eq!(out.dimensions(), (3, 3));
         assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]); // left monitor

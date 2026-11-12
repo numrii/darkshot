@@ -2,6 +2,7 @@
 // a capture can only leave the app via the clipboard or a file on disk.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod annotate;
 mod daemon;
 mod overlay;
 
