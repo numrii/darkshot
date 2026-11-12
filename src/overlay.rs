@@ -11,6 +11,7 @@ use eframe::egui::{
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -18,18 +19,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
 };
 
+use winit::event_loop::{DeviceEvents, EventLoop};
+
 use crate::AnyResult;
 
 /// How close (in points) the pointer must be to an edge or handle to grab it.
 const GRAB_TOLERANCE: f32 = 6.0;
 const HANDLE_SIZE: f32 = 7.0;
 
-/// Print a startup timing line when `DARKSHOT_TRACE` is set (debugging aid).
+/// Print a timing line (startup phases, then one per frame) when `DARKSHOT_TRACE` is set (debugging aid).
 fn trace(what: &str) {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-    if std::env::var_os("DARKSHOT_TRACE").is_some() {
-        eprintln!("TRACE {elapsed:>10.1?} {what}");
+    if *ENABLED.get_or_init(|| std::env::var_os("DARKSHOT_TRACE").is_some()) {
+        eprintln!("TRACE {:>9.1}ms {what}", elapsed.as_secs_f64() * 1000.0);
     }
 }
 
@@ -70,11 +74,20 @@ pub fn run() -> AnyResult<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    // We own the event loop (rather than calling `eframe::run_native`) so raw device
+    // events can be switched off. With them on, a high-polling-rate mouse floods the
+    // message queue with thousands of raw input messages per second; Windows only
+    // delivers paint messages when the queue is empty, so repaints starve and anything
+    // being dragged lags far behind the cursor.
+    let event_loop = EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+    event_loop.listen_device_events(DeviceEvents::Never);
+    let mut app = eframe::create_native(
         "Darkshot",
         options,
         Box::new(move |cc| Ok(Box::new(Overlay::new(cc, desktop)))),
-    )?;
+        &event_loop,
+    );
+    event_loop.run_app(&mut app)?;
     Ok(())
 }
 
@@ -281,8 +294,6 @@ struct Overlay {
     /// the first frame: the real limit is not known before then.
     textures: Vec<egui::TextureHandle>,
     hwnd: Option<HWND>,
-    /// Frames drawn so far, capped; only used for startup tracing.
-    frames: u8,
     /// The monitor the pointer was last on; Ctrl+A and the hint bar use it.
     current_monitor: usize,
     /// Selected region in image pixels.
@@ -298,12 +309,25 @@ impl Overlay {
             current_monitor: desktop.home,
             desktop,
             textures: Vec::new(),
-            frames: 0,
             hwnd: hwnd_of(cc),
             selection: None,
             drag: None,
             error: None,
         };
+        if let Some(hwnd) = overlay.hwnd {
+            // Switch off the window's fade-in. During that animation the live desktop
+            // shows through the frozen capture, which looks like ghosting when
+            // something on screen is moving. The window is still hidden at this point.
+            let disable: i32 = 1;
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                    std::ptr::from_ref(&disable).cast(),
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
         overlay.cover_desktop(true);
         if let Some(hwnd) = overlay.hwnd {
             unsafe { SetForegroundWindow(hwnd) };
@@ -445,10 +469,7 @@ impl eframe::App for Overlay {
                 ));
             }
         }
-        if self.frames < 3 {
-            self.frames += 1;
-            trace("frame painted");
-        }
+        trace("frame");
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
             let area = Rect::from_min_max(to_pt(m.min), to_pt(m.max));
@@ -679,7 +700,6 @@ mod tests {
             },
             textures: Vec::new(),
             hwnd: None,
-            frames: 0,
             current_monitor: 0,
             selection: Some(rect(3.0, 1.0, 6.0, 4.0)),
             drag: None,
