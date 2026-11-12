@@ -28,6 +28,9 @@ pub enum ShapeKind {
     Text,
     /// A region of the capture made unreadable; `width` is the strength.
     Blur,
+    /// A numbered circle for step-by-step instructions, centred on `a`; `width` is the
+    /// diameter and `text` the number.
+    Step,
 }
 
 /// How text stands out from what is behind it.
@@ -219,9 +222,11 @@ impl Annotation {
     }
 
     /// Bounding box of what is drawn: the freehand path, the text with its padding,
-    /// or the two end points.
+    /// the step marker's circle, or the two end points.
     pub fn path_bounds(&self) -> Rect {
-        if self.kind == ShapeKind::Text {
+        if self.kind == ShapeKind::Step {
+            Rect::from_center_size(self.a, Vec2::splat(self.width))
+        } else if self.kind == ShapeKind::Text {
             self.text_rect().expand2(self.text_padding())
         } else if self.is_freehand() {
             Rect::from_points(&self.points)
@@ -232,7 +237,9 @@ impl Annotation {
 
     /// Too small to be a deliberate shape (a stray click rather than a drag).
     pub fn is_degenerate(&self) -> bool {
-        if self.kind == ShapeKind::Text {
+        if self.kind == ShapeKind::Step {
+            false
+        } else if self.kind == ShapeKind::Text {
             self.text.trim().is_empty()
         } else if self.is_freehand() {
             let r = self.path_bounds();
@@ -247,8 +254,12 @@ impl Annotation {
     /// The full, undashed path of the shape (for lines: end to end, ignoring heads).
     fn outline(&self) -> Polyline {
         match self.kind {
-            ShapeKind::Rect | ShapeKind::Blur | ShapeKind::Text => {
-                let r = if self.kind == ShapeKind::Text { self.path_bounds() } else { self.rect() };
+            ShapeKind::Rect | ShapeKind::Blur | ShapeKind::Text | ShapeKind::Step => {
+                let r = if matches!(self.kind, ShapeKind::Text | ShapeKind::Step) {
+                    self.path_bounds()
+                } else {
+                    self.rect()
+                };
                 Polyline {
                     points: vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()],
                     closed: true,
@@ -276,7 +287,7 @@ impl Annotation {
     }
 
     pub fn geometry(&self) -> Geometry {
-        if matches!(self.kind, ShapeKind::Text | ShapeKind::Blur) {
+        if matches!(self.kind, ShapeKind::Text | ShapeKind::Blur | ShapeKind::Step) {
             // Drawn from rasterised layers, not from strokes.
             return Geometry::default();
         }
@@ -317,6 +328,7 @@ impl Annotation {
         match self.kind {
             ShapeKind::Text => return self.path_bounds().expand(tol).contains(p),
             ShapeKind::Blur => return self.rect().expand(tol).contains(p),
+            ShapeKind::Step => return p.distance(self.a) <= self.width / 2.0 + tol,
             _ => {}
         }
         let reach = self.width / 2.0 + tol;
@@ -380,6 +392,7 @@ impl Annotation {
 
         match self.kind {
             ShapeKind::Text => return self.rasterize_text(pixmap, origin),
+            ShapeKind::Step => return self.rasterize_step(pixmap, origin),
             // Blur regions need the capture's pixels; the overlay applies them.
             ShapeKind::Blur => return,
             _ => {}
@@ -473,6 +486,40 @@ impl Annotation {
 
 /// How far the outline reaches beyond each letter: a thin halo, just enough to lift
 /// the text off a busy background.
+impl Annotation {
+    /// A filled circle in the annotation's colour with the number centred in a
+    /// contrasting colour.
+    fn rasterize_step(&self, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
+        use tiny_skia::{FillRule, Paint, PathBuilder, Transform};
+
+        let shift = Transform::from_translate(-origin.x, -origin.y);
+        let paint_of = |c: Color32| {
+            let [r, g, b, a] = c.to_srgba_unmultiplied();
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(r, g, b, a);
+            paint.anti_alias = true;
+            paint
+        };
+        let radius = self.width / 2.0;
+        if let Some(circle) = PathBuilder::from_circle(self.a.x, self.a.y, radius) {
+            pixmap.fill_path(&circle, &paint_of(self.color), FillRule::Winding, shift, None);
+        }
+        // Size the number to the circle (smaller for more digits), then centre its
+        // actual glyph outline, so it looks centred whatever the font's metrics.
+        let digits = self.text.chars().count().max(1) as f32;
+        let size = self.width * if digits > 1.0 { 0.62 / digits.sqrt() } else { 0.62 };
+        if let Some(glyphs) = crate::text::outline(&self.text, size, Pos2::ZERO) {
+            let b = glyphs.bounds();
+            let centre = Transform::from_translate(
+                self.a.x - (b.left() + b.width() / 2.0),
+                self.a.y - (b.top() + b.height() / 2.0),
+            );
+            let transform = centre.post_concat(shift);
+            pixmap.fill_path(&glyphs, &paint_of(contrast(self.color)), FillRule::Winding, transform, None);
+        }
+    }
+}
+
 fn halo_width(font_size: f32) -> f32 {
     (font_size * 0.05).max(1.0)
 }
@@ -834,6 +881,25 @@ mod tests {
         let mut empty = shape(ShapeKind::Text, (0.0, 0.0), (0.0, 0.0));
         empty.text = "  \n ".into();
         assert!(empty.is_degenerate());
+    }
+
+    #[test]
+    fn step_markers() {
+        let mut step = shape(ShapeKind::Step, (50.0, 40.0), (50.0, 40.0));
+        step.width = 30.0;
+        step.text = "3".into();
+        assert!(!step.is_degenerate());
+        assert_eq!(step.path_bounds(), Rect::from_center_size(Pos2::new(50.0, 40.0), Vec2::splat(30.0)));
+        assert!(step.hit(Pos2::new(62.0, 40.0), 0.0) && !step.hit(Pos2::new(70.0, 40.0), 2.0));
+
+        let mut img = RgbaImage::from_pixel(100, 80, image::Rgba([255, 255, 255, 255]));
+        render_onto(&mut img, Pos2::ZERO, &[step.clone()]);
+        // Red disc with a white number in the middle; nothing outside the circle.
+        assert_eq!(img.get_pixel(50, 28).0, [255, 0, 0, 255]); // inside, above the digit
+        let centre_band: Vec<_> = (44..57).map(|x| img.get_pixel(x, 40).0).collect();
+        assert!(centre_band.iter().any(|p| p[1] > 200), "no white digit: {centre_band:?}");
+        assert_eq!(img.get_pixel(50, 10).0, [255, 255, 255, 255]);
+        assert_eq!(img.get_pixel(80, 40).0, [255, 255, 255, 255]);
     }
 
     #[test]

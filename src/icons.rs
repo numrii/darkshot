@@ -16,6 +16,8 @@ pub enum Icon {
     Marker,
     Text,
     Blur,
+    Step,
+    Eyedropper,
     /// An arrow with a head at both ends.
     DoubleHead,
     Undo,
@@ -282,6 +284,24 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
             line(&[(7.5, 16.5), (12.5, 16.5)]);
         }
         Icon::Blur => effect_preview(painter, area.shrink(2.0 * unit), Effect::Pixelate, color),
+        Icon::Step => {
+            // A filled disc with "1" knocked out.
+            painter.circle_filled(p(10.0, 10.0), 8.0 * unit, color);
+            painter.text(
+                p(10.0, 10.3),
+                egui::Align2::CENTER_CENTER,
+                "1",
+                egui::FontId::proportional(11.0 * unit),
+                background,
+            );
+        }
+        Icon::Eyedropper => {
+            // A pipette: bulb at the top right, tube running down to the tip.
+            line(&[(4.0, 16.0), (12.0, 8.0)]);
+            line(&[(9.5, 5.5), (14.5, 10.5)]);
+            painter.circle_filled(p(14.5, 5.5), 3.2 * unit, color);
+            painter.circle_filled(p(3.5, 16.5), 1.2 * unit, color);
+        }
         Icon::DoubleHead => {
             line(&[(6.0, 10.0), (14.0, 10.0)]);
             triangle([(2.0, 10.0), (7.5, 6.0), (7.5, 14.0)]);

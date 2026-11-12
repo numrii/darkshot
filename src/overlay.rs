@@ -516,6 +516,8 @@ const OPTIONS_WIDTH: f32 = icons::PICKER_WIDTH * 2.0 + icons::BUTTON + 3.0 * 2.0
 /// Default text size and blur strength, in pixels.
 const TEXT_SIZE: f32 = 24.0;
 const BLUR_STRENGTH: f32 = 12.0;
+/// Default step marker diameter, in pixels.
+const STEP_SIZE: f32 = 28.0;
 
 /// Tools that remember their own colour and size, separately from the rest (which
 /// share one). The highlighter starts yellow and wide, text at a readable size.
@@ -525,6 +527,7 @@ enum StyleSlot {
     Marker,
     Text,
     Blur,
+    Step,
 }
 
 fn style_slot(tool: Tool) -> StyleSlot {
@@ -532,6 +535,7 @@ fn style_slot(tool: Tool) -> StyleSlot {
         Tool::Shape(ShapeKind::Marker) => StyleSlot::Marker,
         Tool::Shape(ShapeKind::Text) => StyleSlot::Text,
         Tool::Shape(ShapeKind::Blur) => StyleSlot::Blur,
+        Tool::Shape(ShapeKind::Step) => StyleSlot::Step,
         _ => StyleSlot::Shared,
     }
 }
@@ -542,6 +546,7 @@ fn width_range(kind: Option<ShapeKind>) -> std::ops::RangeInclusive<f32> {
     match kind {
         Some(ShapeKind::Text) => 8.0..=120.0,
         Some(ShapeKind::Blur) => 4.0..=60.0,
+        Some(ShapeKind::Step) => 16.0..=80.0,
         _ => MIN_WIDTH..=MAX_WIDTH,
     }
 }
@@ -598,6 +603,10 @@ struct Overlay {
     /// `width` when switching tools.
     styles: HashMap<StyleSlot, (Color32, f32)>,
     editing: Option<TextEdit>,
+    /// The eyedropper is active: the next click picks a colour from the capture.
+    picking_color: bool,
+    /// The press that picked a colour; its drag is ignored.
+    ignore_drag: bool,
     /// The save panel: open or not, and its settings.
     save_open: bool,
     save_options: SaveOptions,
@@ -654,8 +663,11 @@ impl Overlay {
                 (StyleSlot::Text, (swatches[0], TEXT_SIZE)),
                 // Black: the colour of a redaction (pixelate and blur ignore it).
                 (StyleSlot::Blur, (Color32::BLACK, BLUR_STRENGTH)),
+                (StyleSlot::Step, (swatches[0], STEP_SIZE)),
             ]),
             editing: None,
+            picking_color: false,
+            ignore_drag: false,
             save_open: false,
             save_options: SaveOptions::from_settings(settings),
             annotations: Vec::new(),
@@ -819,6 +831,12 @@ impl Overlay {
                     effect: self.effect,
                 });
                 self.stroke_points = vec![anchor];
+                if kind == ShapeKind::Step {
+                    let next = self.next_step_number();
+                    if let Some(step) = self.annotations.last_mut() {
+                        step.text = next.to_string();
+                    }
+                }
                 self.selected = Some(self.annotations.len() - 1);
             }
             Action::MoveShape { index, .. }
@@ -862,7 +880,9 @@ impl Overlay {
             }
             Action::NewShape { anchor } => {
                 let Some(shape) = self.annotations.last_mut() else { return };
-                if shape.is_box() {
+                if shape.kind == ShapeKind::Step {
+                    (shape.a, shape.b) = (p, p);
+                } else if shape.is_box() {
                     shape.set_rect(Drag::Create { anchor }.apply(p, mods, bounds));
                 } else if matches!(shape.kind, ShapeKind::Pen | ShapeKind::Marker) {
                     if self.stroke_points.last().is_none_or(|last| last.distance(p) >= MIN_POINT_SPACING) {
@@ -1029,6 +1049,21 @@ impl Overlay {
             self.history.record(&self.annotations, Some(Repeat::Style));
             self.annotations[index] = shape;
         }
+    }
+
+    /// The number for a new step marker: one more than the highest so far.
+    fn next_step_number(&self) -> u32 {
+        let numbers = self.annotations.iter().filter(|a| a.kind == ShapeKind::Step);
+        numbers.filter_map(|a| a.text.parse::<u32>().ok()).max().unwrap_or(0) + 1
+    }
+
+    /// The captured colour at desktop pixel `p` (undimmed, without annotations).
+    fn pixel_at(&self, p: Pos2) -> Option<Color32> {
+        let (monitor, shot) =
+            self.desktop.monitors.iter().zip(&self.desktop.shots).find(|(m, _)| m.contains(p))?;
+        let (x, y) = ((p.x - monitor.min.x) as u32, (p.y - monitor.min.y) as u32);
+        let [r, g, b, _] = shot.get_pixel_checked(x, y)?.0;
+        Some(Color32::from_rgb(r, g, b))
     }
 
     // --- Text editing ------------------------------------------------------------------
@@ -1291,6 +1326,8 @@ impl Overlay {
                 icons::picker(ui, &mut self.text_style, true, &TextStyle::ALL, icons::text_style_preview)
                     .on_hover_text("Text style");
             }
+            // Step markers have no options beyond colour and size.
+            ShapeKind::Step => {}
             ShapeKind::Blur => {
                 icons::picker(ui, &mut self.effect, true, &Effect::ALL, icons::effect_preview)
                     .on_hover_text("Effect");
@@ -1345,6 +1382,7 @@ impl Overlay {
                             ),
                             (Tool::Shape(ShapeKind::Text), Icon::Text, "Text (T)"),
                             (Tool::Shape(ShapeKind::Blur), Icon::Blur, "Hide: pixelate, Gaussian blur or redact (B)"),
+                            (Tool::Shape(ShapeKind::Step), Icon::Step, "Numbered step (N)"),
                         ];
                         for (tool, icon, tip) in tools {
                             let button = icons::button(ui, icon, self.tool == tool, true);
@@ -1366,6 +1404,10 @@ impl Overlay {
                                 self.color = swatch;
                             }
                         }
+                        let dropper = icons::button(ui, Icon::Eyedropper, self.picking_color, true);
+                        if dropper.on_hover_text("Pick a colour from the screen (I)").clicked() {
+                            self.picking_color = !self.picking_color;
+                        }
                         icons::color_picker_button(ui, &mut self.color)
                             .on_hover_text("Custom colour");
                         let kind = self.style_kind();
@@ -1374,6 +1416,7 @@ impl Overlay {
                             _ if redact => "Not used by Redact",
                             Some(ShapeKind::Text) => "Font size (mouse wheel)",
                             Some(ShapeKind::Blur) => "Strength (mouse wheel)",
+                            Some(ShapeKind::Step) => "Size (mouse wheel)",
                             _ => "Thickness (mouse wheel)",
                         };
                         // Fixed width, so the toolbar does not shift when the value
@@ -1640,18 +1683,30 @@ impl eframe::App for Overlay {
 
         if response.drag_started() {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
-                let action = self.pick_action(to_px(origin), tol);
-                self.begin_action(action);
-                self.error = None;
+                if self.picking_color {
+                    if let Some(color) = self.pixel_at(to_px(origin)) {
+                        self.color = color;
+                    }
+                    self.picking_color = false;
+                    self.ignore_drag = true;
+                } else {
+                    let action = self.pick_action(to_px(origin), tol);
+                    self.begin_action(action);
+                    self.error = None;
+                }
             }
         }
-        if response.dragged() {
+        if response.dragged() && !self.ignore_drag {
             if let Some(p) = response.interact_pointer_pos() {
                 self.apply_action(to_px(p), mods, bounds);
             }
         }
         if response.drag_stopped() {
-            self.end_action();
+            if std::mem::take(&mut self.ignore_drag) {
+                // The eyedropper's click: nothing to finish.
+            } else {
+                self.end_action();
+            }
         }
 
         // Cursor reflects what a drag would do from here. Over the toolbar, egui decides.
@@ -1682,6 +1737,7 @@ impl eframe::App for Overlay {
             redo: bool,
             delete: bool,
             tool: Option<Tool>,
+            eyedropper: bool,
             wheel: f32,
         }
         let typing = ctx.egui_wants_keyboard_input();
@@ -1702,6 +1758,7 @@ impl eframe::App for Overlay {
                 (Key::M, Tool::Shape(ShapeKind::Marker)),
                 (Key::T, Tool::Shape(ShapeKind::Text)),
                 (Key::B, Tool::Shape(ShapeKind::Blur)),
+                (Key::N, Tool::Shape(ShapeKind::Step)),
             ]
             .into_iter()
             .find(|(key, _)| plain && i.key_pressed(*key))
@@ -1729,6 +1786,7 @@ impl eframe::App for Overlay {
                 redo: ctrl && (i.key_pressed(Key::Y) || i.modifiers.shift && i.key_pressed(Key::Z)),
                 delete: i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
                 tool,
+                eyedropper: plain && i.key_pressed(Key::I),
                 wheel,
             }
         });
@@ -1758,7 +1816,10 @@ impl eframe::App for Overlay {
         // or Enter saves.
         let mut esc_used = false;
         let mut save_requested = false;
-        if self.save_open {
+        if self.picking_color && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.picking_color = false;
+            esc_used = true;
+        } else if self.save_open {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.save_open = false;
                 esc_used = true;
@@ -1790,6 +1851,9 @@ impl eframe::App for Overlay {
             }
             if let Some(tool) = keys.tool {
                 self.set_tool(tool);
+            }
+            if keys.eyedropper {
+                self.picking_color = !self.picking_color;
             }
             if keys.cancel {
                 // Esc first lets go of the selected annotation, then closes.
@@ -1879,7 +1943,7 @@ impl eframe::App for Overlay {
             // Freehand strokes and text are shown from rasterised layers, exactly as
             // they will be saved. The stroke being drawn changes every frame, so it is
             // painted directly.
-            let layered = annotation.is_freehand() || annotation.kind == ShapeKind::Text;
+            let layered = annotation.is_freehand() || matches!(annotation.kind, ShapeKind::Text | ShapeKind::Step);
             if layered && !(drawing && i == last) {
                 let key = layer_key(annotation);
                 if !self.layers.contains_key(&key) {
@@ -1898,7 +1962,8 @@ impl eframe::App for Overlay {
         }
         self.layers.retain(|key, _| used.contains(key));
 
-        let dim = Color32::from_black_alpha(130);
+        // No dimming while picking a colour, so the screen shows the true colours.
+        let dim = if self.picking_color { Color32::TRANSPARENT } else { Color32::from_black_alpha(130) };
         match self.selection {
             Some(sel_px) => {
                 let sel = rect_to_pt(sel_px);
@@ -1981,7 +2046,24 @@ impl eframe::App for Overlay {
             painter.line_segment(caret, Stroke::new(1.5, ACCENT));
         }
 
-        let hint = if self.editing.is_some() {
+        // The eyedropper's preview: the colour under the cursor, next to it.
+        if self.picking_color {
+            ctx.set_cursor_icon(CursorIcon::Crosshair);
+            if let Some(p) = hover {
+                if let Some(color) = self.pixel_at(to_px(p)) {
+                    let centre = p + vec2(26.0, 26.0);
+                    painter.circle_filled(centre, 15.0, color);
+                    painter.circle_stroke(centre, 15.0, Stroke::new(2.0, Color32::WHITE));
+                    painter.circle_stroke(centre, 16.5, Stroke::new(1.0, Color32::from_black_alpha(160)));
+                    let hex = crate::settings::to_hex(color);
+                    label(&painter, centre + vec2(22.0, 0.0), Align2::LEFT_CENTER, hex, Color32::WHITE);
+                }
+            }
+        }
+
+        let hint = if self.picking_color {
+            "Click to pick a colour · Esc cancel"
+        } else if self.editing.is_some() {
             "Type · Enter new line · arrows move · Esc or click outside to finish"
         } else if self.selection.is_none() {
             "Drag to select an area · Ctrl+click a window · hold Ctrl to snap · Ctrl+A whole screen · Esc cancel"
