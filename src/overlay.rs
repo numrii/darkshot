@@ -28,6 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winit::event_loop::{DeviceEvents, EventLoop};
 
 use crate::annotate::{self, Annotation, History, Repeat, ShapeKind, MAX_WIDTH, MIN_WIDTH};
+use crate::icons::{self, Icon};
 use crate::AnyResult;
 
 /// How close (in points) the pointer must be to an edge or handle to grab it.
@@ -546,6 +547,7 @@ impl Overlay {
 
     fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
         trace("window created");
+        setup_text(&cc.egui_ctx);
         let overlay = Self::with_desktop(desktop, hwnd_of(cc));
         if let Some(hwnd) = overlay.hwnd {
             // Switch off the window's fade-in. During that animation the live desktop
@@ -885,15 +887,17 @@ impl Overlay {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
                         let tools = [
-                            (Tool::Select, "Select", "Select, move and resize (V)"),
-                            (Tool::Shape(ShapeKind::Rect), "Rect", "Rectangle (R)"),
-                            (Tool::Shape(ShapeKind::Ellipse), "Ellipse", "Ellipse (E)"),
-                            (Tool::Shape(ShapeKind::Line), "Line", "Line (L)"),
-                            (Tool::Shape(ShapeKind::Arrow), "Arrow", "Arrow (A)"),
+                            (Tool::Select, Icon::Select, "Select, move and resize (V)"),
+                            (Tool::Shape(ShapeKind::Rect), Icon::Rect, "Rectangle (R)"),
+                            (Tool::Shape(ShapeKind::Ellipse), Icon::Ellipse, "Ellipse (E)"),
+                            (Tool::Shape(ShapeKind::Line), Icon::Line, "Line (L)"),
+                            (Tool::Shape(ShapeKind::Arrow), Icon::Arrow, "Arrow (A)"),
                         ];
-                        for (tool, name, tip) in tools {
-                            if ui.selectable_label(self.tool == tool, name).on_hover_text(tip).clicked() {
+                        for (tool, icon, tip) in tools {
+                            let button = icons::button(ui, icon, self.tool == tool, true);
+                            if button.on_hover_text(tip).clicked() {
                                 self.tool = tool;
                             }
                         }
@@ -923,24 +927,54 @@ impl Overlay {
                         .on_hover_text("Thickness (mouse wheel)");
 
                         ui.separator();
-                        let undo = ui.add_enabled(self.history.can_undo(), egui::Button::new("Undo"));
-                        if undo.on_hover_text("Ctrl+Z").clicked() {
+                        let undo = icons::button(ui, Icon::Undo, false, self.history.can_undo());
+                        if undo.on_hover_text("Undo (Ctrl+Z)").clicked() {
                             self.undo();
                         }
-                        let redo = ui.add_enabled(self.history.can_redo(), egui::Button::new("Redo"));
-                        if redo.on_hover_text("Ctrl+Y").clicked() {
+                        let redo = icons::button(ui, Icon::Redo, false, self.history.can_redo());
+                        if redo.on_hover_text("Redo (Ctrl+Y)").clicked() {
                             self.redo();
                         }
 
                         ui.separator();
-                        out.copy = ui.button("Copy").on_hover_text("Ctrl+C").clicked();
-                        out.save = ui.button("Save").on_hover_text("Ctrl+S").clicked();
-                        out.close = ui.button("Close").on_hover_text("Esc").clicked();
+                        let action = |ui: &mut egui::Ui, icon, tip| {
+                            icons::button(ui, icon, false, true).on_hover_text(tip).clicked()
+                        };
+                        out.copy = action(ui, Icon::Copy, "Copy to clipboard (Ctrl+C)");
+                        out.save = action(ui, Icon::Save, "Save to file (Ctrl+S)");
+                        out.close = action(ui, Icon::Close, "Close (Esc)");
                     });
                 });
             });
         out
     }
+}
+
+/// Make UI text as crisp as native Windows text.
+///
+/// - Use Segoe UI, the Windows UI font, read from the local Windows font folder. It
+///   ships hinting instructions tuned for small sizes, which egui's bundled font lacks.
+///   If it is missing, egui's own font is kept.
+/// - Turn off sub-pixel binning: it lets glyphs sit at fractional pixel offsets, which
+///   smears their edges at 100% display scaling.
+fn setup_text(ctx: &egui::Context) {
+    let font = std::env::var_os("WINDIR")
+        .map(|dir| std::path::PathBuf::from(dir).join("Fonts").join("segoeui.ttf"))
+        .and_then(|path| std::fs::read(path).ok());
+    if let Some(bytes) = font {
+        ctx.add_font(egui::epaint::text::FontInsert::new(
+            "Segoe UI",
+            egui::FontData::from_owned(bytes),
+            vec![egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: egui::epaint::text::FontPriority::Highest,
+            }],
+        ));
+    }
+    ctx.all_styles_mut(|style| {
+        style.visuals.text_options.subpixel_binning = false;
+        style.visuals.text_options.font_hinting = true;
+    });
 }
 
 /// Text on a dark pill so it stays readable over any screenshot.
