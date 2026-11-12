@@ -1181,7 +1181,7 @@ impl Overlay {
         let mut img = self.crop_desktop(area)?;
         match shape.effect {
             Effect::Pixelate => effects::pixelate(&mut img, strength),
-            Effect::Blur => effects::blur(&mut img, strength),
+            Effect::Gaussian => effects::blur(&mut img, strength),
             Effect::Redact => unreachable!(),
         }
         Some((img, area))
@@ -1313,7 +1313,7 @@ impl Overlay {
                                 "Highlighter (M), Shift for a straight line",
                             ),
                             (Tool::Shape(ShapeKind::Text), Icon::Text, "Text (T)"),
-                            (Tool::Shape(ShapeKind::Blur), Icon::Blur, "Blur or pixelate (B)"),
+                            (Tool::Shape(ShapeKind::Blur), Icon::Blur, "Hide: pixelate, Gaussian blur or redact (B)"),
                         ];
                         for (tool, icon, tip) in tools {
                             let button = icons::button(ui, icon, self.tool == tool, true);

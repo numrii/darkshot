@@ -51,7 +51,8 @@ impl TextStyle {
 pub enum Effect {
     #[default]
     Pixelate,
-    Blur,
+    /// A Gaussian blur.
+    Gaussian,
     /// A solid, fully opaque fill in the annotation's colour. Unlike pixelate and blur,
     /// nothing of the original can be recovered from it.
     Redact,
@@ -59,7 +60,7 @@ pub enum Effect {
 
 impl Effect {
     pub const ALL: [(Effect, &'static str); 3] =
-        [(Effect::Pixelate, "Pixelate"), (Effect::Blur, "Blur"), (Effect::Redact, "Redact")];
+        [(Effect::Pixelate, "Pixelate"), (Effect::Gaussian, "Gaussian"), (Effect::Redact, "Redact")];
 }
 
 /// How see-through the highlighter is (multiplies the colour's own opacity).
@@ -470,8 +471,10 @@ impl Annotation {
     }
 }
 
+/// How far the outline reaches beyond each letter: a thin halo, just enough to lift
+/// the text off a busy background.
 fn halo_width(font_size: f32) -> f32 {
-    (font_size * 0.1).max(1.5)
+    (font_size * 0.05).max(1.0)
 }
 
 /// Black or white, whichever stands out more against `c`.
@@ -1086,5 +1089,27 @@ fn style_sheet() {
         }
     }
     render_onto(&mut img, Pos2::ZERO, &shapes);
-    img.save(path).unwrap();
+
+    // Text styles, over a light and a dark band.
+    let mut sheet = RgbaImage::from_pixel(560, 520, image::Rgba([246, 246, 246, 255]));
+    image::imageops::replace(&mut sheet, &img, 0, 0);
+    for y in 460..520 {
+        for x in 0..560 {
+            sheet.put_pixel(x, y, image::Rgba([30, 30, 34, 255]));
+        }
+    }
+    let mut texts = Vec::new();
+    for (band, y) in [(0, 410.0), (1, 470.0)] {
+        for (col, (style, name)) in TextStyle::ALL.iter().enumerate() {
+            let mut text = base(ShapeKind::Text, (20.0 + col as f32 * 180.0, y), (0.0, 0.0), 24.0);
+            text.text = (*name).to_owned();
+            text.text_style = *style;
+            if band == 1 {
+                text.color = Color32::from_rgb(0xFF, 0xE6, 0x00);
+            }
+            texts.push(text);
+        }
+    }
+    render_onto(&mut sheet, Pos2::ZERO, &texts);
+    sheet.save(path).unwrap();
 }

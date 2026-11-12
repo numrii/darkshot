@@ -156,7 +156,7 @@ pub fn effect_preview(painter: &egui::Painter, area: Rect, effect: Effect, color
     if effect == Effect::Redact {
         // A solid bar over two lines of "text".
         painter.rect_filled(square.shrink(side * 0.05), 1.5, color);
-    } else if effect == Effect::Blur {
+    } else if effect == Effect::Gaussian {
         for (i, alpha) in [0.15, 0.3, 0.5, 0.8].into_iter().enumerate() {
             let r = side / 2.0 * (1.0 - i as f32 * 0.22);
             painter.circle_filled(square.center(), r, color.gamma_multiply(alpha));
