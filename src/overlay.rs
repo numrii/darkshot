@@ -487,12 +487,13 @@ enum Action {
     MoveEnd { index: usize, end_b: bool },
 }
 
-/// Default annotation colours: red, green, blue, amber.
+/// Default annotation colours: red, green, blue, and the highlighter's yellow (so the
+/// highlighter's default shows as a selected swatch).
 const SWATCHES: [Color32; 4] = [
     Color32::from_rgb(0xE5, 0x48, 0x4D),
     Color32::from_rgb(0x30, 0xA4, 0x6C),
     Color32::from_rgb(0x3E, 0x63, 0xDD),
-    Color32::from_rgb(0xFF, 0xB2, 0x24),
+    MARKER_COLOR,
 ];
 const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
 /// Default highlighter colour (classic highlighter yellow) and thickness.
