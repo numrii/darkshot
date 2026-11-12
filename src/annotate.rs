@@ -24,6 +24,38 @@ pub enum ShapeKind {
     Pen,
     /// Freehand highlighter: wide and translucent.
     Marker,
+    /// Text; `width` is the font size in pixels.
+    Text,
+    /// A region of the capture made unreadable; `width` is the strength.
+    Blur,
+}
+
+/// How text stands out from what is behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub enum TextStyle {
+    #[default]
+    Plain,
+    /// A contrasting halo round each letter.
+    Outline,
+    /// A filled box in the text colour, with the text in a contrasting colour.
+    Box,
+}
+
+impl TextStyle {
+    pub const ALL: [(TextStyle, &'static str); 3] =
+        [(TextStyle::Plain, "Plain"), (TextStyle::Outline, "Outlined"), (TextStyle::Box, "Boxed")];
+}
+
+/// How a blur region hides what is under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub enum Effect {
+    #[default]
+    Pixelate,
+    Blur,
+}
+
+impl Effect {
+    pub const ALL: [(Effect, &'static str); 2] = [(Effect::Pixelate, "Pixelate"), (Effect::Blur, "Blur")];
 }
 
 /// How see-through the highlighter is (multiplies the colour's own opacity).
@@ -100,6 +132,11 @@ pub struct Annotation {
     pub double_head: bool,
     /// Freehand path, for `Pen` and `Marker`.
     pub points: Vec<Pos2>,
+    /// For `Text`: the text (lines separated by `\n`), drawn with its top-left at `a`.
+    pub text: String,
+    pub text_style: TextStyle,
+    /// For `Blur`.
+    pub effect: Effect,
 }
 
 /// An open or closed run of connected points.
@@ -126,7 +163,22 @@ pub struct Geometry {
 
 impl Annotation {
     pub fn is_box(&self) -> bool {
-        matches!(self.kind, ShapeKind::Rect | ShapeKind::Ellipse)
+        matches!(self.kind, ShapeKind::Rect | ShapeKind::Ellipse | ShapeKind::Blur)
+    }
+
+    /// Space round text taken by its outline halo or box.
+    fn text_padding(&self) -> Vec2 {
+        let size = self.width;
+        match self.text_style {
+            TextStyle::Plain => Vec2::ZERO,
+            TextStyle::Outline => Vec2::splat(halo_width(size)),
+            TextStyle::Box => vec2(size * 0.35, size * 0.15),
+        }
+    }
+
+    /// The text itself, without padding.
+    pub fn text_rect(&self) -> Rect {
+        crate::text::bounds(&self.text, self.width, self.a)
     }
 
     pub fn rect(&self) -> Rect {
@@ -161,9 +213,12 @@ impl Annotation {
         }
     }
 
-    /// Bounding box of the freehand path (or of the two end points).
+    /// Bounding box of what is drawn: the freehand path, the text with its padding,
+    /// or the two end points.
     pub fn path_bounds(&self) -> Rect {
-        if self.is_freehand() {
+        if self.kind == ShapeKind::Text {
+            self.text_rect().expand2(self.text_padding())
+        } else if self.is_freehand() {
             Rect::from_points(&self.points)
         } else {
             self.rect()
@@ -172,7 +227,9 @@ impl Annotation {
 
     /// Too small to be a deliberate shape (a stray click rather than a drag).
     pub fn is_degenerate(&self) -> bool {
-        if self.is_freehand() {
+        if self.kind == ShapeKind::Text {
+            self.text.trim().is_empty()
+        } else if self.is_freehand() {
             let r = self.path_bounds();
             r.width() < 3.0 && r.height() < 3.0
         } else if self.is_box() {
@@ -185,8 +242,8 @@ impl Annotation {
     /// The full, undashed path of the shape (for lines: end to end, ignoring heads).
     fn outline(&self) -> Polyline {
         match self.kind {
-            ShapeKind::Rect => {
-                let r = self.rect();
+            ShapeKind::Rect | ShapeKind::Blur | ShapeKind::Text => {
+                let r = if self.kind == ShapeKind::Text { self.path_bounds() } else { self.rect() };
                 Polyline {
                     points: vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()],
                     closed: true,
@@ -214,6 +271,10 @@ impl Annotation {
     }
 
     pub fn geometry(&self) -> Geometry {
+        if matches!(self.kind, ShapeKind::Text | ShapeKind::Blur) {
+            // Drawn from rasterised layers, not from strokes.
+            return Geometry::default();
+        }
         let mut geo = Geometry {
             miter: self.kind == ShapeKind::Rect,
             round_caps: matches!(self.kind, ShapeKind::Pen | ShapeKind::Marker),
@@ -247,6 +308,12 @@ impl Annotation {
     /// the inside of a box does not count: you can click through it. Gaps in dashed
     /// strokes count as part of the stroke, so dashed shapes are as easy to grab.
     pub fn hit(&self, p: Pos2, tol: f32) -> bool {
+        // Text and blur regions are solid: anywhere inside them counts.
+        match self.kind {
+            ShapeKind::Text => return self.path_bounds().expand(tol).contains(p),
+            ShapeKind::Blur => return self.rect().expand(tol).contains(p),
+            _ => {}
+        }
         let reach = self.width / 2.0 + tol;
         if distance_to_polyline(p, &self.outline()) <= reach {
             return true;
@@ -306,6 +373,13 @@ impl Annotation {
     fn rasterize(&self, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
         use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Transform};
 
+        match self.kind {
+            ShapeKind::Text => return self.rasterize_text(pixmap, origin),
+            // Blur regions need the capture's pixels; the overlay applies them.
+            ShapeKind::Blur => return,
+            _ => {}
+        }
+
         let geo = self.geometry();
         let [r, g, b, a] = self.ink().to_srgba_unmultiplied();
         let mut paint = Paint::default();
@@ -350,6 +424,74 @@ impl Annotation {
             pixmap.fill_path(&path, &paint, FillRule::Winding, shift, None);
         }
     }
+}
+
+impl Annotation {
+    fn rasterize_text(&self, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
+        use tiny_skia::{FillRule, LineJoin, Paint, Transform};
+
+        let shift = Transform::from_translate(-origin.x, -origin.y);
+        let paint_of = |c: Color32| {
+            let [r, g, b, a] = c.to_srgba_unmultiplied();
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(r, g, b, a);
+            paint.anti_alias = true;
+            paint
+        };
+        let size = self.width;
+        let mut fill = self.color;
+        match self.text_style {
+            TextStyle::Plain => {}
+            TextStyle::Box => {
+                let r = self.path_bounds();
+                if let Some(path) = rounded_rect(r, size * 0.25) {
+                    pixmap.fill_path(&path, &paint_of(self.color), FillRule::Winding, shift, None);
+                }
+                fill = contrast(self.color);
+            }
+            TextStyle::Outline => {
+                if let Some(path) = crate::text::outline(&self.text, size, self.a) {
+                    let halo = tiny_skia::Stroke {
+                        width: halo_width(size) * 2.0,
+                        line_join: LineJoin::Round,
+                        ..Default::default()
+                    };
+                    pixmap.stroke_path(&path, &paint_of(contrast(self.color)), &halo, shift, None);
+                }
+            }
+        }
+        if let Some(path) = crate::text::outline(&self.text, size, self.a) {
+            pixmap.fill_path(&path, &paint_of(fill), FillRule::Winding, shift, None);
+        }
+    }
+}
+
+fn halo_width(font_size: f32) -> f32 {
+    (font_size * 0.1).max(1.5)
+}
+
+/// Black or white, whichever stands out more against `c`.
+pub fn contrast(c: Color32) -> Color32 {
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+    if luma > 150.0 { Color32::BLACK } else { Color32::WHITE }
+}
+
+fn rounded_rect(r: Rect, radius: f32) -> Option<tiny_skia::Path> {
+    let radius = radius.min(r.width() / 2.0).min(r.height() / 2.0);
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(l + radius, t);
+    pb.line_to(rt - radius, t);
+    pb.quad_to(rt, t, rt, t + radius);
+    pb.line_to(rt, b - radius);
+    pb.quad_to(rt, b, rt - radius, b);
+    pb.line_to(l + radius, b);
+    pb.quad_to(l, b, l, b - radius);
+    pb.line_to(l, t + radius);
+    pb.quad_to(l, t, l + radius, t);
+    pb.close();
+    pb.finish()
 }
 
 /// Add an arrowhead pointing along `dir` with its tip at `tip`, and return where the
@@ -644,7 +786,47 @@ mod tests {
             head: ArrowHead::Triangle,
             double_head: false,
             points: Vec::new(),
+            text: String::new(),
+            text_style: TextStyle::Plain,
+            effect: Effect::Pixelate,
         }
+    }
+
+    #[test]
+    fn text_renders_in_every_style() {
+        let white = image::Rgba([255, 255, 255, 255]);
+        for (style, _) in TextStyle::ALL {
+            let mut text = shape(ShapeKind::Text, (10.0, 10.0), (10.0, 10.0));
+            text.text = "Hello\nworld".into();
+            text.width = 24.0;
+            text.text_style = style;
+            assert!(!text.is_degenerate());
+            let bounds = text.path_bounds();
+            assert!(bounds.height() > 48.0 && bounds.width() > 40.0, "{bounds:?}");
+            assert!(text.hit(bounds.center(), 0.0) && !text.hit(bounds.max + vec2(5.0, 5.0), 0.0));
+
+            let mut img = RgbaImage::from_pixel(200, 120, white);
+            render_onto(&mut img, Pos2::ZERO, &[text.clone()]);
+            let red = img.pixels().filter(|p| p.0 == [255, 0, 0, 255]).count();
+            let black = img.pixels().filter(|p| p.0[..3] == [0, 0, 0]).count();
+            let changed = img.pixels().filter(|p| p.0 != white.0).count();
+            match style {
+                TextStyle::Plain => assert!(red > 100 && black == 0, "{style:?} red {red}"),
+                // A red halo-free fill plus a white halo (invisible on white): still red text.
+                TextStyle::Outline => assert!(red > 100, "{style:?} red {red}"),
+                // Red box with white text inside.
+                TextStyle::Box => assert!(red > 2000 && changed > red, "{style:?} red {red}"),
+            }
+            // Nothing is drawn outside the reported bounds.
+            for (x, y, p) in img.enumerate_pixels() {
+                if p.0 != white.0 {
+                    assert!(bounds.expand(1.0).contains(Pos2::new(x as f32, y as f32)), "{style:?} {x},{y}");
+                }
+            }
+        }
+        let mut empty = shape(ShapeKind::Text, (0.0, 0.0), (0.0, 0.0));
+        empty.text = "  \n ".into();
+        assert!(empty.is_degenerate());
     }
 
     #[test]
@@ -866,6 +1048,9 @@ fn style_sheet() {
         head: ArrowHead::Triangle,
         double_head: false,
         points: Vec::new(),
+        text: String::new(),
+        text_style: TextStyle::Plain,
+        effect: Effect::Pixelate,
     };
     for (row, (dash, _)) in Dash::ALL.iter().enumerate() {
         let y = 20.0 + row as f32 * 34.0;

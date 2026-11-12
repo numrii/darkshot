@@ -1041,6 +1041,7 @@ dependencies = [
  "rfd",
  "tiny-skia 0.12.0",
  "tray-icon",
+ "ttf-parser",
  "windows-sys 0.61.2",
  "winit",
  "xcap",

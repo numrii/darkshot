@@ -30,8 +30,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winit::event_loop::{DeviceEvents, EventLoop};
 
 use crate::annotate::{
-    self, Annotation, ArrowHead, Dash, History, Repeat, ShapeKind, MAX_WIDTH, MIN_WIDTH,
+    self, Annotation, ArrowHead, Dash, Effect, History, Repeat, ShapeKind, TextStyle, MAX_WIDTH,
+    MIN_WIDTH,
 };
+use crate::effects;
+use crate::text::Layout;
 use crate::icons::{self, Icon};
 use crate::AnyResult;
 
@@ -485,6 +488,10 @@ enum Action {
     /// Dragging one end of a straight line, arrow, pen or marker stroke; `end_b` = the
     /// end (tip) rather than the start.
     MoveEnd { index: usize, end_b: bool },
+    /// A click with the text tool on empty space: places a new text when released.
+    PlaceText { anchor: Pos2 },
+    /// A click inside the text being edited: moves the caret there.
+    Caret { at: Pos2 },
 }
 
 /// Default annotation colours: red, green, blue, and the highlighter's yellow (so the
@@ -499,6 +506,52 @@ const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
 /// Default highlighter colour (classic highlighter yellow) and thickness.
 const MARKER_COLOR: Color32 = Color32::from_rgb(0xFF, 0xE6, 0x00);
 const MARKER_WIDTH: f32 = 16.0;
+/// Default text size and blur strength, in pixels.
+const TEXT_SIZE: f32 = 24.0;
+const BLUR_STRENGTH: f32 = 12.0;
+
+/// Tools that remember their own colour and size, separately from the rest (which
+/// share one). The highlighter starts yellow and wide, text at a readable size.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum StyleSlot {
+    Shared,
+    Marker,
+    Text,
+    Blur,
+}
+
+fn style_slot(tool: Tool) -> StyleSlot {
+    match tool {
+        Tool::Shape(ShapeKind::Marker) => StyleSlot::Marker,
+        Tool::Shape(ShapeKind::Text) => StyleSlot::Text,
+        Tool::Shape(ShapeKind::Blur) => StyleSlot::Blur,
+        _ => StyleSlot::Shared,
+    }
+}
+
+/// The range of the size control: font size for text, strength for blur, stroke
+/// width for the rest.
+fn width_range(kind: Option<ShapeKind>) -> std::ops::RangeInclusive<f32> {
+    match kind {
+        Some(ShapeKind::Text) => 8.0..=120.0,
+        Some(ShapeKind::Blur) => 4.0..=60.0,
+        _ => MIN_WIDTH..=MAX_WIDTH,
+    }
+}
+
+/// A text annotation being typed into.
+struct TextEdit {
+    index: usize,
+    /// Caret position, in characters.
+    cursor: usize,
+    /// The annotation list before editing began, for one undo step for the whole edit.
+    before: Vec<Annotation>,
+}
+
+/// Byte offset of character `index` in `s`.
+fn byte_at(s: &str, index: usize) -> usize {
+    s.char_indices().nth(index).map_or(s.len(), |(b, _)| b)
+}
 /// Freehand points closer than this to the previous one are skipped while drawing.
 const MIN_POINT_SPACING: f32 = 1.5;
 
@@ -524,10 +577,12 @@ struct Overlay {
     dash: Dash,
     head: ArrowHead,
     double_head: bool,
-    /// The highlighter keeps its own colour and thickness, swapped with `color` and
-    /// `width` when switching to or from it.
-    other_color: Color32,
-    other_width: f32,
+    text_style: TextStyle,
+    effect: Effect,
+    /// Colour and size remembered per style slot, swapped in and out with `color` and
+    /// `width` when switching tools.
+    styles: HashMap<StyleSlot, (Color32, f32)>,
+    editing: Option<TextEdit>,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -538,6 +593,8 @@ struct Overlay {
     /// as in the output (egui would darken the translucent marker where it overlaps
     /// itself). Keyed by the stroke's content; entries not drawn in a frame are dropped.
     layers: HashMap<u64, (egui::TextureHandle, Rect)>,
+    /// Blur regions as displayed, keyed by their area and settings.
+    blur_layers: HashMap<u64, (egui::TextureHandle, Rect)>,
 
     error: Option<String>,
 }
@@ -566,13 +623,20 @@ impl Overlay {
             dash: Dash::Solid,
             head: ArrowHead::Triangle,
             double_head: false,
-            other_color: MARKER_COLOR,
-            other_width: MARKER_WIDTH,
+            text_style: TextStyle::Plain,
+            effect: Effect::Pixelate,
+            styles: HashMap::from([
+                (StyleSlot::Marker, (MARKER_COLOR, MARKER_WIDTH)),
+                (StyleSlot::Text, (SWATCHES[0], TEXT_SIZE)),
+                (StyleSlot::Blur, (SWATCHES[0], BLUR_STRENGTH)),
+            ]),
+            editing: None,
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
             stroke_points: Vec::new(),
             layers: HashMap::new(),
+            blur_layers: HashMap::new(),
             error: None,
         }
     }
@@ -638,6 +702,12 @@ impl Overlay {
             return Action::Region(Drag::Create { anchor: p });
         };
 
+        if let Some(edit) = &self.editing {
+            if self.annotations[edit.index].hit(p, tol) {
+                return Action::Caret { at: p };
+            }
+        }
+
         if let Some(index) = self.selected {
             let shape = &self.annotations[index];
             if shape.is_box() {
@@ -645,8 +715,8 @@ impl Overlay {
                     let drag = Drag::Resize { start: p, orig: shape.rect(), hx, hy };
                     return Action::ResizeBox { index, drag };
                 }
-            } else if shape.is_freehand() {
-                // Freehand strokes can be moved, but have no handles.
+            } else if shape.is_freehand() || shape.kind == ShapeKind::Text {
+                // Freehand strokes and text can be moved, but have no handles.
             } else if p.distance(shape.b) <= tol {
                 return Action::MoveEnd { index, end_b: true };
             } else if p.distance(shape.a) <= tol {
@@ -672,6 +742,14 @@ impl Overlay {
                 Some(index) => move_shape(index),
                 None => Action::Region(Drag::Move { start: p, orig: sel }),
             },
+            // The text tool edits a text it is clicked on (or moves it when dragged).
+            Tool::Shape(ShapeKind::Text) => {
+                let on_text = |a: &Annotation| a.kind == ShapeKind::Text && a.hit(p, tol);
+                match self.annotations.iter().rposition(on_text) {
+                    Some(index) => move_shape(index),
+                    None => Action::PlaceText { anchor: p },
+                }
+            }
             // While drawing, only the selected annotation can be grabbed, so new
             // shapes can start on top of existing ones.
             Tool::Shape(_) => match self.selected {
@@ -682,7 +760,17 @@ impl Overlay {
     }
 
     fn begin_action(&mut self, action: Action) {
+        if !matches!(action, Action::Caret { .. }) {
+            self.finish_editing();
+        }
         match action {
+            Action::Caret { at } => {
+                if let Some(edit) = &mut self.editing {
+                    let shape = &self.annotations[edit.index];
+                    edit.cursor = Layout::new(&shape.text, shape.width).index_at(at - shape.a.to_vec2());
+                }
+            }
+            Action::PlaceText { .. } => self.selected = None,
             Action::Region(Drag::Create { .. } | Drag::Move { .. }) => self.selected = None,
             Action::Region(Drag::Resize { .. }) => {}
             Action::NewShape { anchor } => {
@@ -698,6 +786,9 @@ impl Overlay {
                     head: self.head,
                     double_head: self.double_head,
                     points: Vec::new(),
+                    text: String::new(),
+                    text_style: self.text_style,
+                    effect: self.effect,
                 });
                 self.stroke_points = vec![anchor];
                 self.selected = Some(self.annotations.len() - 1);
@@ -716,6 +807,7 @@ impl Overlay {
     fn apply_action(&mut self, p: Pos2, mods: Modifiers, bounds: Rect) {
         let Some(action) = self.action.clone() else { return };
         match action {
+            Action::PlaceText { .. } | Action::Caret { .. } => {}
             Action::Region(drag) => {
                 // A stray click outside the region must not replace it with nothing.
                 if let Drag::Create { anchor } = drag {
@@ -782,7 +874,19 @@ impl Overlay {
     }
 
     fn end_action(&mut self) {
+        // A click (no change) on a text with the text tool starts editing it.
+        if let Some(Action::MoveShape { index, start, .. }) = self.action {
+            let unchanged = self.pending_undo.is_some();
+            let text = self.annotations[index].kind == ShapeKind::Text;
+            if unchanged && text && self.tool == Tool::Shape(ShapeKind::Text) {
+                self.action = None;
+                self.pending_undo = None;
+                self.edit_text(index, start);
+                return;
+            }
+        }
         match self.action.take() {
+            Some(Action::PlaceText { anchor }) => self.start_text(anchor),
             Some(Action::NewShape { .. }) => {
                 self.stroke_points.clear();
                 if let Some(shape) = self.annotations.last_mut() {
@@ -820,19 +924,23 @@ impl Overlay {
 
     // --- Editing commands --------------------------------------------------------------
 
-    /// Switch tools. The highlighter has its own colour and thickness (yellow and much
-    /// wider by default), swapped in when switching to it and out when leaving it.
+    /// Switch tools. The highlighter, text and blur tools each keep their own colour and
+    /// size (the highlighter starts yellow and wide), swapped in when switching to them
+    /// and out when leaving.
     fn set_tool(&mut self, tool: Tool) {
         if tool == self.tool {
             return;
         }
         // Let go of the selected shape first, or the style of the new tool (such as
         // its thickness) would be applied to it.
+        self.finish_editing();
         self.selected = None;
-        let marker = |t: Tool| t == Tool::Shape(ShapeKind::Marker);
-        if marker(self.tool) != marker(tool) {
-            std::mem::swap(&mut self.width, &mut self.other_width);
-            std::mem::swap(&mut self.color, &mut self.other_color);
+        let (old, new) = (style_slot(self.tool), style_slot(tool));
+        if old != new {
+            self.styles.insert(old, (self.color, self.width));
+            if let Some(&(color, width)) = self.styles.get(&new) {
+                (self.color, self.width) = (color, width);
+            }
         }
         self.tool = tool;
     }
@@ -845,6 +953,8 @@ impl Overlay {
         self.dash = shape.dash;
         self.head = shape.head;
         self.double_head = shape.double_head;
+        self.text_style = shape.text_style;
+        self.effect = shape.effect;
     }
 
     /// Push the current style onto the selected annotation, if it differs.
@@ -854,14 +964,132 @@ impl Overlay {
         shape.color = self.color;
         shape.width = self.width;
         shape.dash = self.dash;
-        if shape.kind == ShapeKind::Arrow {
-            shape.head = self.head;
-            shape.double_head = self.double_head;
+        match shape.kind {
+            ShapeKind::Arrow => {
+                shape.head = self.head;
+                shape.double_head = self.double_head;
+            }
+            ShapeKind::Text => shape.text_style = self.text_style,
+            ShapeKind::Blur => shape.effect = self.effect,
+            _ => {}
         }
         if shape != self.annotations[index] {
             self.history.record(&self.annotations, Some(Repeat::Style));
             self.annotations[index] = shape;
         }
+    }
+
+    // --- Text editing ------------------------------------------------------------------
+
+    /// The kind of shape the style controls currently apply to.
+    fn style_kind(&self) -> Option<ShapeKind> {
+        match (self.selected, self.tool) {
+            (Some(i), _) => Some(self.annotations[i].kind),
+            (None, Tool::Shape(kind)) => Some(kind),
+            (None, Tool::Select) => None,
+        }
+    }
+
+    /// Place a new, empty text with its first line centred on `at` and start typing.
+    fn start_text(&mut self, at: Pos2) {
+        let before = self.annotations.clone();
+        let line_height = Layout::new("", self.width).line_height;
+        let a = (at - vec2(0.0, line_height / 2.0)).round();
+        self.annotations.push(Annotation {
+            kind: ShapeKind::Text,
+            a,
+            b: a,
+            color: self.color,
+            width: self.width,
+            dash: Dash::Solid,
+            head: ArrowHead::Triangle,
+            double_head: false,
+            points: Vec::new(),
+            text: String::new(),
+            text_style: self.text_style,
+            effect: self.effect,
+        });
+        let index = self.annotations.len() - 1;
+        self.selected = Some(index);
+        self.editing = Some(TextEdit { index, cursor: 0, before });
+    }
+
+    /// Start editing text `index` with the caret nearest to `at`.
+    fn edit_text(&mut self, index: usize, at: Pos2) {
+        self.finish_editing();
+        self.select(index);
+        let shape = &self.annotations[index];
+        let cursor = Layout::new(&shape.text, shape.width).index_at(at - shape.a.to_vec2());
+        self.editing = Some(TextEdit { index, cursor, before: self.annotations.clone() });
+    }
+
+    /// Stop editing. A text left empty is removed; any change becomes one undo step.
+    fn finish_editing(&mut self) {
+        let Some(edit) = self.editing.take() else { return };
+        if self.annotations[edit.index].is_degenerate() {
+            self.annotations.remove(edit.index);
+            self.selected = None;
+        }
+        if self.annotations != edit.before {
+            self.history.record(&edit.before, None);
+        }
+    }
+
+    /// Apply one keyboard event to the text being edited. Returns true if the event
+    /// ends editing.
+    fn text_event(&mut self, event: &egui::Event) -> bool {
+        let Some(edit) = &mut self.editing else { return false };
+        let shape = &mut self.annotations[edit.index];
+        let insert = |shape: &mut Annotation, edit: &mut TextEdit, s: &str| {
+            let at = byte_at(&shape.text, edit.cursor);
+            shape.text.insert_str(at, s);
+            edit.cursor += s.chars().count();
+        };
+        match event {
+            egui::Event::Text(t) => {
+                let t: String = t.chars().filter(|c| !c.is_control()).collect();
+                insert(shape, edit, &t);
+            }
+            egui::Event::Paste(t) => {
+                let t = t.replace("\r\n", "\n").replace('\r', "\n");
+                let t: String = t.chars().filter(|c| *c == '\n' || !c.is_control()).collect();
+                insert(shape, edit, &t);
+            }
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                let layout = Layout::new(&shape.text, shape.width);
+                let (row, start, len) = layout.line_of(edit.cursor);
+                let count = shape.text.chars().count();
+                match key {
+                    Key::Escape => return true,
+                    Key::Enter if modifiers.command => return true,
+                    Key::Enter => insert(shape, edit, "\n"),
+                    Key::Backspace if edit.cursor > 0 => {
+                        let at = byte_at(&shape.text, edit.cursor - 1);
+                        shape.text.remove(at);
+                        edit.cursor -= 1;
+                    }
+                    Key::Delete if edit.cursor < count => {
+                        let at = byte_at(&shape.text, edit.cursor);
+                        shape.text.remove(at);
+                    }
+                    Key::ArrowLeft => edit.cursor = edit.cursor.saturating_sub(1),
+                    Key::ArrowRight => edit.cursor = (edit.cursor + 1).min(count),
+                    Key::Home => edit.cursor = start,
+                    Key::End => edit.cursor = start + len,
+                    Key::ArrowUp | Key::ArrowDown => {
+                        let target = if *key == Key::ArrowUp { row.checked_sub(1) } else { Some(row + 1) };
+                        if let Some(target) = target.filter(|r| *r < layout.line_count()) {
+                            let x = layout.caret(edit.cursor).x;
+                            let y = (target as f32 + 0.5) * layout.line_height;
+                            edit.cursor = layout.index_at(Pos2::new(x, y));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn nudge_selected(&mut self, index: usize, by: Vec2) {
@@ -893,7 +1121,16 @@ impl Overlay {
     /// The pixels inside the current selection, stitched from every monitor it touches.
     /// Areas outside all monitors (possible when monitors differ in size) stay transparent.
     fn cropped(&self) -> Option<RgbaImage> {
-        let sel = self.selection?.intersect(self.bounds());
+        self.crop_desktop(self.selection?)
+    }
+
+    /// The capture's pixels inside `area` (desktop pixels), stitched across monitors.
+    fn crop_desktop(&self, area: Rect) -> Option<RgbaImage> {
+        let sel = area.intersect(self.bounds());
+        let sel = Rect::from_min_max(sel.min.round(), sel.max.round());
+        if sel.width() < 1.0 || sel.height() < 1.0 {
+            return None;
+        }
         let (w, h) = (sel.width() as u32, sel.height() as u32);
         if w == 0 || h == 0 {
             return None;
@@ -921,10 +1158,31 @@ impl Overlay {
         Some(out)
     }
 
-    /// The final image: the cropped capture with every annotation drawn onto it.
+    /// A blur region's processed pixels and the desktop area they cover.
+    fn blurred(&self, shape: &Annotation) -> Option<(RgbaImage, Rect)> {
+        let area = shape.rect().intersect(self.bounds());
+        let area = Rect::from_min_max(area.min.round(), area.max.round());
+        let mut img = self.crop_desktop(area)?;
+        let strength = shape.width.round().max(1.0) as u32;
+        match shape.effect {
+            Effect::Pixelate => effects::pixelate(&mut img, strength),
+            Effect::Blur => effects::blur(&mut img, strength),
+        }
+        Some((img, area))
+    }
+
+    /// The final image: the cropped capture with blur regions applied and every other
+    /// annotation drawn on top. Blur regions always act on the capture itself, below
+    /// all other annotations, both here and on screen.
     fn output(&self) -> Option<RgbaImage> {
-        let origin = self.selection?.intersect(self.bounds()).min;
+        let origin = self.selection?.intersect(self.bounds()).min.round();
         let mut img = self.cropped()?;
+        for shape in self.annotations.iter().filter(|a| a.kind == ShapeKind::Blur) {
+            if let Some((blurred, area)) = self.blurred(shape) {
+                let offset = area.min - origin;
+                image::imageops::replace(&mut img, &blurred, offset.x as i64, offset.y as i64);
+            }
+        }
         annotate::render_onto(&mut img, origin, &self.annotations);
         Some(img)
     }
@@ -985,6 +1243,8 @@ impl Overlay {
                                 Icon::Marker,
                                 "Highlighter (M), Shift for a straight line",
                             ),
+                            (Tool::Shape(ShapeKind::Text), Icon::Text, "Text (T)"),
+                            (Tool::Shape(ShapeKind::Blur), Icon::Blur, "Blur or pixelate (B)"),
                         ];
                         for (tool, icon, tip) in tools {
                             let button = icons::button(ui, icon, self.tool == tool, true);
@@ -1010,15 +1270,21 @@ impl Overlay {
                             .on_hover_text("Custom colour");
                         // Fixed width, so the toolbar does not shift when the value
                         // gains a digit.
+                        let kind = self.style_kind();
+                        let size_tip = match kind {
+                            Some(ShapeKind::Text) => "Font size (mouse wheel)",
+                            Some(ShapeKind::Blur) => "Strength (mouse wheel)",
+                            _ => "Thickness (mouse wheel)",
+                        };
                         ui.add_sized(
                             [52.0, 22.0],
                             egui::DragValue::new(&mut self.width)
-                                .range(MIN_WIDTH..=MAX_WIDTH)
+                                .range(width_range(kind))
                                 .speed(0.25)
                                 .fixed_decimals(0)
                                 .suffix(" px"),
                         )
-                        .on_hover_text("Thickness (mouse wheel)");
+                        .on_hover_text(size_tip);
 
                         let sample = |kind, width| Annotation {
                             kind,
@@ -1030,14 +1296,33 @@ impl Overlay {
                             head: ArrowHead::Triangle,
                             double_head: false,
                             points: Vec::new(),
+                            text: String::new(),
+                            text_style: TextStyle::Plain,
+                            effect: Effect::Pixelate,
                         };
-                        icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
-                            let mut line = sample(ShapeKind::Line, 2.0);
-                            (line.a, line.b, line.color, line.dash) =
-                                (area.left_center(), area.right_center(), color, dash);
-                            line.paint(painter, |p| p, 1.0);
-                        })
-                        .on_hover_text("Stroke style");
+                        // One slot, same size whatever it shows: text style for text,
+                        // effect for blur regions, stroke style for everything else.
+                        match kind {
+                            Some(ShapeKind::Text) => {
+                                icons::picker(ui, &mut self.text_style, true, &TextStyle::ALL, icons::text_style_preview)
+                                    .on_hover_text("Text style");
+                            }
+                            Some(ShapeKind::Blur) => {
+                                icons::picker(ui, &mut self.effect, true, &Effect::ALL, |painter, area, effect, color| {
+                                    icons::effect_preview(painter, area, effect == Effect::Blur, color);
+                                })
+                                .on_hover_text("Effect");
+                            }
+                            _ => {
+                                icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
+                                    let mut line = sample(ShapeKind::Line, 2.0);
+                                    (line.a, line.b, line.color, line.dash) =
+                                        (area.left_center(), area.right_center(), color, dash);
+                                    line.paint(painter, |p| p, 1.0);
+                                })
+                                .on_hover_text("Stroke style");
+                            }
+                        }
 
                         // Arrowhead controls stay in place (disabled) for other shapes,
                         // so the toolbar does not change size when switching tools.
@@ -1106,10 +1391,11 @@ fn setup_text(ctx: &egui::Context) {
     });
 }
 
-/// Identifies a freehand stroke's appearance, for the layer cache.
+/// Identifies how an annotation looks, for the layer caches.
 fn layer_key(a: &Annotation) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (a.kind, a.dash, a.color, a.width.to_bits()).hash(&mut h);
+    (a.kind, a.dash, a.color, a.width.to_bits(), a.text_style, a.effect).hash(&mut h);
+    (a.text.as_str(), a.a.x.to_bits(), a.a.y.to_bits(), a.b.x.to_bits(), a.b.y.to_bits()).hash(&mut h);
     for p in &a.points {
         (p.x.to_bits(), p.y.to_bits()).hash(&mut h);
     }
@@ -1230,6 +1516,7 @@ impl eframe::App for Overlay {
                 | Action::ResizeBox { drag: Drag::Resize { hx, hy, .. }, .. } => resize_cursor(hx, hy),
                 Action::Region(Drag::Move { .. }) | Action::MoveShape { .. } => CursorIcon::Move,
                 Action::MoveEnd { .. } => CursorIcon::Grab,
+                Action::PlaceText { .. } | Action::Caret { .. } => CursorIcon::Text,
                 _ => CursorIcon::Crosshair,
             });
         }
@@ -1239,6 +1526,7 @@ impl eframe::App for Overlay {
             nudge: Vec2,
             select_all: bool,
             copy: bool,
+            enter: bool,
             save: bool,
             cancel: bool,
             undo: bool,
@@ -1263,6 +1551,8 @@ impl eframe::App for Overlay {
                 (Key::A, Tool::Shape(ShapeKind::Arrow)),
                 (Key::P, Tool::Shape(ShapeKind::Pen)),
                 (Key::M, Tool::Shape(ShapeKind::Marker)),
+                (Key::T, Tool::Shape(ShapeKind::Text)),
+                (Key::B, Tool::Shape(ShapeKind::Blur)),
             ]
             .into_iter()
             .find(|(key, _)| plain && i.key_pressed(*key))
@@ -1282,8 +1572,8 @@ impl eframe::App for Overlay {
                 ),
                 select_all: ctrl && i.key_pressed(Key::A),
                 // egui turns Ctrl+C into Event::Copy rather than a key press.
-                copy: i.events.iter().any(|e| matches!(e, egui::Event::Copy))
-                    || i.key_pressed(Key::Enter),
+                copy: i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                enter: i.key_pressed(Key::Enter),
                 save: ctrl && i.key_pressed(Key::S),
                 cancel: i.key_pressed(Key::Escape),
                 undo: ctrl && !i.modifiers.shift && i.key_pressed(Key::Z),
@@ -1294,8 +1584,29 @@ impl eframe::App for Overlay {
             }
         });
 
+        // While typing into a text, keys go to the text. Undo, redo, copy and save
+        // still work; they finish the edit first.
+        let was_editing = self.editing.is_some();
+        if was_editing && !typing {
+            let events = ctx.input(|i| i.events.clone());
+            for event in &events {
+                if self.text_event(event) {
+                    self.finish_editing();
+                    break;
+                }
+            }
+            if keys.undo || keys.redo {
+                self.finish_editing();
+                if keys.undo {
+                    self.undo();
+                } else {
+                    self.redo();
+                }
+            }
+        }
+
         let mut close = false;
-        if self.action.is_none() && !typing {
+        if self.action.is_none() && !typing && !was_editing {
             if keys.undo {
                 self.undo();
             } else if keys.redo {
@@ -1323,7 +1634,19 @@ impl eframe::App for Overlay {
             }
         }
         if keys.wheel != 0.0 && response.hovered() {
-            self.width = (self.width + keys.wheel.signum()).clamp(MIN_WIDTH, MAX_WIDTH);
+            let range = width_range(self.style_kind());
+            self.width = (self.width + keys.wheel.signum()).clamp(*range.start(), *range.end());
+        }
+
+        // Double-click a text with the select tool to edit it.
+        let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+        if double && self.tool == Tool::Select && response.hovered() {
+            if let Some(p) = hover.map(to_px) {
+                let on_text = |a: &Annotation| a.kind == ShapeKind::Text && a.hit(p, tol);
+                if let Some(index) = self.annotations.iter().rposition(on_text) {
+                    self.edit_text(index, p);
+                }
+            }
         }
 
         // --- Toolbar -------------------------------------------------------------------
@@ -1352,12 +1675,39 @@ impl eframe::App for Overlay {
         self.restyle_selected();
 
         // --- Paint: annotations, dimming, region outline and handles, labels -----------
+        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+
+        // Blur regions first: they act on the capture, below every other annotation.
+        let mut used = HashSet::new();
+        for annotation in self.annotations.iter().filter(|a| a.kind == ShapeKind::Blur) {
+            let key = layer_key(annotation);
+            if !self.blur_layers.contains_key(&key) {
+                if let Some((img, area)) = self.blurred(annotation) {
+                    let size = [img.width() as usize, img.height() as usize];
+                    let image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                    let texture = ctx.load_texture("blur", image, egui::TextureOptions::NEAREST);
+                    self.blur_layers.insert(key, (texture, area));
+                }
+            }
+            if let Some((texture, area)) = self.blur_layers.get(&key) {
+                painter.image(texture.id(), rect_to_pt(*area), uv, Color32::WHITE);
+                used.insert(key);
+            }
+        }
+        self.blur_layers.retain(|key, _| used.contains(key));
+
         let drawing = matches!(self.action, Some(Action::NewShape { .. }));
         let last = self.annotations.len().wrapping_sub(1);
         let mut used = HashSet::new();
         for (i, annotation) in self.annotations.iter().enumerate() {
-            // The stroke being drawn changes every frame, so it is painted directly.
-            if annotation.is_freehand() && !(drawing && i == last) {
+            if annotation.kind == ShapeKind::Blur {
+                continue;
+            }
+            // Freehand strokes and text are shown from rasterised layers, exactly as
+            // they will be saved. The stroke being drawn changes every frame, so it is
+            // painted directly.
+            let layered = annotation.is_freehand() || annotation.kind == ShapeKind::Text;
+            if layered && !(drawing && i == last) {
                 let key = layer_key(annotation);
                 if !self.layers.contains_key(&key) {
                     if let Some((image, area)) = annotation.layer(bounds) {
@@ -1366,7 +1716,6 @@ impl eframe::App for Overlay {
                     }
                 }
                 if let Some((texture, area)) = self.layers.get(&key) {
-                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
                     painter.image(texture.id(), rect_to_pt(*area), uv, Color32::WHITE);
                     used.insert(key);
                     continue;
@@ -1416,7 +1765,10 @@ impl eframe::App for Overlay {
         // Handles of the selected annotation, in an accent colour to tell them apart
         // from the region's.
         if let Some(shape) = self.selected.map(|i| &self.annotations[i]) {
-            if shape.is_freehand() {
+            if shape.kind == ShapeKind::Text {
+                let r = rect_to_pt(shape.path_bounds().expand(3.0));
+                painter.rect_stroke(r, 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Middle);
+            } else if shape.is_freehand() {
                 let r = rect_to_pt(shape.path_bounds().expand(shape.width / 2.0 + 3.0));
                 painter.rect_stroke(r, 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Middle);
             } else if shape.is_box() {
@@ -1431,12 +1783,22 @@ impl eframe::App for Overlay {
             }
         }
 
-        let hint = if self.selection.is_none() {
+        if let Some(edit) = &self.editing {
+            let shape = &self.annotations[edit.index];
+            let layout = Layout::new(&shape.text, shape.width);
+            let top = to_pt(shape.a + layout.caret(edit.cursor).to_vec2());
+            let caret = [top, top + vec2(0.0, layout.line_height / scale)];
+            painter.line_segment(caret, Stroke::new(1.5, ACCENT));
+        }
+
+        let hint = if self.editing.is_some() {
+            "Type · Enter new line · arrows move · Esc or click outside to finish"
+        } else if self.selection.is_none() {
             "Drag to select an area · Ctrl+A whole screen · Esc cancel"
         } else if self.selected.is_some() {
             "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect"
         } else {
-            "V select · R rect · E ellipse · L line · A arrow · P pen · M marker · Shift constrain/straight · Alt from centre · Ctrl+Z undo"
+            "V select · R rect · E ellipse · L line · A arrow · P pen · M marker · T text · B blur · Shift constrain/straight · Ctrl+Z undo"
         };
         let monitor = self.desktop.monitors[self.current_monitor];
         let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);
@@ -1447,8 +1809,11 @@ impl eframe::App for Overlay {
         }
 
         // --- Actions -------------------------------------------------------------------
-        let copy = toolbar.copy || keys.copy && !typing;
+        let copy = toolbar.copy || (keys.copy || keys.enter && !was_editing) && !typing;
         let save = toolbar.save || keys.save && !typing;
+        if copy || save {
+            self.finish_editing();
+        }
         if close || toolbar.close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if copy || save {
@@ -1550,6 +1915,94 @@ mod tests {
         assert_eq!((overlay.color, overlay.width), (SWATCHES[1], 24.0));
         overlay.set_tool(Tool::Select);
         assert_eq!((overlay.color, overlay.width), (SWATCHES[0], 6.0));
+    }
+
+    fn plain_overlay(w: u32, h: u32, shot: RgbaImage) -> Overlay {
+        let desktop = Desktop {
+            shots: vec![shot],
+            bounds: RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+            monitors: vec![rect(0.0, 0.0, w as f32, h as f32)],
+            home: 0,
+        };
+        Overlay::with_desktop(desktop, None)
+    }
+
+    fn key(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn typing_and_editing_text() {
+        let mut overlay = plain_overlay(400, 300, RgbaImage::new(400, 300));
+        overlay.selection = Some(rect(0.0, 0.0, 400.0, 300.0));
+        overlay.set_tool(Tool::Shape(ShapeKind::Text));
+        assert_eq!(overlay.width, TEXT_SIZE);
+
+        overlay.start_text(Pos2::new(50.0, 50.0));
+        for event in [
+            egui::Event::Text("Hello".into()),
+            key(Key::Enter),
+            egui::Event::Text("wrld".into()),
+            key(Key::ArrowLeft),
+            key(Key::ArrowLeft),
+            key(Key::ArrowLeft),
+            egui::Event::Text("o".into()),
+            key(Key::ArrowUp),
+            key(Key::End),
+            egui::Event::Text("!".into()),
+            egui::Event::Paste("\r\nbye".into()),
+            key(Key::Backspace),
+        ] {
+            assert!(!overlay.text_event(&event));
+        }
+        assert_eq!(overlay.annotations[0].text, "Hello!\nby\nworld");
+        assert!(overlay.text_event(&key(Key::Escape)));
+        overlay.finish_editing();
+
+        // The whole edit is one undo step.
+        assert!(overlay.editing.is_none());
+        overlay.undo();
+        assert!(overlay.annotations.is_empty());
+        overlay.redo();
+        assert_eq!(overlay.annotations.len(), 1);
+
+        // A text left empty disappears without an undo step.
+        overlay.start_text(Pos2::new(50.0, 200.0));
+        overlay.text_event(&egui::Event::Text("   ".into()));
+        overlay.finish_editing();
+        assert_eq!(overlay.annotations.len(), 1);
+        overlay.undo();
+        assert!(overlay.annotations.is_empty());
+    }
+
+    #[test]
+    fn blur_regions_apply_to_the_output() {
+        // Alternating black and white columns.
+        let shot = RgbaImage::from_fn(100, 60, |x, _| {
+            if x % 2 == 0 { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
+        });
+        let mut overlay = plain_overlay(100, 60, shot);
+        overlay.selection = Some(rect(10.0, 10.0, 90.0, 50.0));
+        overlay.set_tool(Tool::Shape(ShapeKind::Blur));
+        overlay.begin_action(Action::NewShape { anchor: Pos2::new(20.0, 20.0) });
+        overlay.apply_action(Pos2::new(60.0, 40.0), Modifiers::NONE, overlay.bounds());
+        overlay.end_action();
+        assert_eq!(overlay.annotations[0].kind, ShapeKind::Blur);
+
+        let out = overlay.output().unwrap();
+        // Inside the blur region (desktop 20..60): blocks average to mid grey.
+        let inside = out.get_pixel(20, 15).0;
+        assert!((100..=155).contains(&inside[0]) && inside[0] == inside[1], "{inside:?}");
+        // Outside it the stripes are untouched (output x 0 is desktop x 10, a black column).
+        assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
+        assert_eq!(out.get_pixel(75, 35).0, [255, 255, 255, 255]); // desktop x 85
     }
 
     #[test]

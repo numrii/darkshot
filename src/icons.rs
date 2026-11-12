@@ -3,6 +3,8 @@
 
 use eframe::egui::{self, vec2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Vec2};
 
+use crate::annotate::TextStyle;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Select,
@@ -12,6 +14,8 @@ pub enum Icon {
     Arrow,
     Pen,
     Marker,
+    Text,
+    Blur,
     /// An arrow with a head at both ends.
     DoubleHead,
     Undo,
@@ -119,6 +123,51 @@ pub fn picker<T: Copy + PartialEq>(
     response
 }
 
+/// Preview of a text style: "Ab" plain, with a halo, or in a box.
+pub fn text_style_preview(painter: &egui::Painter, area: Rect, style: TextStyle, color: Color32) {
+    let font = egui::FontId::proportional(area.height().min(16.0));
+    let centre = area.center();
+    let text = |at: Pos2, c: Color32| {
+        painter.text(at, egui::Align2::CENTER_CENTER, "Ab", font.clone(), c);
+    };
+    match style {
+        TextStyle::Plain => text(centre, color),
+        TextStyle::Outline => {
+            let halo = crate::annotate::contrast(color).gamma_multiply(0.9);
+            for d in [vec2(-1.0, 0.0), vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(0.0, 1.0)] {
+                text(centre + d, halo);
+            }
+            text(centre, color);
+        }
+        TextStyle::Box => {
+            let r = Rect::from_center_size(centre, vec2(area.width().min(30.0), area.height()));
+            painter.rect_filled(r, 3.0, color);
+            text(centre, crate::annotate::contrast(color));
+        }
+    }
+}
+
+/// Preview of a blur effect: a grid of blocks (pixelate) or soft rings (blur).
+pub fn effect_preview(painter: &egui::Painter, area: Rect, blur: bool, color: Color32) {
+    let side = area.width().min(area.height());
+    let square = Rect::from_center_size(area.center(), Vec2::splat(side));
+    if blur {
+        for (i, alpha) in [0.15, 0.3, 0.5, 0.8].into_iter().enumerate() {
+            let r = side / 2.0 * (1.0 - i as f32 * 0.22);
+            painter.circle_filled(square.center(), r, color.gamma_multiply(alpha));
+        }
+    } else {
+        // 3x3 blocks in a fixed pattern of strengths.
+        let shades = [0.9, 0.35, 0.65, 0.3, 0.8, 0.45, 0.6, 0.25, 0.95];
+        let cell = side / 3.0;
+        for (i, alpha) in shades.into_iter().enumerate() {
+            let min = square.min + vec2((i % 3) as f32, (i / 3) as f32) * cell;
+            let r = Rect::from_min_size(min, Vec2::splat(cell)).shrink(0.5);
+            painter.rect_filled(r, 0.0, color.gamma_multiply(alpha));
+        }
+    }
+}
+
 /// A colour-wheel button that opens a full colour picker (RGB, HSV and hex). The
 /// centre dot shows the current colour.
 pub fn color_picker_button(ui: &mut egui::Ui, color: &mut Color32) -> Response {
@@ -221,6 +270,13 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
             painter.add(Shape::closed_line(body.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
             triangle([(5.5, 8.0), (11.0, 13.5), (4.0, 14.0)]);
         }
+        Icon::Text => {
+            // A serif-free "T".
+            line(&[(4.0, 4.5), (16.0, 4.5)]);
+            line(&[(10.0, 4.5), (10.0, 16.5)]);
+            line(&[(7.5, 16.5), (12.5, 16.5)]);
+        }
+        Icon::Blur => effect_preview(painter, area.shrink(2.0 * unit), false, color),
         Icon::DoubleHead => {
             line(&[(6.0, 10.0), (14.0, 10.0)]);
             triangle([(2.0, 10.0), (7.5, 6.0), (7.5, 14.0)]);

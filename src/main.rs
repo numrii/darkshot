@@ -4,8 +4,10 @@
 
 mod annotate;
 mod daemon;
+mod effects;
 mod icons;
 mod overlay;
+mod text;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
