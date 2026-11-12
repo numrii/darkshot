@@ -2,7 +2,8 @@
 //! spanning all of them, let the user pick and adjust a region, then copy or save it.
 
 use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::cell::Cell;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
     self, vec2, Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke,
@@ -10,13 +11,15 @@ use eframe::egui::{
 };
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
+    GetCursorPos, GetWindowRect, KillTimer, SetForegroundWindow, SetTimer, SetWindowPos,
+    HWND_TOPMOST, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEMOVE, WM_NCDESTROY, WM_TIMER,
 };
 
 use winit::event_loop::{DeviceEvents, EventLoop};
@@ -150,6 +153,70 @@ fn hwnd_of(window: &impl HasWindowHandle) -> Option<HWND> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get() as HWND),
         _ => None,
+    }
+}
+
+/// Minimum time between mouse-move messages passed on to the app (500 per second).
+const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(2);
+const MOUSE_THROTTLE_ID: usize = 0xDA5C_5407;
+
+/// Window subclass that rate-limits `WM_MOUSEMOVE`.
+///
+/// Windows only delivers paint messages when the message queue is otherwise empty. A
+/// mouse polling at up to 8000 Hz keeps a mouse-move pending almost all the time, and
+/// each one costs real work in winit and egui, so repaints get starved and a dragged
+/// selection moves in jerks. Dropping the surplus here, before any of that work, keeps
+/// the queue draining. The latest dropped position is never lost: it is delivered
+/// before any button or wheel message, or by a short timer once the mouse stops.
+unsafe extern "system" fn throttle_mouse_moves(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    thread_local! {
+        static LAST_FORWARDED: Cell<Option<Instant>> = const { Cell::new(None) };
+        static PENDING: Cell<Option<(WPARAM, LPARAM)>> = const { Cell::new(None) };
+    }
+    unsafe {
+        match msg {
+            WM_MOUSEMOVE => {
+                let now = Instant::now();
+                let too_soon = LAST_FORWARDED
+                    .get()
+                    .is_some_and(|last| now.duration_since(last) < MOUSE_MOVE_INTERVAL);
+                if too_soon {
+                    if PENDING.replace(Some((wparam, lparam))).is_none() {
+                        SetTimer(hwnd, MOUSE_THROTTLE_ID, 10, None);
+                    }
+                    return 0;
+                }
+                LAST_FORWARDED.set(Some(now));
+                PENDING.set(None);
+            }
+            WM_TIMER if wparam == MOUSE_THROTTLE_ID => {
+                KillTimer(hwnd, MOUSE_THROTTLE_ID);
+                if let Some((w, l)) = PENDING.take() {
+                    LAST_FORWARDED.set(Some(Instant::now()));
+                    return DefSubclassProc(hwnd, WM_MOUSEMOVE, w, l);
+                }
+                return 0;
+            }
+            // Clicks and wheel turns must act at the true cursor position, so deliver
+            // any held-back move first. Their lparam carries the same client coordinates.
+            WM_MOUSEFIRST..=WM_MOUSELAST => {
+                if let Some((w, _)) = PENDING.take() {
+                    DefSubclassProc(hwnd, WM_MOUSEMOVE, w, lparam);
+                }
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(throttle_mouse_moves), MOUSE_THROTTLE_ID);
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, msg, wparam, lparam)
     }
 }
 
@@ -320,6 +387,7 @@ impl Overlay {
             // something on screen is moving. The window is still hidden at this point.
             let disable: i32 = 1;
             unsafe {
+                SetWindowSubclass(hwnd, Some(throttle_mouse_moves), MOUSE_THROTTLE_ID, 0);
                 DwmSetWindowAttribute(
                     hwnd,
                     DWMWA_TRANSITIONS_FORCEDISABLED as u32,
