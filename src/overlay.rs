@@ -915,9 +915,12 @@ impl Overlay {
                                 self.color = swatch;
                             }
                         }
-                        ui.color_edit_button_srgba(&mut self.color)
+                        icons::color_picker_button(ui, &mut self.color)
                             .on_hover_text("Custom colour");
-                        ui.add(
+                        // Fixed width, so the toolbar does not shift when the value
+                        // gains a digit.
+                        ui.add_sized(
+                            [52.0, 22.0],
                             egui::DragValue::new(&mut self.width)
                                 .range(MIN_WIDTH..=MAX_WIDTH)
                                 .speed(0.25)

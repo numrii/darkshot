@@ -48,6 +48,52 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, selected: bool, enabled: bool) -> R
     response
 }
 
+/// A colour-wheel button that opens a full colour picker (RGB, HSV and hex). The
+/// centre dot shows the current colour.
+pub fn color_picker_button(ui: &mut egui::Ui, color: &mut Color32) -> Response {
+    let popup_id = ui.auto_id_with("color-picker");
+    let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::splat(BUTTON), Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, open);
+        let background = if open || response.hovered() {
+            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+            visuals.bg_fill
+        } else {
+            ui.visuals().window_fill
+        };
+        // A ring of hue segments, each slightly widened so no seams show between them.
+        let center = rect.center();
+        let (outer, inner) = (8.5, 4.5);
+        const SEGMENTS: usize = 24;
+        let step = std::f32::consts::TAU / SEGMENTS as f32;
+        for i in 0..SEGMENTS {
+            let (a0, a1) = (i as f32 * step - 0.02, (i + 1) as f32 * step + 0.02);
+            let at = |a: f32, r: f32| center + vec2(a.cos(), a.sin()) * r;
+            let hue = Color32::from(egui::ecolor::Hsva::new(i as f32 / SEGMENTS as f32, 0.85, 1.0, 1.0));
+            let quad = vec![at(a0, inner), at(a0, outer), at(a1, outer), at(a1, inner)];
+            ui.painter().add(Shape::convex_polygon(quad, hue, Stroke::NONE));
+        }
+        ui.painter().circle_filled(center, inner, background);
+        ui.painter().circle_filled(center, 3.0, *color);
+        let edge = ui.visuals().widgets.noninteractive.fg_stroke.color.gamma_multiply(0.5);
+        ui.painter().circle_stroke(center, 3.0, Stroke::new(1.0, edge));
+    }
+
+    egui::Popup::menu(&response)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.spacing_mut().slider_width = 275.0;
+            let alpha = egui::widgets::color_picker::Alpha::OnlyBlend;
+            if egui::widgets::color_picker::color_picker_color32(ui, color, alpha) {
+                response.mark_changed();
+            }
+        });
+    response
+}
+
 /// Draw `icon` into `area` (any square). `background` is what the icon sits on, used
 /// where one part of the icon must hide another.
 pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, background: Color32) {
