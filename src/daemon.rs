@@ -2,30 +2,32 @@
 //!
 //! Each capture runs as a short-lived child process (`darkshot --capture`), so the
 //! background process holds no GPU resources and a crash in the overlay cannot take
-//! the hotkey down with it.
+//! the hotkey down with it. The settings window is a child process too
+//! (`darkshot --settings`); when it closes, the settings are read again.
 
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_QUIT,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_APP, WM_QUIT,
 };
 
+use crate::settings::{parse_hotkey, Settings};
 use crate::AnyResult;
 
 const MENU_CAPTURE: &str = "capture";
+const MENU_SETTINGS: &str = "settings";
 const MENU_QUIT: &str = "quit";
 
-// Temporary fixed hotkey for testing; this will become configurable.
-const HOTKEY_MODIFIERS: Modifiers = Modifiers::CONTROL;
-const HOTKEY_CODE: Code = Code::F9;
-const HOTKEY_LABEL: &str = "Ctrl+F9";
+/// Thread messages to the main thread, which owns the hotkey and the tray.
+const WM_OPEN_SETTINGS: u32 = WM_APP + 1;
+const WM_SETTINGS_CLOSED: u32 = WM_APP + 2;
 
 pub fn run() -> AnyResult<()> {
     if !acquire_single_instance() {
@@ -35,15 +37,7 @@ pub fn run() -> AnyResult<()> {
     let overlay: Arc<Mutex<Option<Child>>> = Arc::default();
     let main_thread = unsafe { GetCurrentThreadId() };
 
-    // Global hotkey. Registration fails if another tool already owns the combination.
     let hotkeys = GlobalHotKeyManager::new()?;
-    let hotkey_ok = match hotkeys.register(HotKey::new(Some(HOTKEY_MODIFIERS), HOTKEY_CODE)) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("could not register {HOTKEY_LABEL}: {e}");
-            false
-        }
-    };
     {
         let overlay = overlay.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
@@ -54,24 +48,16 @@ pub fn run() -> AnyResult<()> {
     }
 
     // Tray icon: left click captures, right click opens the menu.
-    let capture_label = if hotkey_ok {
-        format!("Capture\t{HOTKEY_LABEL}")
-    } else {
-        "Capture".to_owned()
-    };
+    let capture_item = MenuItem::with_id(MENU_CAPTURE, "Capture", true, None);
     let menu = Menu::with_items(&[
-        &MenuItem::with_id(MENU_CAPTURE, capture_label, true, None),
+        &capture_item,
+        &MenuItem::with_id(MENU_SETTINGS, "Settings…", true, None),
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(MENU_QUIT, "Quit Darkshot", true, None),
     ])?;
-    let tooltip = if hotkey_ok {
-        format!("Darkshot: press {HOTKEY_LABEL} to capture")
-    } else {
-        format!("Darkshot: {HOTKEY_LABEL} is taken by another app, click here to capture")
-    };
-    let _tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .with_icon(tray_icon()?)
-        .with_tooltip(tooltip)
+        .with_tooltip("Darkshot")
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .build()?;
@@ -91,35 +77,110 @@ pub fn run() -> AnyResult<()> {
     {
         let overlay = overlay.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+            let post = |message| unsafe { PostThreadMessageW(main_thread, message, 0, 0) };
             if e.id == MENU_CAPTURE {
                 start_capture(&overlay);
+            } else if e.id == MENU_SETTINGS {
+                post(WM_OPEN_SETTINGS);
             } else if e.id == MENU_QUIT {
-                unsafe { PostThreadMessageW(main_thread, WM_QUIT, 0, 0) };
+                post(WM_QUIT);
             }
         }));
     }
 
-    if !hotkey_ok {
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Darkshot")
-            .set_description(format!(
-                "{HOTKEY_LABEL} is already registered by another application, so the hotkey \
-                 is unavailable.\n\nYou can still capture by clicking the Darkshot tray icon."
-            ))
-            .show();
-    }
+    let mut registered = None;
+    apply_hotkey(&hotkeys, &mut registered, &capture_item, &tray);
+    let mut settings_open = false;
 
     // The tray icon and the hotkey both deliver their events through this thread's
     // Win32 message queue, so pump it until Quit posts WM_QUIT.
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            match msg.message {
+                WM_OPEN_SETTINGS if msg.hwnd.is_null() => {
+                    if !settings_open {
+                        // Let go of the hotkey while the settings are open, so pressing
+                        // the current combination to record it does not start a capture.
+                        if let Some(old) = registered.take() {
+                            let _ = hotkeys.unregister(old);
+                        }
+                        settings_open = open_settings(main_thread);
+                        if !settings_open {
+                            apply_hotkey(&hotkeys, &mut registered, &capture_item, &tray);
+                        }
+                    }
+                }
+                WM_SETTINGS_CLOSED if msg.hwnd.is_null() => {
+                    settings_open = false;
+                    apply_hotkey(&hotkeys, &mut registered, &capture_item, &tray);
+                }
+                _ => {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Read the hotkey from the settings and register it, replacing any registered one.
+/// Updates the menu and tooltip, and explains if the combination is not available.
+fn apply_hotkey(
+    hotkeys: &GlobalHotKeyManager,
+    registered: &mut Option<HotKey>,
+    capture_item: &MenuItem,
+    tray: &TrayIcon,
+) {
+    if let Some(old) = registered.take() {
+        let _ = hotkeys.unregister(old);
+    }
+    let label = Settings::load().hotkey.trim().to_owned();
+    let result = match parse_hotkey(&label) {
+        Some(hotkey) => hotkeys.register(hotkey).map(|()| hotkey).map_err(|e| e.to_string()),
+        None => Err("not a valid key combination".to_owned()),
+    };
+    match result {
+        Ok(hotkey) => {
+            *registered = Some(hotkey);
+            capture_item.set_text(format!("Capture\t{label}"));
+            let _ = tray.set_tooltip(Some(format!("Darkshot: press {label} to capture")));
+        }
+        Err(e) => {
+            eprintln!("could not register {label}: {e}");
+            capture_item.set_text("Capture");
+            let _ = tray.set_tooltip(Some(format!("Darkshot: {label} is unavailable, click here to capture")));
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Darkshot")
+                .set_description(format!(
+                    "The capture shortcut {label} could not be registered. Windows or another \
+                     application may already use it.\n\nYou can still capture by clicking the \
+                     Darkshot tray icon, or choose another shortcut under Settings."
+                ))
+                .show();
+        }
+    }
+}
+
+/// Start the settings window as a child process. When it exits, the main thread is
+/// told to read the settings again. Returns false if it could not be started.
+fn open_settings(main_thread: u32) -> bool {
+    let child = std::env::current_exe().and_then(|exe| Command::new(exe).arg("--settings").spawn());
+    match child {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                unsafe { PostThreadMessageW(main_thread, WM_SETTINGS_CLOSED, 0, 0) };
+            });
+            true
+        }
+        Err(e) => {
+            eprintln!("could not open settings: {e}");
+            false
+        }
+    }
 }
 
 /// Launch the overlay as a child process, unless one is already on screen.

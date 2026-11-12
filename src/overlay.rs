@@ -35,6 +35,7 @@ use crate::annotate::{
 };
 use crate::effects;
 use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
+use crate::settings::Settings;
 use crate::text::Layout;
 use crate::icons::{self, Icon};
 use crate::AnyResult;
@@ -496,16 +497,13 @@ enum Action {
 }
 
 /// Default annotation colours: red, green, blue, and the highlighter's yellow (so the
-/// highlighter's default shows as a selected swatch).
-const SWATCHES: [Color32; 4] = [
-    Color32::from_rgb(0xE5, 0x48, 0x4D),
-    Color32::from_rgb(0x30, 0xA4, 0x6C),
-    Color32::from_rgb(0x3E, 0x63, 0xDD),
-    MARKER_COLOR,
-];
+/// highlighter's default shows as a selected swatch). The settings can change them.
+#[cfg(test)]
+const SWATCHES: [Color32; 4] = crate::settings::DEFAULT_SWATCHES;
 const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
 /// Default highlighter colour (classic highlighter yellow) and thickness.
-const MARKER_COLOR: Color32 = Color32::from_rgb(0xFF, 0xE6, 0x00);
+#[cfg(test)]
+const MARKER_COLOR: Color32 = crate::settings::DEFAULT_MARKER_COLOR;
 const MARKER_WIDTH: f32 = 16.0;
 /// Width of the toolbar's context options: room for the largest set, the arrow's
 /// (stroke style, arrowhead, both-ends toggle), each followed by the toolbar's 2 px
@@ -576,6 +574,8 @@ struct Overlay {
     pending_undo: Option<Vec<Annotation>>,
 
     tool: Tool,
+    /// The toolbar's colour swatches, from the settings.
+    swatches: [Color32; 4],
     /// Style for new annotations; mirrors the selected one, if any.
     color: Color32,
     width: f32,
@@ -618,8 +618,10 @@ struct ToolbarOutput {
 }
 
 impl Overlay {
-    fn with_desktop(desktop: Desktop, hwnd: Option<HWND>) -> Self {
+    fn with_desktop(desktop: Desktop, hwnd: Option<HWND>, settings: &Settings) -> Self {
+        let swatches = settings.swatch_colors();
         Self {
+            swatches,
             current_monitor: desktop.home,
             desktop,
             textures: Vec::new(),
@@ -628,7 +630,7 @@ impl Overlay {
             action: None,
             pending_undo: None,
             tool: Tool::Select,
-            color: SWATCHES[0],
+            color: swatches[0],
             width: 4.0,
             dash: Dash::Solid,
             head: ArrowHead::Triangle,
@@ -636,14 +638,14 @@ impl Overlay {
             text_style: TextStyle::Plain,
             effect: Effect::Pixelate,
             styles: HashMap::from([
-                (StyleSlot::Marker, (MARKER_COLOR, MARKER_WIDTH)),
-                (StyleSlot::Text, (SWATCHES[0], TEXT_SIZE)),
+                (StyleSlot::Marker, (settings.marker(), MARKER_WIDTH)),
+                (StyleSlot::Text, (swatches[0], TEXT_SIZE)),
                 // Black: the colour of a redaction (pixelate and blur ignore it).
                 (StyleSlot::Blur, (Color32::BLACK, BLUR_STRENGTH)),
             ]),
             editing: None,
             save_open: false,
-            save_options: SaveOptions::default(),
+            save_options: SaveOptions::from_settings(settings),
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -657,7 +659,7 @@ impl Overlay {
     fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
         trace("window created");
         setup_text(&cc.egui_ctx);
-        let overlay = Self::with_desktop(desktop, hwnd_of(cc));
+        let overlay = Self::with_desktop(desktop, hwnd_of(cc), &Settings::load());
         if let Some(hwnd) = overlay.hwnd {
             // Switch off the window's fade-in. During that animation the live desktop
             // shows through the frozen capture, which looks like ghosting when
@@ -1315,7 +1317,7 @@ impl Overlay {
                         }
 
                         ui.separator();
-                        for swatch in SWATCHES {
+                        for swatch in self.swatches {
                             let (rect, response) =
                                 ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
                             ui.painter().rect_filled(rect.shrink(2.0), 3.0, swatch);
@@ -1407,16 +1409,18 @@ impl Overlay {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(300.0);
                     egui::Grid::new("save-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                        ui.label("Name");
-                        let name = ui.add(
-                            egui::TextEdit::singleline(&mut options.prefix)
-                                .hint_text("prefix")
-                                .desired_width(200.0),
-                        );
-                        if name.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            save = true;
+                        for (label, text, hint) in [
+                            ("Prefix", &mut options.prefix, "none"),
+                            ("Suffix", &mut options.suffix, "none"),
+                        ] {
+                            ui.label(label);
+                            let field = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(200.0));
+                            let tip = "Can include {date} and {time}";
+                            if field.on_hover_text(tip).lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                save = true;
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
 
                         ui.label("Format");
                         ui.horizontal(|ui| {
@@ -1478,7 +1482,7 @@ impl Overlay {
 ///   If it is missing, egui's own font is kept.
 /// - Turn off sub-pixel binning: it lets glyphs sit at fractional pixel offsets, which
 ///   smears their edges at 100% display scaling.
-fn setup_text(ctx: &egui::Context) {
+pub(crate) fn setup_text(ctx: &egui::Context) {
     let font = std::env::var_os("WINDIR")
         .map(|dir| std::path::PathBuf::from(dir).join("Fonts").join("segoeui.ttf"))
         .and_then(|path| std::fs::read(path).ok());
@@ -2029,7 +2033,7 @@ mod tests {
             monitors: vec![rect(0.0, 0.0, 4.0, 4.0)],
             home: 0,
         };
-        let mut overlay = Overlay::with_desktop(desktop, None);
+        let mut overlay = Overlay::with_desktop(desktop, None, &Settings::default());
         let marker = Tool::Shape(ShapeKind::Marker);
         let rect_tool = Tool::Shape(ShapeKind::Rect);
 
@@ -2057,7 +2061,7 @@ mod tests {
             monitors: vec![rect(0.0, 0.0, w as f32, h as f32)],
             home: 0,
         };
-        Overlay::with_desktop(desktop, None)
+        Overlay::with_desktop(desktop, None, &Settings::default())
     }
 
     fn key(key: Key) -> egui::Event {
@@ -2163,6 +2167,7 @@ mod tests {
                 home: 0,
             },
             None,
+            &Settings::default(),
         );
         overlay.selection = Some(rect(3.0, 1.0, 6.0, 4.0));
         let out = overlay.cropped().unwrap();

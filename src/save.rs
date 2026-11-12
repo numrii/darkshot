@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
+use crate::settings::{expand, Settings};
 use crate::AnyResult;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,8 +37,10 @@ pub const QUALITY_MEDIUM: u8 = 75;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaveOptions {
-    /// Start of the file name; a timestamp follows.
+    /// The file name is `prefix` + `suffix` + extension; both may contain `{date}` and
+    /// `{time}`.
     pub prefix: String,
+    pub suffix: String,
     pub format: Format,
     /// JPEG quality, 1-100.
     pub quality: u8,
@@ -47,28 +50,35 @@ pub struct SaveOptions {
 
 impl Default for SaveOptions {
     fn default() -> Self {
-        Self {
-            prefix: "darkshot".into(),
-            format: Format::Png,
-            quality: QUALITY_HIGH,
-            folder: pictures_folder(),
-        }
+        Self::from_settings(&Settings::default())
     }
 }
 
 impl SaveOptions {
-    /// The suggested file name: the prefix (cleaned of characters Windows does not
-    /// allow), the local date and time, and the format's extension.
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            prefix: settings.save.prefix.clone(),
+            suffix: settings.save.suffix.clone(),
+            format: settings.save.format.into(),
+            quality: settings.save.jpeg_quality,
+            folder: settings.save_folder(),
+        }
+    }
+
+    /// The suggested file name: prefix + suffix with `{date}` and `{time}` filled in,
+    /// cleaned of characters Windows does not allow, plus the format's extension. If
+    /// both are empty, the date and time are used.
     pub fn file_name(&self) -> String {
-        let prefix: String = self
-            .prefix
+        let (date, time) = local_date_time();
+        let name = expand(&format!("{}{}", self.prefix, self.suffix), &date, &time);
+        let name: String = name
             .trim()
             .chars()
             .map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c })
             .collect();
-        let stamp = timestamp();
+        let name = name.trim_end_matches('.');
         let ext = self.format.extension();
-        if prefix.is_empty() { format!("{stamp}.{ext}") } else { format!("{prefix}-{stamp}.{ext}") }
+        if name.is_empty() { format!("{date}_{time}.{ext}") } else { format!("{name}.{ext}") }
     }
 
     /// Ask where to save, starting in the configured folder with the suggested name.
@@ -121,21 +131,14 @@ pub fn write(img: &RgbaImage, path: &Path, format: Format, quality: u8) -> AnyRe
     Ok(path)
 }
 
-/// The local date and time as `YYYY-MM-DD_HH-MM-SS`.
-fn timestamp() -> String {
+/// The local date (`YYYY-MM-DD`) and time (`HH-MM-SS`).
+pub fn local_date_time() -> (String, String) {
     let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
-    format!(
-        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    (
+        format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay),
+        format!("{:02}-{:02}-{:02}", t.wHour, t.wMinute, t.wSecond),
     )
-}
-
-/// The user's Pictures folder, if it exists.
-fn pictures_folder() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE")?;
-    let pictures = PathBuf::from(home).join("Pictures");
-    pictures.is_dir().then_some(pictures)
 }
 
 #[cfg(test)]
@@ -144,14 +147,29 @@ mod tests {
 
     #[test]
     fn file_names() {
-        let mut options = SaveOptions { prefix: " my:shot? ".into(), ..Default::default() };
+        let stamp_len = "2026-11-12_21-50-03".len();
+        // Default: prefix + date and time.
+        let name = SaveOptions::default().file_name();
+        assert!(name.starts_with("darkshot-20") && name.ends_with(".png"), "{name}");
+        assert_eq!(name.len(), "darkshot-".len() + stamp_len + ".png".len());
+
+        // Characters Windows forbids are replaced.
+        let mut options = SaveOptions { prefix: " my:shot?-".into(), ..Default::default() };
+        assert!(options.file_name().starts_with("my_shot_-20"), "{}", options.file_name());
+
+        // Fixed text only, placeholders in the prefix, and nothing at all.
+        options.prefix = "bug-report".into();
+        options.suffix = String::new();
+        assert_eq!(options.file_name(), "bug-report.png");
+        options.prefix = "{date} ".into();
+        options.suffix = "notes".into();
         let name = options.file_name();
-        assert!(name.starts_with("my_shot_-20") && name.ends_with(".png"), "{name}");
-        assert_eq!(name.len(), "my_shot_-".len() + "2026-11-12_21-50-03".len() + ".png".len());
+        assert!(name.starts_with("20") && name.ends_with(" notes.png") && !name.contains('{'), "{name}");
         options.prefix.clear();
+        options.suffix.clear();
         options.format = Format::Jpeg;
         let name = options.file_name();
-        assert!(name.starts_with("20") && name.ends_with(".jpg"), "{name}");
+        assert!(name.starts_with("20") && name.len() == stamp_len + ".jpg".len(), "{name}");
     }
 
     #[test]
