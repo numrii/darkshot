@@ -1,5 +1,5 @@
-//! The capture overlay: freeze the monitor under the cursor, let the user pick and
-//! adjust a region, then copy or save it.
+//! The capture overlay: freeze every monitor, show the frozen desktop in one window
+//! spanning all of them, let the user pick and adjust a region, then copy or save it.
 
 use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,11 +11,8 @@ use eframe::egui::{
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
 use windows_sys::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowRect, SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
@@ -27,46 +24,112 @@ use crate::AnyResult;
 const GRAB_TOLERANCE: f32 = 6.0;
 const HANDLE_SIZE: f32 = 7.0;
 
-/// Capture the monitor under the cursor and run the overlay on it until the user
-/// copies, saves or cancels.
+/// Print a startup timing line when `DARKSHOT_TRACE` is set (debugging aid).
+fn trace(what: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    if std::env::var_os("DARKSHOT_TRACE").is_some() {
+        eprintln!("TRACE {elapsed:>10.1?} {what}");
+    }
+}
+
+/// Capture all monitors and run the overlay until the user copies, saves or cancels.
 pub fn run() -> AnyResult<()> {
     // Must happen first: without it Windows reports scaled, not physical, coordinates.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
-    let (cursor, monitor) = monitor_under_cursor()?;
     // Grab the screen before our own window exists so the overlay is never in the shot.
-    let screenshot = xcap::Monitor::from_point(cursor.x, cursor.y)?.capture_image()?;
+    trace("start");
+    let desktop = Desktop::capture()?;
+    trace("captured");
 
+    // Create the window at its final size. If it were created small and resized
+    // afterwards, the first frame would be drawn into the small surface and stretched.
+    // egui takes points; `cover_desktop` corrects any rounding or mixed-DPI mismatch.
+    let b = desktop.bounds;
+    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_taskbar(false)
-            .with_active(true),
+            .with_active(true)
+            .with_clamp_size_to_monitor_size(false)
+            .with_position([b.left as f32 / scale, b.top as f32 / scale])
+            .with_inner_size([
+                (b.right - b.left) as f32 / scale,
+                (b.bottom - b.top) as f32 / scale,
+            ]),
+        // Present immediately with a one-frame queue: with the default (vsync, two
+        // frames) a dragged selection visibly trails the mouse cursor.
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration::default().with_surface_config(
+            eframe::egui_wgpu::SurfaceConfig {
+                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                desired_maximum_frame_latency: Some(1),
+            },
+        ),
         ..Default::default()
     };
 
     eframe::run_native(
         "Darkshot",
         options,
-        Box::new(move |cc| Ok(Box::new(Overlay::new(cc, screenshot, monitor)))),
+        Box::new(move |cc| Ok(Box::new(Overlay::new(cc, desktop)))),
     )?;
     Ok(())
 }
 
-/// The cursor position and the bounds of the monitor it is on, in physical pixels.
-fn monitor_under_cursor() -> AnyResult<(POINT, RECT)> {
-    unsafe {
+/// A frozen capture of the whole virtual desktop.
+struct Desktop {
+    /// One capture per monitor, in physical pixels. Kept separate (never composited
+    /// up front) so opening the overlay stays fast on large multi-monitor desktops.
+    shots: Vec<RgbaImage>,
+    /// The virtual desktop's bounds in screen coordinates.
+    bounds: RECT,
+    /// Each monitor's area in desktop pixels (origin = the desktop's top-left corner).
+    /// Selections use the same coordinate space.
+    monitors: Vec<Rect>,
+    /// Index of the monitor the cursor was on at capture time.
+    home: usize,
+}
+
+impl Desktop {
+    fn capture() -> AnyResult<Self> {
         let mut cursor = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut cursor) == 0 {
-            return Err("could not read the cursor position".into());
+        unsafe { GetCursorPos(&mut cursor) };
+
+        let mut shots = Vec::new();
+        for monitor in xcap::Monitor::all()? {
+            shots.push((monitor.x()?, monitor.y()?, monitor.capture_image()?));
+            trace("monitor captured");
         }
-        let mut info: MONITORINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let handle = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-        if GetMonitorInfoW(handle, &mut info) == 0 {
-            return Err("could not read the monitor bounds".into());
-        }
-        Ok((cursor, info.rcMonitor))
+        let edge = |f: fn(&(i32, i32, RgbaImage)) -> i32| shots.iter().map(f);
+        let (Some(left), Some(top), Some(right), Some(bottom)) = (
+            edge(|s| s.0).min(),
+            edge(|s| s.1).min(),
+            edge(|s| s.0 + s.2.width() as i32).max(),
+            edge(|s| s.1 + s.2.height() as i32).max(),
+        ) else {
+            return Err("no monitors found".into());
+        };
+
+        let monitors: Vec<Rect> = shots
+            .iter()
+            .map(|(x, y, shot)| {
+                Rect::from_min_size(
+                    Pos2::new((x - left) as f32, (y - top) as f32),
+                    vec2(shot.width() as f32, shot.height() as f32),
+                )
+            })
+            .collect();
+        let cursor = Pos2::new((cursor.x - left) as f32, (cursor.y - top) as f32);
+        let home = monitors.iter().position(|m| m.contains(cursor)).unwrap_or(0);
+
+        Ok(Self {
+            shots: shots.into_iter().map(|s| s.2).collect(),
+            bounds: RECT { left, top, right, bottom },
+            monitors,
+            home,
+        })
     }
 }
 
@@ -213,13 +276,15 @@ fn resize_cursor(hx: i8, hy: i8) -> CursorIcon {
 }
 
 struct Overlay {
-    /// The frozen capture of one monitor, in physical pixels.
-    image: RgbaImage,
-    /// Created on the first frame: the GPU's real texture size limit is not known before then.
-    texture: Option<egui::TextureHandle>,
-    /// Where the overlay window must sit: the captured monitor's bounds.
-    monitor: RECT,
+    desktop: Desktop,
+    /// One texture per monitor, so no texture exceeds the GPU's size limit. Created on
+    /// the first frame: the real limit is not known before then.
+    textures: Vec<egui::TextureHandle>,
     hwnd: Option<HWND>,
+    /// Frames drawn so far, capped; only used for startup tracing.
+    frames: u8,
+    /// The monitor the pointer was last on; Ctrl+A and the hint bar use it.
+    current_monitor: usize,
     /// Selected region in image pixels.
     selection: Option<Rect>,
     drag: Option<Drag>,
@@ -227,46 +292,47 @@ struct Overlay {
 }
 
 impl Overlay {
-    fn new(cc: &eframe::CreationContext<'_>, image: RgbaImage, monitor: RECT) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
+        trace("window created");
         let overlay = Self {
-            image,
-            texture: None,
-            monitor,
+            current_monitor: desktop.home,
+            desktop,
+            textures: Vec::new(),
+            frames: 0,
             hwnd: hwnd_of(cc),
             selection: None,
             drag: None,
             error: None,
         };
-        if overlay.cover_monitor() {
-            if let Some(hwnd) = overlay.hwnd {
-                unsafe { SetForegroundWindow(hwnd) };
-            }
+        overlay.cover_desktop(true);
+        if let Some(hwnd) = overlay.hwnd {
+            unsafe { SetForegroundWindow(hwnd) };
         }
         overlay
     }
 
-    /// Make the window cover exactly the captured monitor. Returns true if it had to move.
-    /// Called every frame because Windows may resize the window when it crosses onto a
-    /// monitor with a different DPI scale.
-    fn cover_monitor(&self) -> bool {
+    /// Make the window cover exactly the captured desktop, above everything else.
+    /// Returns true if it had to move. Checked every frame (`force` = false) because
+    /// Windows may resize the window when it lands on a monitor with a different DPI scale.
+    fn cover_desktop(&self, force: bool) -> bool {
         let Some(hwnd) = self.hwnd else { return false };
-        let m = self.monitor;
+        let m = self.desktop.bounds;
         unsafe {
             let mut now: RECT = std::mem::zeroed();
-            if GetWindowRect(hwnd, &mut now) != 0
-                && (now.left, now.top, now.right, now.bottom) == (m.left, m.top, m.right, m.bottom)
-            {
-                return false;
+            let in_place = GetWindowRect(hwnd, &mut now) != 0
+                && (now.left, now.top, now.right, now.bottom) == (m.left, m.top, m.right, m.bottom);
+            if force || !in_place {
+                SetWindowPos(hwnd, HWND_TOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top, 0);
             }
-            SetWindowPos(hwnd, HWND_TOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top, 0);
+            !in_place
         }
-        true
     }
 
     fn bounds(&self) -> Rect {
+        let b = self.desktop.bounds;
         Rect::from_min_size(
             Pos2::ZERO,
-            vec2(self.image.width() as f32, self.image.height() as f32),
+            vec2((b.right - b.left) as f32, (b.bottom - b.top) as f32),
         )
     }
 
@@ -281,14 +347,35 @@ impl Overlay {
         }
     }
 
-    /// Crop the capture to the current selection.
+    /// The pixels inside the current selection, stitched from every monitor it touches.
+    /// Areas outside all monitors (possible when monitors differ in size) stay transparent.
     fn cropped(&self) -> Option<RgbaImage> {
         let sel = self.selection?.intersect(self.bounds());
         let (w, h) = (sel.width() as u32, sel.height() as u32);
         if w == 0 || h == 0 {
             return None;
         }
-        Some(image::imageops::crop_imm(&self.image, sel.min.x as u32, sel.min.y as u32, w, h).to_image())
+        let mut out = RgbaImage::new(w, h);
+        for (monitor, shot) in self.desktop.monitors.iter().zip(&self.desktop.shots) {
+            let part = sel.intersect(*monitor);
+            if part.width() < 1.0 || part.height() < 1.0 {
+                continue;
+            }
+            let piece = image::imageops::crop_imm(
+                shot,
+                (part.min.x - monitor.min.x) as u32,
+                (part.min.y - monitor.min.y) as u32,
+                part.width() as u32,
+                part.height() as u32,
+            );
+            image::imageops::replace(
+                &mut out,
+                &*piece,
+                (part.min.x - sel.min.x) as i64,
+                (part.min.y - sel.min.y) as i64,
+            );
+        }
+        Some(out)
     }
 
     fn copy_to_clipboard(img: &RgbaImage) -> AnyResult<()> {
@@ -331,7 +418,7 @@ impl eframe::App for Overlay {
         if self.hwnd.is_none() {
             self.hwnd = hwnd_of(frame);
         }
-        if self.cover_monitor() {
+        if self.cover_desktop(false) {
             ctx.request_repaint(); // check again next frame that the move stuck
         }
 
@@ -340,27 +427,43 @@ impl eframe::App for Overlay {
         let painter = ui.painter_at(screen);
 
         // Image pixels per egui point, and conversions between the two spaces.
-        let scale = self.image.width() as f32 / screen.width();
+        let scale = self.bounds().width() / screen.width();
         let bounds = self.bounds();
         let to_px = |p: Pos2| ((p - screen.min) * scale).to_pos2();
         let to_pt = |p: Pos2| screen.min + p.to_vec2() / scale;
         let tol = GRAB_TOLERANCE * scale;
 
-        // Frozen screenshot as the backdrop.
-        let texture = self.texture.get_or_insert_with(|| {
-            let size = [self.image.width() as usize, self.image.height() as usize];
-            ctx.load_texture(
-                "screenshot",
-                egui::ColorImage::from_rgba_unmultiplied(size, self.image.as_raw()),
-                egui::TextureOptions::NEAREST,
-            )
-        });
+        // Frozen screenshot as the backdrop, one textured quad per monitor.
+        if self.textures.is_empty() {
+            trace("first frame");
+            for (i, shot) in self.desktop.shots.iter().enumerate() {
+                let size = [shot.width() as usize, shot.height() as usize];
+                self.textures.push(ctx.load_texture(
+                    format!("monitor-{i}"),
+                    egui::ColorImage::from_rgba_unmultiplied(size, shot.as_raw()),
+                    egui::TextureOptions::NEAREST,
+                ));
+            }
+        }
+        if self.frames < 3 {
+            self.frames += 1;
+            trace("frame painted");
+        }
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        painter.image(texture.id(), screen, uv, Color32::WHITE);
+        for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
+            let area = Rect::from_min_max(to_pt(m.min), to_pt(m.max));
+            painter.image(texture.id(), area, uv, Color32::WHITE);
+        }
 
         // --- Mouse: create, move or resize the selection ---------------------------
         let (hover, press_origin, mods) =
             ctx.input(|i| (i.pointer.latest_pos(), i.pointer.press_origin(), i.modifiers));
+        if let Some(i) = hover.and_then(|p| {
+            let p = to_px(p);
+            self.desktop.monitors.iter().position(|m| m.contains(p))
+        }) {
+            self.current_monitor = i;
+        }
 
         if response.drag_started() {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
@@ -412,7 +515,7 @@ impl eframe::App for Overlay {
 
         if self.drag.is_none() {
             if select_all {
-                self.selection = Some(bounds);
+                self.selection = Some(self.desktop.monitors[self.current_monitor]);
             } else if nudge != Vec2::ZERO {
                 if let Some(sel) = self.selection {
                     self.selection = Some(keep_inside(sel.translate(nudge), bounds));
@@ -479,7 +582,8 @@ impl eframe::App for Overlay {
         } else {
             "Drag to select an area · Ctrl+A whole screen · Esc cancel"
         };
-        let bottom = screen.center_bottom() + vec2(0.0, -24.0);
+        let monitor = self.desktop.monitors[self.current_monitor];
+        let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);
         label(&painter, bottom, Align2::CENTER_BOTTOM, hint.to_owned(), Color32::WHITE);
         if let Some(err) = &self.error {
             let pos = bottom + vec2(0.0, -30.0);
@@ -560,5 +664,32 @@ mod tests {
         assert_eq!(edges_at(sel, Pos2::new(200.0, 203.0), 6.0), Some((0, 1)));
         assert_eq!(edges_at(sel, Pos2::new(200.0, 150.0), 6.0), None);
         assert_eq!(keep_inside(rect(900.0, -5.0, 1010.0, 50.0), BOUNDS), rect(890.0, 0.0, 1000.0, 55.0));
+    }
+
+    #[test]
+    fn crop_stitches_across_monitors() {
+        // Two 4x4 monitors side by side: left is red, right is blue and sits 2 px lower.
+        let solid = |c: [u8; 4]| RgbaImage::from_pixel(4, 4, image::Rgba(c));
+        let overlay = Overlay {
+            desktop: Desktop {
+                shots: vec![solid([255, 0, 0, 255]), solid([0, 0, 255, 255])],
+                bounds: RECT { left: -4, top: 0, right: 4, bottom: 6 },
+                monitors: vec![rect(0.0, 0.0, 4.0, 4.0), rect(4.0, 2.0, 8.0, 6.0)],
+                home: 0,
+            },
+            textures: Vec::new(),
+            hwnd: None,
+            frames: 0,
+            current_monitor: 0,
+            selection: Some(rect(3.0, 1.0, 6.0, 4.0)),
+            drag: None,
+            error: None,
+        };
+        let out = overlay.cropped().unwrap();
+        assert_eq!(out.dimensions(), (3, 3));
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]); // left monitor
+        assert_eq!(out.get_pixel(1, 0).0, [0, 0, 0, 0]); // above the right monitor: no screen there
+        assert_eq!(out.get_pixel(1, 1).0, [0, 0, 255, 255]); // right monitor
+        assert_eq!(out.get_pixel(2, 2).0, [0, 0, 255, 255]);
     }
 }
