@@ -1037,6 +1037,7 @@ dependencies = [
  "eframe",
  "global-hotkey",
  "image",
+ "raw-window-handle",
  "rfd",
  "tray-icon",
  "windows-sys 0.61.2",
