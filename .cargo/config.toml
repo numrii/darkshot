@@ -1,0 +1,4 @@
+# Link the C runtime statically so darkshot.exe is a single portable file
+# with no dependency on the Visual C++ redistributable.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
