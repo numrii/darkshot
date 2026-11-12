@@ -5,18 +5,15 @@ clipboard or a file on disk. There is no upload and no network code.
 
 ## Next
 
-- **Snap to window edges.** Hold Ctrl while drawing or resizing the capture region to
-  snap it to the edges of the window under the cursor. Needs the list of window
-  rectangles captured together with the screenshot.
-
-## Planned
-
 - **Take over shortcuts Windows reserves.** An optional setting to claim a combination
   Windows holds for itself, such as Win+Shift+S (Snipping Tool), without the user
   editing the registry. Use a low-level keyboard hook (`WH_KEYBOARD_LL`, as AutoHotkey
   and PowerToys do) that swallows the combination before Windows sees it. Nothing in
   Windows is changed, and the takeover ends when Darkshot quits. The hook callback must
   return quickly, or Windows removes the hook.
+
+## Planned
+
 - **Release build.** A proper app icon, a size-optimised release profile, and turning
   off eframe's default features so no code that can open a URL (the `webbrowser`
   crate) is compiled in.
@@ -28,6 +25,9 @@ clipboard or a file on disk. There is no upload and no network code.
 - Tray icon and global capture shortcut; one overlay spanning all monitors.
 - Capture region with resize handles, move, arrow-key nudge, Ctrl+A for the current
   monitor; Shift constrains, Alt works from the centre.
+- Window snapping: Ctrl+click selects a window; holding Ctrl while drawing, moving or
+  resizing the region snaps its edges to window and monitor edges (ties go to the
+  frontmost window).
 - Editable annotations: rectangle, ellipse, line, arrow, pen, highlighter, text and
   blur, with undo and redo.
 - Stroke styles (solid, dashed, long dash, dash dot, dotted) and arrowheads (triangle,

@@ -10,6 +10,7 @@ mod overlay;
 mod save;
 mod settings;
 mod settings_window;
+mod snap;
 mod text;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;

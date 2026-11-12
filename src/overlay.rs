@@ -36,6 +36,7 @@ use crate::annotate::{
 use crate::effects;
 use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::Settings;
+use crate::snap::{self, Snap};
 use crate::text::Layout;
 use crate::icons::{self, Icon};
 use crate::AnyResult;
@@ -138,6 +139,8 @@ struct Desktop {
     monitors: Vec<Rect>,
     /// Index of the monitor the cursor was on at capture time.
     home: usize,
+    /// The windows on screen at capture time, for Ctrl-snapping.
+    snap: Snap,
 }
 
 impl Desktop {
@@ -175,6 +178,7 @@ impl Desktop {
         Ok(Self {
             shots: shots.into_iter().map(|s| s.2).collect(),
             bounds: RECT { left, top, right, bottom },
+            snap: Snap::new(snap::visible_windows(left, top), &monitors),
             monitors,
             home,
         })
@@ -573,6 +577,12 @@ struct Overlay {
     /// history only if the drag actually changes something, so a plain click adds nothing.
     pending_undo: Option<Vec<Annotation>>,
 
+    /// Modifier keys held this frame.
+    mods: Modifiers,
+    /// Whether the current region drag has moved far enough to count as a drag (a
+    /// click with Ctrl selects the window under it instead).
+    drag_moved: bool,
+
     tool: Tool,
     /// The toolbar's colour swatches, from the settings.
     swatches: [Color32; 4],
@@ -622,6 +632,8 @@ impl Overlay {
         let swatches = settings.swatch_colors();
         Self {
             swatches,
+            mods: Modifiers::NONE,
+            drag_moved: false,
             current_monitor: desktop.home,
             desktop,
             textures: Vec::new(),
@@ -775,6 +787,7 @@ impl Overlay {
     }
 
     fn begin_action(&mut self, action: Action) {
+        self.drag_moved = false;
         if !matches!(action, Action::Caret { .. }) {
             self.finish_editing();
         }
@@ -826,11 +839,26 @@ impl Overlay {
             Action::Region(drag) => {
                 // A stray click outside the region must not replace it with nothing.
                 if let Drag::Create { anchor } = drag {
-                    if anchor.distance(p) < 3.0 {
+                    if anchor.distance(p) < 3.0 && !self.drag_moved {
                         return;
                     }
                 }
-                self.selection = Some(drag.apply(p, mods, bounds));
+                self.drag_moved = true;
+                let mut region = drag.apply(p, mods, bounds);
+                // Ctrl: pull the edges being dragged onto nearby window or monitor edges.
+                if mods.ctrl {
+                    let snap = &self.desktop.snap;
+                    region = match drag {
+                        Drag::Create { .. } => snap.edges(region, true, true, true, true),
+                        Drag::Move { .. } => keep_inside(snap.moved(region), bounds),
+                        Drag::Resize { hx, hy, .. } => {
+                            let (x, y) = (hx != 0 && mods.alt, hy != 0 && mods.alt);
+                            snap.edges(region, hx < 0 || x, hx > 0 || x, hy < 0 || y, hy > 0 || y)
+                        }
+                    };
+                    region = region.intersect(bounds);
+                }
+                self.selection = Some(region);
             }
             Action::NewShape { anchor } => {
                 let Some(shape) = self.annotations.last_mut() else { return };
@@ -916,7 +944,16 @@ impl Overlay {
                     self.selected = None;
                 }
             }
-            Some(Action::Region(_)) => {
+            Some(Action::Region(drag)) => {
+                // Ctrl+click: select the window under the pointer.
+                if let Drag::Create { anchor } = drag {
+                    if !self.drag_moved && self.mods.ctrl {
+                        if let Some(window) = self.desktop.snap.window_at(anchor) {
+                            self.selection = Some(window.intersect(self.bounds()));
+                            self.selected = None;
+                        }
+                    }
+                }
                 if self.selection.is_some_and(|s| s.width() < 1.0 || s.height() < 1.0) {
                     self.selection = None;
                 }
@@ -1577,6 +1614,7 @@ impl eframe::App for Overlay {
         // --- Mouse ---------------------------------------------------------------------
         let (hover, press_origin, mods) =
             ctx.input(|i| (i.pointer.latest_pos(), i.pointer.press_origin(), i.modifiers));
+        self.mods = mods;
         if let Some(i) = hover.and_then(|p| {
             let p = to_px(p);
             self.desktop.monitors.iter().position(|m| m.contains(p))
@@ -1897,6 +1935,23 @@ impl eframe::App for Overlay {
             }
         }
 
+        // With Ctrl held over a spot where a click would start a new region, outline the
+        // window a click would select.
+        if mods.ctrl && self.action.is_none() && response.hovered() {
+            if let Some(p) = hover.map(to_px) {
+                if let Action::Region(Drag::Create { .. }) = self.pick_action(p, tol) {
+                    if let Some(window) = self.desktop.snap.window_at(p) {
+                        let window = window.intersect(bounds);
+                        let r = rect_to_pt(window);
+                        painter.rect_filled(r, 0.0, ACCENT.gamma_multiply(0.12));
+                        painter.rect_stroke(r, 0.0, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+                        let size = format!("{} x {}", window.width() as u32, window.height() as u32);
+                        label(&painter, r.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, size, Color32::WHITE);
+                    }
+                }
+            }
+        }
+
         // Handles of the selected annotation, in an accent colour to tell them apart
         // from the region's.
         if let Some(shape) = self.selected.map(|i| &self.annotations[i]) {
@@ -1929,7 +1984,7 @@ impl eframe::App for Overlay {
         let hint = if self.editing.is_some() {
             "Type · Enter new line · arrows move · Esc or click outside to finish"
         } else if self.selection.is_none() {
-            "Drag to select an area · Ctrl+A whole screen · Esc cancel"
+            "Drag to select an area · Ctrl+click a window · hold Ctrl to snap · Ctrl+A whole screen · Esc cancel"
         } else if self.selected.is_some() {
             "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect"
         } else {
@@ -2032,6 +2087,7 @@ mod tests {
             bounds: RECT { left: 0, top: 0, right: 4, bottom: 4 },
             monitors: vec![rect(0.0, 0.0, 4.0, 4.0)],
             home: 0,
+            snap: Snap::default(),
         };
         let mut overlay = Overlay::with_desktop(desktop, None, &Settings::default());
         let marker = Tool::Shape(ShapeKind::Marker);
@@ -2060,6 +2116,7 @@ mod tests {
             bounds: RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
             monitors: vec![rect(0.0, 0.0, w as f32, h as f32)],
             home: 0,
+            snap: Snap::default(),
         };
         Overlay::with_desktop(desktop, None, &Settings::default())
     }
@@ -2165,6 +2222,7 @@ mod tests {
                 bounds: RECT { left: -4, top: 0, right: 4, bottom: 6 },
                 monitors: vec![rect(0.0, 0.0, 4.0, 4.0), rect(4.0, 2.0, 8.0, 6.0)],
                 home: 0,
+            snap: Snap::default(),
             },
             None,
             &Settings::default(),
