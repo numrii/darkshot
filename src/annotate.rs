@@ -2,11 +2,13 @@
 //! painting (egui), rasterising into the output image (tiny-skia), and undo history.
 //!
 //! All geometry is in desktop pixels, the same space the selection uses, so shapes
-//! stay put when the capture region is moved or resized.
+//! stay put when the capture region is moved or resized. Each shape is reduced to a
+//! [`Geometry`] (stroked polylines, filled triangles, dots) that both renderers draw
+//! the same way, so what is on screen is what gets copied or saved.
 
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, epaint, vec2, Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, vec2, Color32, Pos2, Rect, Stroke, Vec2};
 use image::RgbaImage;
 
 pub const MIN_WIDTH: f32 = 1.0;
@@ -20,6 +22,59 @@ pub enum ShapeKind {
     Arrow,
 }
 
+/// How a stroke is broken up. Dash lengths scale with the stroke width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Dash {
+    #[default]
+    Solid,
+    Dash,
+    LongDash,
+    DashDot,
+    Dot,
+}
+
+impl Dash {
+    pub const ALL: [(Dash, &'static str); 5] = [
+        (Dash::Solid, "Solid"),
+        (Dash::Dash, "Dashed"),
+        (Dash::LongDash, "Long dash"),
+        (Dash::DashDot, "Dash dot"),
+        (Dash::Dot, "Dotted"),
+    ];
+
+    /// Alternating on/off lengths in pixels for stroke width `w`, or `None` for solid
+    /// lines and dots. Minimum lengths keep thin strokes readable.
+    fn pattern(self, w: f32) -> Option<Vec<f32>> {
+        match self {
+            Dash::Solid | Dash::Dot => None,
+            Dash::Dash => Some(vec![(4.0 * w).max(6.0), (2.5 * w).max(4.0)]),
+            Dash::LongDash => Some(vec![(9.0 * w).max(14.0), (3.0 * w).max(5.0)]),
+            Dash::DashDot => {
+                let gap = (2.0 * w).max(3.5);
+                Some(vec![(6.0 * w).max(9.0), gap, w.max(1.5), gap])
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ArrowHead {
+    #[default]
+    Triangle,
+    Open,
+    Stealth,
+    Dot,
+}
+
+impl ArrowHead {
+    pub const ALL: [(ArrowHead, &'static str); 4] = [
+        (ArrowHead::Triangle, "Triangle"),
+        (ArrowHead::Open, "Open"),
+        (ArrowHead::Stealth, "Stealth"),
+        (ArrowHead::Dot, "Dot"),
+    ];
+}
+
 /// One editable annotation. For boxes (`Rect`, `Ellipse`) `a` and `b` are opposite
 /// corners; for `Line` and `Arrow` they are the start and the end (the arrow tip).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,6 +85,30 @@ pub struct Annotation {
     pub color: Color32,
     /// Stroke width in pixels.
     pub width: f32,
+    pub dash: Dash,
+    /// Arrows only: the head's style, and whether the start gets one too.
+    pub head: ArrowHead,
+    pub double_head: bool,
+}
+
+/// An open or closed run of connected points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Polyline {
+    pub points: Vec<Pos2>,
+    pub closed: bool,
+}
+
+/// What a shape is made of, ready to draw.
+#[derive(Default, Debug)]
+pub struct Geometry {
+    /// Stroked with the shape's width, butt caps.
+    pub strokes: Vec<Polyline>,
+    /// Filled triangles (arrowheads).
+    pub fills: Vec<[Pos2; 3]>,
+    /// Filled circles: centre and radius.
+    pub dots: Vec<(Pos2, f32)>,
+    /// Corners should be sharp (rectangles) rather than rounded.
+    pub miter: bool,
 }
 
 impl Annotation {
@@ -60,87 +139,92 @@ impl Annotation {
         }
     }
 
-    /// Whether `p` is on the drawn stroke, within `tol` pixels. Shapes are unfilled,
-    /// so the inside of a box does not count: you can click through it.
-    pub fn hit(&self, p: Pos2, tol: f32) -> bool {
-        let reach = self.width / 2.0 + tol;
+    /// The full, undashed path of the shape (for lines: end to end, ignoring heads).
+    fn outline(&self) -> Polyline {
         match self.kind {
             ShapeKind::Rect => {
                 let r = self.rect();
-                let inner = r.shrink(reach);
-                let hollow = inner.width() > 0.0 && inner.height() > 0.0 && inner.contains(p);
-                r.expand(reach).contains(p) && !hollow
+                Polyline {
+                    points: vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()],
+                    closed: true,
+                }
             }
             ShapeKind::Ellipse => {
                 let r = self.rect();
                 let (rx, ry) = (r.width() / 2.0, r.height() / 2.0);
-                if rx < 1.0 || ry < 1.0 {
-                    return r.expand(reach).contains(p);
-                }
-                let d = p - r.center();
-                // k = 1 exactly on the ellipse; d / k is the boundary point along the ray.
-                let k = ((d.x / rx).powi(2) + (d.y / ry).powi(2)).sqrt();
-                if k < 1e-3 {
-                    return rx.min(ry) <= reach;
-                }
-                d.length() * (1.0 - 1.0 / k).abs() <= reach
+                // Roughly one point per 3 px of circumference.
+                let perimeter = std::f32::consts::TAU * ((rx * rx + ry * ry) / 2.0).sqrt();
+                let n = ((perimeter / 3.0) as usize).clamp(32, 720);
+                let points = (0..n)
+                    .map(|i| {
+                        let t = std::f32::consts::TAU * i as f32 / n as f32;
+                        r.center() + vec2(rx * t.cos(), ry * t.sin())
+                    })
+                    .collect();
+                Polyline { points, closed: true }
             }
-            ShapeKind::Line | ShapeKind::Arrow => {
-                let head = self.arrow_head().is_some_and(|(_, tri)| in_triangle(p, tri));
-                head || distance_to_segment(p, self.a, self.b) <= reach
-            }
+            ShapeKind::Line | ShapeKind::Arrow => Polyline { points: vec![self.a, self.b], closed: false },
         }
     }
 
-    /// For arrows: where the shaft stops and the three corners of the head.
-    pub fn arrow_head(&self) -> Option<(Pos2, [Pos2; 3])> {
-        if self.kind != ShapeKind::Arrow {
-            return None;
+    pub fn geometry(&self) -> Geometry {
+        let mut geo = Geometry { miter: self.kind == ShapeKind::Rect, ..Default::default() };
+        let mut body = self.outline();
+
+        if self.kind == ShapeKind::Arrow {
+            let v = self.b - self.a;
+            let len = v.length();
+            if len >= 1.0 {
+                let dir = v / len;
+                let room = if self.double_head { len * 0.45 } else { len };
+                let head_len = (self.width * 4.0 + 6.0).min(room);
+                body.points[1] = head(&mut geo, self.b, dir, self.width, head_len, self.head);
+                if self.double_head {
+                    body.points[0] = head(&mut geo, self.a, -dir, self.width, head_len, self.head);
+                }
+            }
         }
-        let v = self.b - self.a;
-        let len = v.length();
-        if len < 1.0 {
-            return None;
+
+        match (self.dash, self.dash.pattern(self.width)) {
+            (Dash::Dot, _) => geo.dots.extend(dots_along(&body, self.width)),
+            (_, Some(pattern)) => geo.strokes.extend(dashes_along(&body, &pattern)),
+            _ => geo.strokes.push(body),
         }
-        let dir = v / len;
-        let normal = vec2(-dir.y, dir.x);
-        let head_len = (self.width * 4.0 + 6.0).min(len);
-        let base = self.b - dir * head_len;
-        let half = head_len * 0.45;
-        // The shaft runs slightly into the head so no gap shows between them.
-        let shaft_end = base + dir * head_len.min(1.0);
-        Some((shaft_end, [self.b, base + normal * half, base - normal * half]))
+        geo
+    }
+
+    /// Whether `p` is on the drawn shape, within `tol` pixels. Shapes are unfilled, so
+    /// the inside of a box does not count: you can click through it. Gaps in dashed
+    /// strokes count as part of the stroke, so dashed shapes are as easy to grab.
+    pub fn hit(&self, p: Pos2, tol: f32) -> bool {
+        let reach = self.width / 2.0 + tol;
+        if distance_to_polyline(p, &self.outline()) <= reach {
+            return true;
+        }
+        let geo = self.geometry();
+        geo.fills.iter().any(|tri| in_triangle(p, *tri))
+            || geo.dots.iter().any(|(c, r)| p.distance(*c) <= r + tol)
+            || geo.strokes.iter().any(|s| distance_to_polyline(p, s) <= reach)
     }
 
     /// Draw on screen. `to_pt` maps desktop pixels to egui points; `scale` is pixels
     /// per point.
     pub fn paint(&self, painter: &egui::Painter, to_pt: impl Fn(Pos2) -> Pos2, scale: f32) {
+        let geo = self.geometry();
         let stroke = Stroke::new(self.width / scale, self.color);
-        match self.kind {
-            ShapeKind::Rect => {
-                let r = self.rect();
-                let r = Rect::from_min_max(to_pt(r.min), to_pt(r.max));
-                painter.rect_stroke(r, 0.0, stroke, StrokeKind::Middle);
-            }
-            ShapeKind::Ellipse => {
-                let r = self.rect();
-                let r = Rect::from_min_max(to_pt(r.min), to_pt(r.max));
-                painter.add(epaint::EllipseShape::stroke(r.center(), r.size() / 2.0, stroke));
-            }
-            ShapeKind::Line => {
-                painter.line_segment([to_pt(self.a), to_pt(self.b)], stroke);
-            }
-            ShapeKind::Arrow => match self.arrow_head() {
-                Some((shaft_end, tri)) => {
-                    painter.line_segment([to_pt(self.a), to_pt(shaft_end)], stroke);
-                    painter.add(egui::Shape::convex_polygon(
-                        tri.map(&to_pt).to_vec(),
-                        self.color,
-                        Stroke::NONE,
-                    ));
-                }
-                None => {}
-            },
+        for line in &geo.strokes {
+            let points: Vec<Pos2> = line.points.iter().map(|&p| to_pt(p)).collect();
+            painter.add(if line.closed {
+                egui::Shape::closed_line(points, stroke)
+            } else {
+                egui::Shape::line(points, stroke)
+            });
+        }
+        for tri in &geo.fills {
+            painter.add(egui::Shape::convex_polygon(tri.map(&to_pt).to_vec(), self.color, Stroke::NONE));
+        }
+        for &(centre, radius) in &geo.dots {
+            painter.circle_filled(to_pt(centre), radius / scale, self.color);
         }
     }
 
@@ -148,6 +232,7 @@ impl Annotation {
     fn rasterize(&self, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
         use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Transform};
 
+        let geo = self.geometry();
         let [r, g, b, a] = self.color.to_srgba_unmultiplied();
         let mut paint = Paint::default();
         paint.set_color_rgba8(r, g, b, a);
@@ -155,54 +240,168 @@ impl Annotation {
         let stroke = tiny_skia::Stroke {
             width: self.width,
             line_cap: LineCap::Butt,
-            line_join: LineJoin::Miter,
+            line_join: if geo.miter { LineJoin::Miter } else { LineJoin::Round },
             ..Default::default()
         };
         let shift = Transform::from_translate(-origin.x, -origin.y);
-        let segment = |from: Pos2, to: Pos2| {
-            let mut pb = PathBuilder::new();
-            pb.move_to(from.x, from.y);
-            pb.line_to(to.x, to.y);
-            pb.finish()
-        };
 
-        match self.kind {
-            ShapeKind::Rect | ShapeKind::Ellipse => {
-                let r = self.rect();
-                let Some(bounds) = tiny_skia::Rect::from_ltrb(r.min.x, r.min.y, r.max.x, r.max.y)
-                else {
-                    return;
-                };
-                let path = if self.kind == ShapeKind::Rect {
-                    Some(PathBuilder::from_rect(bounds))
-                } else {
-                    PathBuilder::from_oval(bounds)
-                };
-                if let Some(path) = path {
-                    pixmap.stroke_path(&path, &paint, &stroke, shift, None);
-                }
+        // Everything of one kind goes into one path, so overlapping parts of a
+        // translucent shape are not painted twice.
+        let mut lines = PathBuilder::new();
+        for line in &geo.strokes {
+            let Some((first, rest)) = line.points.split_first() else { continue };
+            lines.move_to(first.x, first.y);
+            for p in rest {
+                lines.line_to(p.x, p.y);
             }
-            ShapeKind::Line => {
-                if let Some(path) = segment(self.a, self.b) {
-                    pixmap.stroke_path(&path, &paint, &stroke, shift, None);
-                }
+            if line.closed {
+                lines.close();
             }
-            ShapeKind::Arrow => {
-                let Some((shaft_end, tri)) = self.arrow_head() else { return };
-                if let Some(path) = segment(self.a, shaft_end) {
-                    pixmap.stroke_path(&path, &paint, &stroke, shift, None);
-                }
-                let mut pb = PathBuilder::new();
-                pb.move_to(tri[0].x, tri[0].y);
-                pb.line_to(tri[1].x, tri[1].y);
-                pb.line_to(tri[2].x, tri[2].y);
-                pb.close();
-                if let Some(path) = pb.finish() {
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, shift, None);
-                }
+        }
+        if let Some(path) = lines.finish() {
+            pixmap.stroke_path(&path, &paint, &stroke, shift, None);
+        }
+
+        let mut fills = PathBuilder::new();
+        for tri in &geo.fills {
+            fills.move_to(tri[0].x, tri[0].y);
+            fills.line_to(tri[1].x, tri[1].y);
+            fills.line_to(tri[2].x, tri[2].y);
+            fills.close();
+        }
+        for &(c, radius) in &geo.dots {
+            fills.push_circle(c.x, c.y, radius);
+        }
+        if let Some(path) = fills.finish() {
+            pixmap.fill_path(&path, &paint, FillRule::Winding, shift, None);
+        }
+    }
+}
+
+/// Add an arrowhead pointing along `dir` with its tip at `tip`, and return where the
+/// shaft should stop so it joins the head cleanly.
+fn head(geo: &mut Geometry, tip: Pos2, dir: Vec2, width: f32, len: f32, kind: ArrowHead) -> Pos2 {
+    let normal = vec2(-dir.y, dir.x);
+    let base = tip - dir * len;
+    let half = len * 0.45;
+    let (left, right) = (base + normal * half, base - normal * half);
+    // Shafts run slightly into solid heads so no seam shows between them.
+    let overlap = dir * len.min(1.0);
+    match kind {
+        ArrowHead::Triangle => {
+            geo.fills.push([tip, left, right]);
+            base + overlap
+        }
+        ArrowHead::Stealth => {
+            // A shallow notch keeps it reading as a solid dart, not an open chevron.
+            let notch = tip - dir * len * 0.75;
+            geo.fills.push([tip, left, notch]);
+            geo.fills.push([tip, notch, right]);
+            notch + overlap
+        }
+        ArrowHead::Open => {
+            // Pull the wings in so the outside of the stroke, not its centre, meets
+            // the tip.
+            let tip_in = tip - dir * (width * 0.9);
+            let back = tip_in - dir * len;
+            geo.strokes.push(Polyline {
+                points: vec![back + normal * half, tip_in, back - normal * half],
+                closed: false,
+            });
+            tip_in
+        }
+        ArrowHead::Dot => {
+            let radius = (width * 1.6).max(3.0);
+            geo.dots.push((tip, radius));
+            tip
+        }
+    }
+}
+
+/// A polyline's segments, including the closing one, with the distance along the
+/// path at which each starts.
+fn segments(line: &Polyline) -> (Vec<(Pos2, Pos2)>, Vec<f32>, f32) {
+    let mut segs: Vec<(Pos2, Pos2)> = line.points.windows(2).map(|w| (w[0], w[1])).collect();
+    if line.closed && line.points.len() > 2 {
+        segs.push((*line.points.last().unwrap(), line.points[0]));
+    }
+    let mut starts = Vec::with_capacity(segs.len());
+    let mut total = 0.0;
+    for (a, b) in &segs {
+        starts.push(total);
+        total += a.distance(*b);
+    }
+    (segs, starts, total)
+}
+
+/// Cut `line` into dashes following `pattern` (alternating on/off lengths). The
+/// pattern is stretched slightly so it fits a whole number of times: closed paths
+/// repeat seamlessly and open paths start and end with a dash.
+fn dashes_along(line: &Polyline, pattern: &[f32]) -> Vec<Polyline> {
+    let (segs, starts, total) = segments(line);
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let period: f32 = pattern.iter().sum();
+    let last_gap = *pattern.last().unwrap();
+    let fit = if line.closed { total } else { total + last_gap };
+    let repeats = (fit / period).round().max(1.0);
+    let k = fit / (repeats * period);
+
+    let point_at = |d: f32| -> (usize, Pos2) {
+        let i = starts.partition_point(|&s| s <= d).saturating_sub(1).min(segs.len() - 1);
+        let (a, b) = segs[i];
+        let len = a.distance(b);
+        let t = if len > 0.0 { ((d - starts[i]) / len).clamp(0.0, 1.0) } else { 0.0 };
+        (i, a + (b - a) * t)
+    };
+
+    let mut dashes = Vec::new();
+    let mut d = 0.0;
+    'outer: loop {
+        for (j, &len) in pattern.iter().enumerate() {
+            let len = len * k;
+            if j % 2 == 0 {
+                let end = (d + len).min(total);
+                let (i0, p0) = point_at(d);
+                let (i1, p1) = point_at(end);
+                let mut points = vec![p0];
+                // Keep the corners the dash passes round.
+                points.extend((i0 + 1..=i1).map(|i| segs[i].0));
+                points.push(p1);
+                dashes.push(Polyline { points, closed: false });
+            }
+            d += len;
+            if d >= total - 0.01 {
+                break 'outer;
             }
         }
     }
+    dashes
+}
+
+/// Evenly spaced dots along `line` for a dotted stroke of width `w`.
+fn dots_along(line: &Polyline, w: f32) -> Vec<(Pos2, f32)> {
+    let (segs, starts, total) = segments(line);
+    let radius = (w / 2.0).max(0.75);
+    let spacing = (w * 2.2).max(3.0);
+    if total <= 0.0 {
+        return vec![(line.points[0], radius)];
+    }
+    // Closed paths: n dots spaced all the way round. Open: n + 1, one at each end.
+    let n = (total / spacing).round().max(1.0) as usize;
+    let count = if line.closed { n } else { n + 1 };
+    let step = total / n as f32;
+    (0..count)
+        .map(|j| {
+            let d = j as f32 * step;
+            let i = starts.partition_point(|&s| s <= d).saturating_sub(1).min(segs.len() - 1);
+            let (a, b) = segs[i];
+            let len = a.distance(b);
+            let t = if len > 0.0 { ((d - starts[i]) / len).clamp(0.0, 1.0) } else { 0.0 };
+            (a + (b - a) * t, radius)
+        })
+        .collect()
 }
 
 /// Draw `annotations` onto `img`, whose top-left pixel is desktop position `origin`.
@@ -249,6 +448,13 @@ fn distance_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     }
     let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
     p.distance(a + ab * t)
+}
+
+fn distance_to_polyline(p: Pos2, line: &Polyline) -> f32 {
+    let (segs, _, _) = segments(line);
+    segs.iter()
+        .map(|&(a, b)| distance_to_segment(p, a, b))
+        .fold(f32::INFINITY, f32::min)
 }
 
 fn in_triangle(p: Pos2, [a, b, c]: [Pos2; 3]) -> bool {
@@ -333,6 +539,9 @@ mod tests {
             b: Pos2::new(b.0, b.1),
             color: Color32::from_rgb(255, 0, 0),
             width: 4.0,
+            dash: Dash::Solid,
+            head: ArrowHead::Triangle,
+            double_head: false,
         }
     }
 
@@ -357,6 +566,72 @@ mod tests {
 
         let arrow = shape(ShapeKind::Arrow, (0.0, 0.0), (100.0, 0.0));
         assert!(arrow.hit(Pos2::new(85.0, 6.0), 0.0)); // inside the head, off the shaft
+
+        // Gaps in a dashed stroke are still grabbable.
+        let mut dashed = shape(ShapeKind::Line, (0.0, 0.0), (200.0, 0.0));
+        dashed.dash = Dash::LongDash;
+        assert!((0..200).all(|x| dashed.hit(Pos2::new(x as f32, 0.0), 0.0)));
+    }
+
+    #[test]
+    fn dashes_fit_the_path() {
+        let mut line = shape(ShapeKind::Line, (0.0, 0.0), (300.0, 0.0));
+        line.dash = Dash::Dash;
+        let geo = line.geometry();
+        assert!(geo.strokes.len() > 5);
+        // Open paths start and end with a dash.
+        assert_eq!(geo.strokes[0].points[0], Pos2::new(0.0, 0.0));
+        let last = geo.strokes.last().unwrap().points.last().unwrap();
+        assert!((last.x - 300.0).abs() < 0.1, "{last:?}");
+        // Dashes are separated by gaps.
+        for pair in geo.strokes.windows(2) {
+            let gap = pair[1].points[0].x - pair[0].points.last().unwrap().x;
+            assert!(gap > 5.0, "{gap}");
+        }
+
+        // A dashed rectangle keeps its corners inside dashes that wrap round them.
+        let mut rect = shape(ShapeKind::Rect, (0.0, 0.0), (100.0, 60.0));
+        rect.dash = Dash::LongDash;
+        let geo = rect.geometry();
+        let covered: f32 = geo
+            .strokes
+            .iter()
+            .flat_map(|s| s.points.windows(2).map(|w| w[0].distance(w[1])))
+            .sum();
+        assert!(covered > 200.0 && covered < 320.0, "{covered}"); // perimeter 320 minus gaps
+
+        // Dotted: evenly spaced, one at each end of an open line.
+        let mut dotted = shape(ShapeKind::Line, (0.0, 0.0), (100.0, 0.0));
+        dotted.dash = Dash::Dot;
+        let geo = dotted.geometry();
+        assert!(geo.strokes.is_empty());
+        assert_eq!(geo.dots.first().unwrap().0, Pos2::new(0.0, 0.0));
+        assert!((geo.dots.last().unwrap().0.x - 100.0).abs() < 0.01);
+        let spacing: Vec<f32> = geo.dots.windows(2).map(|w| w[1].0.x - w[0].0.x).collect();
+        assert!(spacing.iter().all(|s| (s - spacing[0]).abs() < 0.01));
+    }
+
+    #[test]
+    fn arrowheads() {
+        for (head, _) in ArrowHead::ALL {
+            let mut arrow = shape(ShapeKind::Arrow, (0.0, 0.0), (100.0, 0.0));
+            arrow.head = head;
+            arrow.double_head = true;
+            let geo = arrow.geometry();
+            // Both ends are clickable, and so is the middle of the shaft.
+            for x in [1.0, 50.0, 99.0] {
+                assert!(arrow.hit(Pos2::new(x, 0.0), 1.0), "{head:?} at {x}");
+            }
+            match head {
+                ArrowHead::Triangle => assert_eq!(geo.fills.len(), 2),
+                ArrowHead::Stealth => assert_eq!(geo.fills.len(), 4),
+                ArrowHead::Open => assert_eq!(geo.strokes.len(), 3), // two heads + shaft
+                ArrowHead::Dot => assert_eq!(geo.dots.len(), 2),
+            }
+            // The shaft never pokes out past either tip.
+            let shaft = geo.strokes.iter().find(|s| s.points.len() == 2).unwrap();
+            assert!(shaft.points.iter().all(|p| (0.0..=100.0).contains(&p.x)));
+        }
     }
 
     #[test]
@@ -420,5 +695,65 @@ mod tests {
         let px = clear.get_pixel(10, 10).0;
         assert!(px[0] >= 250 && px[1] == 0 && (120..=136).contains(&px[3]), "{px:?}");
         assert_eq!(clear.get_pixel(10, 2).0, [0, 0, 0, 0]);
+
+        // A dashed line leaves gaps in the output.
+        let mut img = RgbaImage::from_pixel(200, 10, white);
+        let mut dashed = shape(ShapeKind::Line, (0.0, 5.0), (200.0, 5.0));
+        dashed.dash = Dash::Dash;
+        render_onto(&mut img, Pos2::ZERO, &[dashed]);
+        let red = (0..200).filter(|&x| img.get_pixel(x, 5).0 == [255, 0, 0, 255]).count();
+        assert!(red > 90 && red < 150, "{red}");
     }
+}
+
+/// Writes a sheet of every stroke style and arrowhead, drawn through the real output
+/// path, for eyeballing: `DARKSHOT_PREVIEW=out.png cargo test style_sheet -- --ignored`.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn style_sheet() {
+    let Some(path) = std::env::var_os("DARKSHOT_PREVIEW") else { return };
+    let mut img = RgbaImage::from_pixel(560, 400, image::Rgba([246, 246, 246, 255]));
+    let mut shapes = Vec::new();
+    let base = |kind, a: (f32, f32), b: (f32, f32), width| Annotation {
+        kind,
+        a: Pos2::new(a.0, a.1),
+        b: Pos2::new(b.0, b.1),
+        color: Color32::from_rgb(0xE5, 0x48, 0x4D),
+        width,
+        dash: Dash::Solid,
+        head: ArrowHead::Triangle,
+        double_head: false,
+    };
+    for (row, (dash, _)) in Dash::ALL.iter().enumerate() {
+        let y = 20.0 + row as f32 * 34.0;
+        for (col, width) in [2.0, 5.0].into_iter().enumerate() {
+            let mut line = base(ShapeKind::Line, (20.0 + col as f32 * 140.0, y), (140.0 + col as f32 * 140.0, y), width);
+            line.dash = *dash;
+            shapes.push(line);
+        }
+        let mut rect = base(ShapeKind::Rect, (310.0, y - 12.0), (400.0, y + 14.0), 3.0);
+        rect.dash = *dash;
+        rect.color = Color32::from_rgb(0x3E, 0x63, 0xDD);
+        shapes.push(rect);
+        let mut ellipse = base(ShapeKind::Ellipse, (420.0, y - 12.0), (540.0, y + 14.0), 3.0);
+        ellipse.dash = *dash;
+        ellipse.color = Color32::from_rgb(0x30, 0xA4, 0x6C);
+        shapes.push(ellipse);
+    }
+    for (row, (head, _)) in ArrowHead::ALL.iter().enumerate() {
+        let y = 210.0 + row as f32 * 48.0;
+        for (col, (width, double)) in [(3.0, false), (6.0, false), (3.0, true)].into_iter().enumerate() {
+            let x = 20.0 + col as f32 * 180.0;
+            let mut arrow = base(ShapeKind::Arrow, (x, y + 18.0), (x + 150.0, y), width);
+            arrow.head = *head;
+            arrow.double_head = double;
+            if col == 2 {
+                arrow.dash = Dash::Dash;
+            }
+            shapes.push(arrow);
+        }
+    }
+    render_onto(&mut img, Pos2::ZERO, &shapes);
+    img.save(path).unwrap();
 }

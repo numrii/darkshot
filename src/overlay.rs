@@ -27,7 +27,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use winit::event_loop::{DeviceEvents, EventLoop};
 
-use crate::annotate::{self, Annotation, History, Repeat, ShapeKind, MAX_WIDTH, MIN_WIDTH};
+use crate::annotate::{
+    self, Annotation, ArrowHead, Dash, History, Repeat, ShapeKind, MAX_WIDTH, MIN_WIDTH,
+};
 use crate::icons::{self, Icon};
 use crate::AnyResult;
 
@@ -507,9 +509,12 @@ struct Overlay {
     pending_undo: Option<Vec<Annotation>>,
 
     tool: Tool,
-    /// Colour and stroke width for new annotations; mirrors the selected one, if any.
+    /// Style for new annotations; mirrors the selected one, if any.
     color: Color32,
     width: f32,
+    dash: Dash,
+    head: ArrowHead,
+    double_head: bool,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -538,6 +543,9 @@ impl Overlay {
             tool: Tool::Select,
             color: SWATCHES[0],
             width: 4.0,
+            dash: Dash::Solid,
+            head: ArrowHead::Triangle,
+            double_head: false,
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -660,6 +668,9 @@ impl Overlay {
                     b: anchor,
                     color: self.color,
                     width: self.width,
+                    dash: self.dash,
+                    head: self.head,
+                    double_head: self.double_head,
                 });
                 self.selected = Some(self.annotations.len() - 1);
             }
@@ -763,16 +774,25 @@ impl Overlay {
 
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
-        self.color = self.annotations[index].color;
-        self.width = self.annotations[index].width;
+        let shape = self.annotations[index];
+        self.color = shape.color;
+        self.width = shape.width;
+        self.dash = shape.dash;
+        self.head = shape.head;
+        self.double_head = shape.double_head;
     }
 
-    /// Push the current colour and width onto the selected annotation, if they differ.
+    /// Push the current style onto the selected annotation, if it differs.
     fn restyle_selected(&mut self) {
         let Some(index) = self.selected else { return };
         let mut shape = self.annotations[index];
         shape.color = self.color;
         shape.width = self.width;
+        shape.dash = self.dash;
+        if shape.kind == ShapeKind::Arrow {
+            shape.head = self.head;
+            shape.double_head = self.double_head;
+        }
         if shape != self.annotations[index] {
             self.history.record(&self.annotations, Some(Repeat::Style));
             self.annotations[index] = shape;
@@ -928,6 +948,40 @@ impl Overlay {
                                 .suffix(" px"),
                         )
                         .on_hover_text("Thickness (mouse wheel)");
+
+                        let sample = |kind, width| Annotation {
+                            kind,
+                            a: Pos2::ZERO,
+                            b: Pos2::ZERO,
+                            color: Color32::WHITE,
+                            width,
+                            dash: Dash::Solid,
+                            head: ArrowHead::Triangle,
+                            double_head: false,
+                        };
+                        icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
+                            let mut line = sample(ShapeKind::Line, 2.0);
+                            (line.a, line.b, line.color, line.dash) =
+                                (area.left_center(), area.right_center(), color, dash);
+                            line.paint(painter, |p| p, 1.0);
+                        })
+                        .on_hover_text("Stroke style");
+
+                        // Arrowhead controls stay in place (disabled) for other shapes,
+                        // so the toolbar does not change size when switching tools.
+                        let arrow = self.tool == Tool::Shape(ShapeKind::Arrow)
+                            || self.selected.is_some_and(|i| self.annotations[i].kind == ShapeKind::Arrow);
+                        icons::picker(ui, &mut self.head, arrow, &ArrowHead::ALL, |painter, area, head, color| {
+                            let mut shape = sample(ShapeKind::Arrow, 1.6);
+                            (shape.a, shape.b, shape.color, shape.head) =
+                                (area.left_center(), area.right_center(), color, head);
+                            shape.paint(painter, |p| p, 1.0);
+                        })
+                        .on_hover_text("Arrowhead");
+                        let both = icons::button(ui, Icon::DoubleHead, self.double_head, arrow);
+                        if both.on_hover_text("Heads on both ends").clicked() {
+                            self.double_head = !self.double_head;
+                        }
 
                         ui.separator();
                         let undo = icons::button(ui, Icon::Undo, false, self.history.can_undo());
