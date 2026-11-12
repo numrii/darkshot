@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, vec2, Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke,
@@ -34,6 +34,7 @@ use crate::annotate::{
     MIN_WIDTH,
 };
 use crate::effects;
+use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::text::Layout;
 use crate::icons::{self, Icon};
 use crate::AnyResult;
@@ -587,6 +588,9 @@ struct Overlay {
     /// `width` when switching tools.
     styles: HashMap<StyleSlot, (Color32, f32)>,
     editing: Option<TextEdit>,
+    /// The save panel: open or not, and its settings.
+    save_open: bool,
+    save_options: SaveOptions,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -606,6 +610,8 @@ struct Overlay {
 /// What the toolbar asked for this frame.
 #[derive(Default)]
 struct ToolbarOutput {
+    /// Where the toolbar was drawn, in points.
+    rect: Option<Rect>,
     copy: bool,
     save: bool,
     close: bool,
@@ -636,6 +642,8 @@ impl Overlay {
                 (StyleSlot::Blur, (Color32::BLACK, BLUR_STRENGTH)),
             ]),
             editing: None,
+            save_open: false,
+            save_options: SaveOptions::default(),
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -1218,22 +1226,6 @@ impl Overlay {
         Ok(())
     }
 
-    /// Returns Ok(false) if the user cancelled the dialog.
-    fn save_to_file(img: &RgbaImage, parent: &eframe::Frame) -> AnyResult<bool> {
-        let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        // Parented to the overlay so the dialog opens above our always-on-top window.
-        let Some(path) = rfd::FileDialog::new()
-            .set_parent(parent)
-            .set_file_name(format!("darkshot-{secs}.png"))
-            .add_filter("PNG image", &["png"])
-            .save_file()
-        else {
-            return Ok(false);
-        };
-        img.save(path)?;
-        Ok(true)
-    }
-
     // --- Toolbar -----------------------------------------------------------------------
 
     /// The style options that apply to `kind`: stroke style for lines and outlines,
@@ -1291,7 +1283,7 @@ impl Overlay {
 
     fn toolbar(&mut self, ctx: &egui::Context, pos: Pos2, pivot: Align2, within: Rect) -> ToolbarOutput {
         let mut out = ToolbarOutput::default();
-        egui::Area::new(egui::Id::unique("darkshot-toolbar"))
+        let shown = egui::Area::new(egui::Id::unique("darkshot-toolbar"))
             .order(egui::Order::Foreground)
             .pivot(pivot)
             .fixed_pos(pos)
@@ -1386,12 +1378,96 @@ impl Overlay {
                             icons::button(ui, icon, false, true).on_hover_text(tip).clicked()
                         };
                         out.copy = action(ui, Icon::Copy, "Copy to clipboard (Ctrl+C)");
-                        out.save = action(ui, Icon::Save, "Save to file (Ctrl+S)");
+                        let save = icons::button(ui, Icon::Save, self.save_open, true);
+                        out.save = save.on_hover_text("Save to file (Ctrl+S)").clicked();
                         out.close = action(ui, Icon::Close, "Close (Esc)");
                     });
                 });
             });
+        out.rect = Some(shown.response.rect);
         out
+    }
+
+    /// The save panel, next to the toolbar: file name prefix, format and JPEG quality.
+    /// Returns true when the user asks to save.
+    fn save_panel(&mut self, ctx: &egui::Context, toolbar: Rect, below: bool, within: Rect) -> bool {
+        let (pos, pivot) = if below {
+            (toolbar.right_bottom() + vec2(0.0, 6.0), Align2::RIGHT_TOP)
+        } else {
+            (toolbar.right_top() - vec2(0.0, 6.0), Align2::RIGHT_BOTTOM)
+        };
+        let mut save = false;
+        let options = &mut self.save_options;
+        egui::Area::new(egui::Id::unique("darkshot-save-panel"))
+            .order(egui::Order::Foreground)
+            .pivot(pivot)
+            .fixed_pos(pos)
+            .constrain_to(within)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(300.0);
+                    egui::Grid::new("save-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Name");
+                        let name = ui.add(
+                            egui::TextEdit::singleline(&mut options.prefix)
+                                .hint_text("prefix")
+                                .desired_width(200.0),
+                        );
+                        if name.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            save = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("Format");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut options.format, Format::Png, "PNG")
+                                .on_hover_text("Lossless");
+                            ui.selectable_value(&mut options.format, Format::Jpeg, "JPEG")
+                                .on_hover_text("Smaller files, some quality loss");
+                        });
+                        ui.end_row();
+
+                        if options.format == Format::Jpeg {
+                            ui.label("Quality");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut options.quality, QUALITY_HIGH, "High");
+                                ui.selectable_value(&mut options.quality, QUALITY_MEDIUM, "Medium");
+                                ui.add(egui::Slider::new(&mut options.quality, 10..=100));
+                            });
+                            ui.end_row();
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    let weak = ui.visuals().weak_text_color();
+                    ui.label(egui::RichText::new(options.file_name()).color(weak).small());
+                    if let Some(folder) = &options.folder {
+                        let name = folder.file_name().map_or_else(
+                            || folder.display().to_string(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        ui.label(egui::RichText::new(format!("Opens in {name}")).color(weak).small());
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save…").on_hover_text("Choose where (Enter)").clicked() {
+                            save = true;
+                        }
+                        if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                            self.save_open = false;
+                        }
+                    });
+                });
+            });
+        save
+    }
+
+    /// Ask where to save and write the file. Returns Ok(false) if the user cancelled.
+    fn save_to_file(&mut self, parent: &eframe::Frame) -> AnyResult<bool> {
+        let Some(img) = self.output() else { return Ok(false) };
+        let Some(path) = self.save_options.ask_path(parent) else { return Ok(false) };
+        save::write(&img, &path, self.save_options.format, self.save_options.quality)?;
+        Ok(true)
     }
 }
 
@@ -1636,8 +1712,24 @@ impl eframe::App for Overlay {
             }
         }
 
+        // With the save panel open, Esc closes it (even while typing a name), and Ctrl+S
+        // or Enter saves.
+        let mut esc_used = false;
+        let mut save_requested = false;
+        if self.save_open {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.save_open = false;
+                esc_used = true;
+            }
+            if keys.save || keys.enter && !typing {
+                save_requested = true;
+            }
+        } else if keys.save && !typing {
+            self.save_open = true;
+        }
+
         let mut close = false;
-        if self.action.is_none() && !typing && !was_editing {
+        if self.action.is_none() && !typing && !was_editing && !esc_used {
             if keys.undo {
                 self.undo();
             } else if keys.redo {
@@ -1702,6 +1794,14 @@ impl eframe::App for Overlay {
                 (sel.right_bottom() + vec2(-8.0, -8.0), Align2::RIGHT_BOTTOM)
             };
             toolbar = self.toolbar(&ctx, pos, pivot, monitor);
+            if toolbar.save {
+                self.save_open = !self.save_open;
+            }
+            if let (true, Some(rect)) = (self.save_open, toolbar.rect) {
+                save_requested |= self.save_panel(&ctx, rect, pivot == Align2::RIGHT_TOP, monitor);
+            }
+        } else {
+            self.save_open = false;
         }
         self.restyle_selected();
 
@@ -1840,25 +1940,27 @@ impl eframe::App for Overlay {
         }
 
         // --- Actions -------------------------------------------------------------------
-        let copy = toolbar.copy || (keys.copy || keys.enter && !was_editing) && !typing;
-        let save = toolbar.save || keys.save && !typing;
+        let enter_copies = keys.enter && !was_editing && !self.save_open;
+        let copy = toolbar.copy || (keys.copy || enter_copies) && !typing;
+        let save = save_requested && self.save_open;
         if copy || save {
             self.finish_editing();
         }
         if close || toolbar.close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if copy || save {
-            if let Some(img) = self.output() {
-                let result = if copy {
-                    Self::copy_to_clipboard(&img).map(|()| true)
-                } else {
-                    Self::save_to_file(&img, frame)
-                };
-                match result {
-                    Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                    Ok(false) => {} // save dialog cancelled: stay in the overlay
-                    Err(e) => self.error = Some(format!("Failed: {e}")),
+            let result = if copy {
+                match self.output() {
+                    Some(img) => Self::copy_to_clipboard(&img).map(|()| true),
+                    None => Ok(false),
                 }
+            } else {
+                self.save_to_file(frame)
+            };
+            match result {
+                Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Ok(false) => {} // save dialog cancelled: stay in the overlay
+                Err(e) => self.error = Some(format!("Failed: {e}")),
             }
         }
     }
