@@ -6,6 +6,7 @@ mod annotate;
 mod daemon;
 mod effects;
 mod icons;
+mod keyhook;
 mod overlay;
 mod save;
 mod settings;

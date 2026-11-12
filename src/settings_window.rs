@@ -1,100 +1,89 @@
 //! The settings window (`darkshot --settings`), opened from the tray menu.
 
-use eframe::egui::{self, Color32, Key, RichText};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
+use eframe::egui::{self, Color32, RichText};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
+use crate::keyhook::Hook;
 use crate::settings::{
-    self, parse_hex, parse_hotkey, to_hex, FormatSetting, Settings, DEFAULT_HOTKEY,
+    self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, Settings, DEFAULT_HOTKEY,
     DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
 };
+
+const VK_ESCAPE: u32 = 0x1B;
+/// The shortcut suggested when taking over from Windows.
+const TAKE_OVER_SUGGESTION: &str = "Win+Shift+S";
 use crate::AnyResult;
 
 pub fn run() -> AnyResult<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Darkshot settings")
-            .with_inner_size([470.0, 470.0])
+            .with_inner_size([470.0, 500.0])
             .with_resizable(false),
         ..Default::default()
     };
-    eframe::run_native(
+    // Own event loop, with raw device input switched off: with it on, the low-level
+    // keyboard hook used for recording shortcuts is not called in this process.
+    let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
+    let mut app = eframe::create_native(
         "Darkshot settings",
         options,
         Box::new(|cc| {
             crate::overlay::setup_text(&cc.egui_ctx);
             Ok(Box::new(SettingsApp::new()))
         }),
-    )?;
+        &event_loop,
+    );
+    event_loop.run_app(&mut app)?;
     Ok(())
 }
 
 struct SettingsApp {
     settings: Settings,
     saved: Settings,
-    /// Waiting for the user to press a new shortcut.
-    recording: bool,
+    /// While recording a shortcut: the keyboard hook catching it.
+    recorder: Option<Hook>,
     message: Option<(String, bool)>,
 }
 
 impl SettingsApp {
     fn new() -> Self {
         let settings = Settings::load();
-        Self { saved: settings.clone(), settings, recording: false, message: None }
+        Self { saved: settings.clone(), settings, recorder: None, message: None }
     }
 
-    /// While recording, turn the next key press into a shortcut such as `Win+Shift+S`.
-    fn record(&mut self, ctx: &egui::Context) {
-        let events = ctx.input(|i| i.events.clone());
-        for event in events {
-            let egui::Event::Key { key, pressed, modifiers, .. } = event else { continue };
-            // PrintScreen only reports its release on Windows.
-            if !pressed && key != Key::PrintScreen {
-                continue;
+    /// Start or stop recording a shortcut. Recording uses the low-level keyboard hook,
+    /// so it also catches combinations Windows keeps for itself (Win+Shift+S), which
+    /// would otherwise trigger Windows' own action instead of reaching this window.
+    fn toggle_recording(&mut self) {
+        self.message = None;
+        if self.recorder.take().is_none() {
+            self.recorder = Hook::record();
+            if self.recorder.is_none() {
+                self.message = Some(("Could not listen to the keyboard.".to_owned(), true));
             }
-            // Modifier keys on their own: wait for the key they go with.
-            if matches!(
-                key,
-                Key::ShiftLeft
-                    | Key::ShiftRight
-                    | Key::ControlLeft
-                    | Key::ControlRight
-                    | Key::AltLeft
-                    | Key::AltRight
-                    | Key::SuperLeft
-                    | Key::SuperRight
-            ) {
-                continue;
-            }
-            let win = unsafe { GetAsyncKeyState(i32::from(VK_LWIN)) < 0 || GetAsyncKeyState(i32::from(VK_RWIN)) < 0 };
-            if key == Key::Escape && !modifiers.any() && !win {
-                self.recording = false;
-                return;
-            }
-            // Windows writes the Windows key first (Win+Shift+S).
-            let mut parts = Vec::new();
-            if win {
-                parts.push("Win");
-            }
-            if modifiers.ctrl {
-                parts.push("Ctrl");
-            }
-            if modifiers.alt {
-                parts.push("Alt");
-            }
-            if modifiers.shift {
-                parts.push("Shift");
-            }
-            parts.push(key.name());
-            let combo = parts.join("+");
-            self.recording = false;
-            if parse_hotkey(&combo).is_some() {
-                self.settings.hotkey = combo;
-                self.message = None;
-            } else {
-                self.message = Some((format!("{combo} can't be used as a shortcut."), true));
-            }
+        }
+    }
+
+    /// Pick up a combination caught by the recorder, if any.
+    fn poll_recorder(&mut self, ctx: &egui::Context) {
+        let Some(recorder) = &self.recorder else { return };
+        let Some((vk, mods)) = recorder.recorded() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
             return;
+        };
+        self.recorder = None;
+        if vk == VK_ESCAPE && mods == 0 {
+            return; // cancelled
+        }
+        match shortcut_text(vk, mods) {
+            Some(text) if shortcut_valid(&text, self.settings.take_over) => {
+                self.settings.hotkey = text;
+                self.message = None;
+            }
+            Some(text) => self.message = Some((format!("{text} can't be used as a shortcut."), true)),
+            None => self.message = Some(("That key can't be used as a shortcut.".to_owned(), true)),
         }
     }
 }
@@ -119,23 +108,22 @@ fn section(ui: &mut egui::Ui, title: &str) {
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.recording {
-            self.record(&ctx);
-        }
+        self.poll_recorder(&ctx);
         let weak = ui.visuals().weak_text_color();
 
         egui::CentralPanel::default().show(ui, |ui| {
             section(ui, "Capture shortcut");
             ui.horizontal(|ui| {
-                let text = if self.recording { "Press keys…".to_owned() } else { self.settings.hotkey.clone() };
-                let button = ui.add_sized([160.0, 26.0], egui::Button::new(text).selected(self.recording));
+                let recording = self.recorder.is_some();
+                let text = if recording { "Press keys…".to_owned() } else { self.settings.hotkey.clone() };
+                let button = ui.add_sized([160.0, 26.0], egui::Button::new(text).selected(recording));
                 if button.on_hover_text("Click, then press the combination. Esc cancels.").clicked() {
-                    self.recording = !self.recording;
-                    self.message = None;
+                    self.toggle_recording();
                 }
                 if ui.button("Reset").on_hover_text(DEFAULT_HOTKEY).clicked() {
                     self.settings.hotkey = DEFAULT_HOTKEY.into();
-                    self.recording = false;
+                    self.settings.take_over = false;
+                    self.recorder = None;
                 }
             });
             ui.label(
@@ -143,6 +131,17 @@ impl eframe::App for SettingsApp {
                     .color(weak)
                     .small(),
             );
+            ui.add_space(4.0);
+            let take_over = ui
+                .checkbox(&mut self.settings.take_over, "Take over the shortcut from Windows")
+                .on_hover_text(
+                    "For combinations Windows keeps for itself, such as Win+Shift+S. Darkshot                      catches the keys before Windows does while it runs; nothing in Windows is changed.",
+                );
+            // Taking over is mostly wanted for Win+Shift+S, so suggest it if the shortcut
+            // has not been changed yet.
+            if take_over.changed() && self.settings.take_over && self.settings.hotkey == DEFAULT_HOTKEY {
+                self.settings.hotkey = TAKE_OVER_SUGGESTION.into();
+            }
 
             section(ui, "Colours");
             egui::Grid::new("colours").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {

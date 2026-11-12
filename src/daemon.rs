@@ -18,7 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_APP, WM_QUIT,
 };
 
-use crate::settings::{parse_hotkey, Settings};
+use crate::keyhook::Hook;
+use crate::settings::{hook_spec, parse_hotkey, Settings};
 use crate::AnyResult;
 
 const MENU_CAPTURE: &str = "capture";
@@ -28,6 +29,26 @@ const MENU_QUIT: &str = "quit";
 /// Thread messages to the main thread, which owns the hotkey and the tray.
 const WM_OPEN_SETTINGS: u32 = WM_APP + 1;
 const WM_SETTINGS_CLOSED: u32 = WM_APP + 2;
+/// Posted by the keyboard hook when a taken-over shortcut is pressed.
+const WM_HOOK_CAPTURE: u32 = WM_APP + 3;
+
+/// How the capture shortcut is currently being caught.
+enum Shortcut {
+    /// Registered with Windows as an ordinary hotkey.
+    Hotkey(HotKey),
+    /// Caught by a low-level keyboard hook (taking it over from Windows).
+    Hook(Hook),
+}
+
+fn release(hotkeys: &GlobalHotKeyManager, active: &mut Option<Shortcut>) {
+    match active.take() {
+        Some(Shortcut::Hotkey(hotkey)) => {
+            let _ = hotkeys.unregister(hotkey);
+        }
+        Some(Shortcut::Hook(hook)) => drop(hook),
+        None => {}
+    }
+}
 
 pub fn run() -> AnyResult<()> {
     if !acquire_single_instance() {
@@ -88,8 +109,8 @@ pub fn run() -> AnyResult<()> {
         }));
     }
 
-    let mut registered = None;
-    apply_hotkey(&hotkeys, &mut registered, &capture_item, &tray);
+    let mut active = None;
+    apply_hotkey(&hotkeys, &mut active, &capture_item, &tray, main_thread);
     let mut settings_open = false;
 
     // The tray icon and the hotkey both deliver their events through this thread's
@@ -100,21 +121,20 @@ pub fn run() -> AnyResult<()> {
             match msg.message {
                 WM_OPEN_SETTINGS if msg.hwnd.is_null() => {
                     if !settings_open {
-                        // Let go of the hotkey while the settings are open, so pressing
+                        // Let go of the shortcut while the settings are open, so pressing
                         // the current combination to record it does not start a capture.
-                        if let Some(old) = registered.take() {
-                            let _ = hotkeys.unregister(old);
-                        }
+                        release(&hotkeys, &mut active);
                         settings_open = open_settings(main_thread);
                         if !settings_open {
-                            apply_hotkey(&hotkeys, &mut registered, &capture_item, &tray);
+                            apply_hotkey(&hotkeys, &mut active, &capture_item, &tray, main_thread);
                         }
                     }
                 }
                 WM_SETTINGS_CLOSED if msg.hwnd.is_null() => {
                     settings_open = false;
-                    apply_hotkey(&hotkeys, &mut registered, &capture_item, &tray);
+                    apply_hotkey(&hotkeys, &mut active, &capture_item, &tray, main_thread);
                 }
+                WM_HOOK_CAPTURE if msg.hwnd.is_null() => start_capture(&overlay),
                 _ => {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -125,25 +145,38 @@ pub fn run() -> AnyResult<()> {
     Ok(())
 }
 
-/// Read the hotkey from the settings and register it, replacing any registered one.
-/// Updates the menu and tooltip, and explains if the combination is not available.
+/// Read the shortcut from the settings and start catching it, replacing whatever was
+/// caught before: as an ordinary hotkey, or with the keyboard hook if the settings say
+/// to take it over. Updates the menu and tooltip, and explains if it is not available.
 fn apply_hotkey(
     hotkeys: &GlobalHotKeyManager,
-    registered: &mut Option<HotKey>,
+    active: &mut Option<Shortcut>,
     capture_item: &MenuItem,
     tray: &TrayIcon,
+    main_thread: u32,
 ) {
-    if let Some(old) = registered.take() {
-        let _ = hotkeys.unregister(old);
-    }
-    let label = Settings::load().hotkey.trim().to_owned();
-    let result = match parse_hotkey(&label) {
-        Some(hotkey) => hotkeys.register(hotkey).map(|()| hotkey).map_err(|e| e.to_string()),
-        None => Err("not a valid key combination".to_owned()),
+    release(hotkeys, active);
+    let settings = Settings::load();
+    let label = settings.hotkey.trim().to_owned();
+    let result = if settings.take_over {
+        match hook_spec(&label) {
+            Some((vk, mods)) => Hook::watch(vk, mods, main_thread, WM_HOOK_CAPTURE)
+                .map(Shortcut::Hook)
+                .ok_or_else(|| "the keyboard hook could not be installed".to_owned()),
+            None => Err("not a valid key combination".to_owned()),
+        }
+    } else {
+        match parse_hotkey(&label) {
+            Some(hotkey) => hotkeys
+                .register(hotkey)
+                .map(|()| Shortcut::Hotkey(hotkey))
+                .map_err(|e| e.to_string()),
+            None => Err("not a valid key combination".to_owned()),
+        }
     };
     match result {
-        Ok(hotkey) => {
-            *registered = Some(hotkey);
+        Ok(shortcut) => {
+            *active = Some(shortcut);
             capture_item.set_text(format!("Capture\t{label}"));
             let _ = tray.set_tooltip(Some(format!("Darkshot: press {label} to capture")));
         }
@@ -157,7 +190,8 @@ fn apply_hotkey(
                 .set_description(format!(
                     "The capture shortcut {label} could not be registered. Windows or another \
                      application may already use it.\n\nYou can still capture by clicking the \
-                     Darkshot tray icon, or choose another shortcut under Settings."
+                     Darkshot tray icon. Under Settings you can choose another shortcut, or let \
+                     Darkshot take this one over."
                 ))
                 .show();
         }

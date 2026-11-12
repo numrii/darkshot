@@ -5,18 +5,12 @@ clipboard or a file on disk. There is no upload and no network code.
 
 ## Next
 
-- **Take over shortcuts Windows reserves.** An optional setting to claim a combination
-  Windows holds for itself, such as Win+Shift+S (Snipping Tool), without the user
-  editing the registry. Use a low-level keyboard hook (`WH_KEYBOARD_LL`, as AutoHotkey
-  and PowerToys do) that swallows the combination before Windows sees it. Nothing in
-  Windows is changed, and the takeover ends when Darkshot quits. The hook callback must
-  return quickly, or Windows removes the hook.
-
-## Planned
-
 - **Release build.** A proper app icon, a size-optimised release profile, and turning
   off eframe's default features so no code that can open a URL (the `webbrowser`
   crate) is compiled in.
+
+## Planned
+
 - **Numbered step markers** (1, 2, 3…) for step-by-step instructions.
 - **Eyedropper** to pick a colour from the screenshot.
 
@@ -25,6 +19,10 @@ clipboard or a file on disk. There is no upload and no network code.
 - Tray icon and global capture shortcut; one overlay spanning all monitors.
 - Capture region with resize handles, move, arrow-key nudge, Ctrl+A for the current
   monitor; Shift constrains, Alt works from the centre.
+- Shortcut takeover: an optional setting that catches the shortcut with a low-level
+  keyboard hook, so combinations Windows keeps for itself (Win+Shift+S) work without
+  registry changes. Recording a shortcut uses the same hook, so any combination can be
+  recorded. A lone Windows-key release is masked so the Start menu does not open.
 - Window snapping: Ctrl+click selects a window; holding Ctrl while drawing, moving or
   resizing the region snaps its edges to window and monitor edges (ties go to the
   frontmost window).
