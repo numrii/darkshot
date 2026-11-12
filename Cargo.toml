@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 arboard = "3.7.0"
 eframe = "0.37.0"
+global-hotkey = "0.10.0"
 image = "0.25.10"
 rfd = "0.18.0"
+tray-icon = "0.26.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security"] }
 xcap = "0.9.10"
