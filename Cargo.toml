@@ -2,10 +2,14 @@
 name = "darkshot"
 version = "0.1.0"
 edition = "2024"
+description = "Privacy-first screenshot and annotation tool: clipboard or file, never uploaded"
 
 [dependencies]
 arboard = "3.7.0"
-eframe = "0.37.0"
+# Only what Darkshot uses. The default features include "links", which compiles in
+# code to open URLs in a browser (the webbrowser crate); a privacy-first tool has no
+# business with that. Also off: Linux backends, web screen reader, system font lookup.
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wgpu"] }
 global-hotkey = "0.10.0"
 image = "0.25.10"
 raw-window-handle = "0.6"
@@ -29,5 +33,11 @@ opt-level = 3
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# Whole-program optimisation in one unit: smaller and a little faster, at the cost of
+# a slower release build.
+lto = true
+codegen-units = 1
 strip = true
+
+[build-dependencies]
+embed-resource = "3.0.12"

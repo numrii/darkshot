@@ -18,6 +18,7 @@ pub fn run() -> AnyResult<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Darkshot settings")
+            .with_icon(crate::appicon::window_icon())
             .with_inner_size([470.0, 500.0])
             .with_resizable(false),
         ..Default::default()

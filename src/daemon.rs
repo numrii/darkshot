@@ -252,25 +252,7 @@ fn acquire_single_instance() -> bool {
     }
 }
 
-/// A 32x32 placeholder icon drawn in code: four white selection corners on a dark tile.
+/// The tray icon: the app icon at 32x32.
 fn tray_icon() -> AnyResult<Icon> {
-    const SIZE: u32 = 32;
-    let near_edge = |v: u32| (7..14).contains(&v) || (18..25).contains(&v);
-    let on_line = |v: u32| (7..10).contains(&v) || (22..25).contains(&v);
-    let outer = |v: u32| v < 2 || v >= SIZE - 2;
-
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let pixel = if outer(x) && outer(y) {
-                [0, 0, 0, 0] // clip the tile's corners
-            } else if (on_line(x) && near_edge(y)) || (on_line(y) && near_edge(x)) {
-                [255, 255, 255, 255]
-            } else {
-                [30, 30, 34, 255]
-            };
-            rgba.extend_from_slice(&pixel);
-        }
-    }
-    Ok(Icon::from_rgba(rgba, SIZE, SIZE)?)
+    Ok(Icon::from_rgba(crate::appicon::rgba(32), 32, 32)?)
 }

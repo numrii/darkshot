@@ -5,15 +5,16 @@ clipboard or a file on disk. There is no upload and no network code.
 
 ## Next
 
-- **Release build.** A proper app icon, a size-optimised release profile, and turning
-  off eframe's default features so no code that can open a URL (the `webbrowser`
-  crate) is compiled in.
+Nothing scheduled. Ideas welcome.
 
 ## Done
 
 - Tray icon and global capture shortcut; one overlay spanning all monitors.
 - Capture region with resize handles, move, arrow-key nudge, Ctrl+A for the current
   monitor; Shift constrains, Alt works from the centre.
+- Release build: the app icon embedded in the exe and used for the tray and settings
+  window; whole-program optimisation; eframe trimmed to the features Darkshot uses, so
+  no URL-opening code (and no networking crate at all) is compiled in.
 - Numbered step markers (N): click to place; each new one takes the next number.
 - Eyedropper (I): picks a colour from the capture itself, with dimming hidden while
   picking and a live preview of the colour under the cursor.
