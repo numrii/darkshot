@@ -26,6 +26,13 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder
 /// (debug builds and builds with the `trace` feature only).
 fn main() -> AnyResult<()> {
+    // Load DLLs only from System32, never from the exe's own folder or the current
+    // directory, so a DLL planted next to a portable darkshot.exe is not picked up.
+    // This covers DLLs loaded at run time (graphics and dialog libraries); the linker
+    // flag /DEPENDENTLOADFLAG in .cargo/config.toml covers those loaded at start.
+    use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+
     if std::env::args().any(|a| a == "--capture") {
         overlay::run()
     } else if std::env::args().any(|a| a == "--settings") {

@@ -54,6 +54,19 @@ Running `darkshot.exe` puts an icon in the notification area. Press the capture
 shortcut (Ctrl+F9 by default) or click the icon to capture. Right-click the icon for
 Settings and Quit.
 
+### Security
+
+- No network code: nothing in Darkshot or its dependencies uploads or downloads.
+- Runs as the signed-in user. Its manifest never asks for administrator rights.
+- The exe carries version information naming its build (office or personal), shown
+  under Properties → Details.
+- Exploit mitigations: ASLR, DEP, Control Flow Guard and CET shadow-stack
+  compatibility. DLLs are loaded only from System32, so a DLL placed next to the exe
+  is ignored.
+- Only the PNG, JPEG and ICO image formats are compiled in.
+- Check the dependencies against the RustSec advisory database with
+  `cargo install cargo-audit` and then `cargo audit`.
+
 ### Starting with Windows
 
 Neither way needs administrator rights, and both affect only your own account.

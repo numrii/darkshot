@@ -26,7 +26,9 @@ arboard = "3.7.0"
 # business with that. Also off: Linux backends, web screen reader, system font lookup.
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wgpu"] }
 global-hotkey = "0.10.0"
-image = "0.25.10"
+# Only the formats Darkshot reads or writes (PNG and JPEG output, the ICO app icon).
+# The default set compiles in a dozen more decoders and an AVIF encoder.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico"] }
 raw-window-handle = "0.6"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }

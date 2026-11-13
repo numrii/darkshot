@@ -1,4 +1,16 @@
 # Link the C runtime statically so darkshot.exe is a single portable file
 # with no dependency on the Visual C++ redistributable.
+#
+# Exploit mitigations on top of the defaults (ASLR, high-entropy ASLR and DEP):
+# - Control Flow Guard: indirect calls may only go to known function starts.
+# - CET shadow stack compatibility: on CPUs that support it, Windows checks return
+#   addresses against a hardware shadow stack.
+# - DEPENDENTLOADFLAG 0x800: the DLLs the exe imports are loaded only from System32,
+#   not from the exe's folder (see also `SetDefaultDllDirectories` in main.rs).
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "control-flow-guard",
+    "-C", "link-arg=/CETCOMPAT",
+    "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
+]
