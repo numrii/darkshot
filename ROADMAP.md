@@ -62,3 +62,5 @@ Nothing scheduled. Ideas welcome.
 - Popups and tooltips stay on the monitor they open on; tooltips wrap.
 - The overlay draws at most one frame per display refresh.
 - Sharp at any display scaling: per-monitor DPI awareness declared in the manifest.
+- Version 1.0.0. Releases are built and published by GitHub Actions from a version tag,
+  with SHA-256 checksums and build provenance attestations.

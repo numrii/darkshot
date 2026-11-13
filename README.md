@@ -8,6 +8,24 @@ installer, and nothing starts with Windows unless you set it up.
 
 <sub>Background photo: "Alone in the unspoilt wilderness" by David Marcu, CC0, via Wikimedia Commons.</sub>
 
+## Download
+
+Get the latest exe from the [Releases page](https://github.com/numrii/darkshot/releases/latest):
+
+- `darkshot-restrictive-<version>.exe` for work or school computers, or wherever you
+  want Darkshot to touch as little as possible.
+- `darkshot-personal-<version>.exe` for your own computer.
+
+See [Two builds](#two-builds) for the difference. There is nothing to install: put the
+exe in any folder you can write to and run it.
+
+The exes are built on GitHub from the tagged source, and `SHA256SUMS.txt` lists their
+checksums. They are not code-signed, so the first time you run one Windows may show
+"Windows protected your PC"; choose More info, then Run anyway. To check a download
+was built from this repository, run
+`gh attestation verify darkshot-restrictive-<version>.exe --repo numrii/darkshot`
+with the [GitHub CLI](https://cli.github.com).
+
 ## Using Darkshot
 
 Run `darkshot.exe` and it sits in the notification area. Press the capture shortcut
@@ -150,6 +168,23 @@ Neither way needs administrator rights, and both affect only your own account.
   This adds Darkshot to `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
   and takes effect at once; untick to remove it. If you move the exe, Settings shows
   that the entry points to the old location, and ticking the box again fixes it.
+
+## Versions
+
+Darkshot uses `major.minor.patch` version numbers:
+
+- **major** changes for big changes, such as a reworked interface or settings that
+  are no longer compatible;
+- **minor** changes for new features;
+- **patch** changes for bug fixes.
+
+### Making a release
+
+1. Set the new version in `Cargo.toml` and run `cargo build` so `Cargo.lock` follows.
+2. Commit, then tag and push: `git tag v1.2.3` and `git push origin main v1.2.3`.
+
+Pushing the tag starts the release workflow, which tests and builds both versions and
+publishes them with their checksums as a GitHub release.
 
 ## Licence
 

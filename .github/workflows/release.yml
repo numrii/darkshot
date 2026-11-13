@@ -1,0 +1,72 @@
+# Builds both versions of Darkshot and publishes them as a GitHub release.
+#
+# Start it by pushing a version tag that matches the version in Cargo.toml:
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# The exes are built here on GitHub's machines from the tagged commit, not on anyone's
+# own computer. Each one gets a build provenance attestation, which anyone can check with
+#   gh attestation verify darkshot-restrictive-1.2.3.exe --repo numrii/darkshot
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write      # create the release
+  id-token: write      # sign the provenance attestation
+  attestations: write  # store it
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match version $version in Cargo.toml"
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build the restrictive version
+        run: cargo build --release --locked
+
+      - name: Build the personal version
+        run: cargo build --release --locked --features personal --target-dir target/personal
+
+      - name: Collect the files
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item target/release/darkshot.exe "out/darkshot-restrictive-$env:VERSION.exe"
+          Copy-Item target/personal/release/darkshot.exe "out/darkshot-personal-$env:VERSION.exe"
+          Get-ChildItem out/*.exe | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content out/SHA256SUMS.txt
+          Get-Content out/SHA256SUMS.txt
+
+      # Attestations need a public repository (or GitHub Enterprise); a private
+      # repository still gets its release, just without them.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        continue-on-error: true
+        with:
+          subject-path: out/*.exe
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" out/*.exe out/SHA256SUMS.txt `
+            --title "Darkshot $env:VERSION" --generate-notes --verify-tag
