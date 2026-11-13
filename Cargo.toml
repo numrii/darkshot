@@ -1,6 +1,6 @@
 [package]
 name = "darkshot"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "MIT"
 description = "Privacy-first screenshot and annotation tool: clipboard or file, never uploaded"
