@@ -1505,7 +1505,7 @@ impl Overlay {
         out
     }
 
-    /// The save panel, next to the toolbar: file name prefix, format and JPEG quality.
+    /// The save panel, next to the toolbar: file name, format and JPEG quality.
     /// Returns true when the user asks to save.
     fn save_panel(&mut self, ctx: &egui::Context, toolbar: Rect, below: bool, within: Rect) -> bool {
         let (pos, pivot) = if below {
