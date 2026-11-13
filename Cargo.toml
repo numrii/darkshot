@@ -5,9 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Privacy-first screenshot and annotation tool: clipboard or file, never uploaded"
 
-# Two builds from one source. The default is the office build: an ordinary registered
-# hotkey, settings only beside the exe, no diagnostic log files. The personal build
-# (`--features personal`) adds the rest.
+# Two builds from one source. The default is the restrictive build: an ordinary
+# registered hotkey, settings only beside the exe, no registry writes and no diagnostic
+# log files. The personal build (`--features personal`) adds the rest.
 [features]
 personal = ["shortcut-takeover", "appdata-fallback", "trace", "autostart"]
 # Take over shortcuts Windows keeps for itself (Win+Shift+S) with a low-level keyboard

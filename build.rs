@@ -14,7 +14,7 @@ fn main() {
     let mut numbers: Vec<u16> = version.split(['.', '-', '+']).map_while(|part| part.parse().ok()).collect();
     numbers.resize(4, 0);
     let numeric = numbers.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
-    let edition = if std::env::var_os("CARGO_FEATURE_PERSONAL").is_some() { "personal" } else { "office" };
+    let edition = if std::env::var_os("CARGO_FEATURE_PERSONAL").is_some() { "personal" } else { "restrictive" };
     let description = format!("Darkshot screenshot tool ({edition} build)");
 
     let rc = format!(

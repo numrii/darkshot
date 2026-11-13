@@ -19,14 +19,14 @@ Nothing scheduled. Ideas welcome.
 - Eyedropper (I): picks a colour from the capture itself. A round spotlight shows the
   undimmed capture around the cursor (hold Shift to magnify it to single pixels), with
   the colour's hex, RGB and HSL values beside it.
-- Office and personal builds from one source (see the README). The default office
-  build has no keyboard hook, stores settings only beside the exe and writes no
+- Restrictive and personal builds from one source (see the README). The default
+  restrictive build has no keyboard hook, stores settings only beside the exe and writes no
   diagnostic logs; `--features personal` adds the rest.
 - Shortcut takeover (personal build): an optional setting that catches the shortcut
   with a low-level keyboard hook, so combinations Windows keeps for itself
   (Win+Shift+S) work without registry changes. Recording a shortcut uses the same hook,
   so any combination can be recorded. A lone Windows-key release is masked so the Start
-  menu does not open. The office build records shortcuts only from the focused
+  menu does not open. The restrictive build records shortcuts only from the focused
   settings window.
 - Start with Windows (personal build): a Settings checkbox that adds Darkshot to the
   current user's Run key, no administrator rights needed. Either build can instead be
