@@ -85,7 +85,8 @@ pub fn run() -> AnyResult<()> {
 
     // Grab the screen before our own window exists so the overlay is never in the shot.
     trace("start");
-    let desktop = Desktop::capture()?;
+    let settings = Settings::load();
+    let desktop = Desktop::capture(settings.include_cursor)?;
     trace("captured");
 
     // Create the window at its final size. If it were created small and resized
@@ -127,7 +128,7 @@ pub fn run() -> AnyResult<()> {
     let mut app = eframe::create_native(
         "Darkshot",
         options,
-        Box::new(move |cc| Ok(Box::new(Overlay::new(cc, desktop)))),
+        Box::new(move |cc| Ok(Box::new(Overlay::new(cc, desktop, &settings)))),
         &event_loop,
     );
     event_loop.run_app(&mut app)?;
@@ -151,14 +152,28 @@ struct Desktop {
 }
 
 impl Desktop {
-    fn capture() -> AnyResult<Self> {
+    /// Capture every monitor, with the mouse cursor drawn in if `include_cursor`.
+    fn capture(include_cursor: bool) -> AnyResult<Self> {
         let mut cursor = POINT { x: 0, y: 0 };
         unsafe { GetCursorPos(&mut cursor) };
+        // Read first, so it is the cursor as it was when the capture was asked for.
+        let pointer = if include_cursor { crate::cursor::Cursor::current() } else { None };
 
+        // Monitors showing HDR are read in their own format and converted (see `hdr`);
+        // the ordinary capture of one looks washed out.
+        let hdr = crate::hdr::Hdr::detect();
         let mut shots = Vec::new();
         for monitor in xcap::Monitor::all()? {
-            shots.push((monitor.x()?, monitor.y()?, monitor.capture_image()?));
+            let (x, y) = (monitor.x()?, monitor.y()?);
+            let shot = match hdr.as_ref().and_then(|hdr| hdr.capture(x, y)) {
+                Some(shot) => shot,
+                None => monitor.capture_image()?,
+            };
+            shots.push((x, y, shot));
             trace("monitor captured");
+        }
+        if let Some(pointer) = pointer {
+            pointer.draw(&mut shots);
         }
         let edge = |f: fn(&(i32, i32, RgbaImage)) -> i32| shots.iter().map(f);
         let (Some(left), Some(top), Some(right), Some(bottom)) = (
@@ -639,6 +654,20 @@ struct Overlay {
     /// The save panel: open or not, and its settings.
     save_open: bool,
     save_options: SaveOptions,
+    /// The border added around the image when it is copied or saved, if switched on.
+    border_on: bool,
+    border: effects::Border,
+    /// Switching the border on takes the toolbar's colour and line style, the first
+    /// time (when the settings did not already give this capture a border).
+    border_unset: bool,
+    /// A drop shadow is added around the image when it is copied or saved.
+    shadow: bool,
+    /// The decoration panel (border and shadow) is open.
+    decor_open: bool,
+    /// Ask before closing without copying or saving when there are annotations.
+    confirm_discard: bool,
+    /// That question is on screen.
+    confirm_open: bool,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -660,6 +689,7 @@ struct Overlay {
 struct ToolbarOutput {
     /// Where the toolbar was drawn, in points.
     rect: Option<Rect>,
+    decor: bool,
     copy: bool,
     save: bool,
     close: bool,
@@ -701,6 +731,13 @@ impl Overlay {
             ignore_drag: false,
             save_open: false,
             save_options: SaveOptions::from_settings(settings),
+            border_on: settings.frame.border,
+            border: settings.border(),
+            border_unset: !settings.frame.border,
+            shadow: settings.frame.shadow,
+            decor_open: false,
+            confirm_discard: settings.confirm_discard,
+            confirm_open: false,
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -711,13 +748,12 @@ impl Overlay {
         }
     }
 
-    fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop, settings: &Settings) -> Self {
         trace("window created");
         setup_text(&cc.egui_ctx);
-        let settings = Settings::load();
         cc.egui_ctx.set_theme(settings.theme);
         icons::set_marker_color(&cc.egui_ctx, settings.marker());
-        let overlay = Self::with_desktop(desktop, hwnd_of(cc), &settings);
+        let overlay = Self::with_desktop(desktop, hwnd_of(cc), settings);
         if let Some(hwnd) = overlay.hwnd {
             // Switch off the window's fade-in. During that animation the live desktop
             // shows through the frozen capture, which looks like ghosting when
@@ -1322,8 +1358,9 @@ impl Overlay {
     }
 
     /// The final image: the cropped capture with blur regions applied and every other
-    /// annotation drawn on top. Blur regions always act on the capture itself, below
-    /// all other annotations, both here and on screen.
+    /// annotation drawn on top, then the border and shadow from the settings around it.
+    /// Blur regions always act on the capture itself, below all other annotations, both
+    /// here and on screen.
     fn output(&self) -> Option<RgbaImage> {
         let origin = self.selection?.intersect(self.bounds()).min.round();
         let mut img = self.cropped()?;
@@ -1334,7 +1371,113 @@ impl Overlay {
             }
         }
         annotate::render_onto(&mut img, origin, &self.annotations);
+        Some(effects::frame(img, &self.frame()))
+    }
+
+    /// The border and shadow this capture gets.
+    fn frame(&self) -> effects::Frame {
+        effects::Frame { border: self.border_on.then_some(self.border), shadow: self.shadow }
+    }
+
+    /// The image for the clipboard. With a border or shadow it is put on white: what
+    /// they leave transparent would be pasted as black by many programs.
+    fn clipboard_output(&self) -> Option<RgbaImage> {
+        let mut img = self.output()?;
+        if !self.frame().is_empty() {
+            effects::flatten(&mut img);
+        }
         Some(img)
+    }
+
+    /// The decoration panel, next to the toolbar: the border and the drop shadow.
+    fn decor_panel(&mut self, ctx: &egui::Context, toolbar: Rect, below: bool, within: Rect) {
+        let (pos, pivot) = if below {
+            (toolbar.right_bottom() + vec2(0.0, 6.0), Align2::RIGHT_TOP)
+        } else {
+            (toolbar.right_top() - vec2(0.0, 6.0), Align2::RIGHT_BOTTOM)
+        };
+        egui::Area::new(egui::Id::unique("darkshot-decor-panel"))
+            .order(egui::Order::Foreground)
+            .pivot(pivot)
+            .fixed_pos(pos)
+            .constrain_to(within)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if ui.checkbox(&mut self.border_on, "Border").changed() && self.border_on {
+                            // The colour and line style in use, as for a new shape.
+                            if std::mem::take(&mut self.border_unset) {
+                                self.border.color = self.color.to_opaque();
+                                self.border.dash = self.dash;
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.add_enabled_ui(self.border_on, |ui| {
+                            icons::color_picker_button(ui, &mut self.border.color).on_hover_text("Border colour");
+                            ui.add_sized(
+                                [52.0, 22.0],
+                                egui::DragValue::new(&mut self.border.width)
+                                    .range(1.0..=crate::settings::MAX_BORDER_WIDTH as f32)
+                                    .speed(0.25)
+                                    .fixed_decimals(0)
+                                    .suffix(" px"),
+                            )
+                            .on_hover_text("Border thickness");
+                            icons::picker(ui, &mut self.border.dash, true, &Dash::ALL, icons::dash_preview)
+                                .on_hover_text("Border style");
+                        });
+                    });
+                    ui.checkbox(&mut self.shadow, "Drop shadow")
+                        .on_hover_text("A soft shadow around the image. Not shown here: it appears in the copied or saved image.");
+                    // The picker opens with full opacity only; keep it that way.
+                    self.border.color = self.border.color.to_opaque();
+                });
+            });
+    }
+
+    /// Esc or Close: leave at once, or ask first if there are annotations to lose and
+    /// the settings say to ask. Returns true to close now.
+    fn request_close(&mut self) -> bool {
+        self.finish_editing();
+        if self.confirm_discard && !self.annotations.is_empty() {
+            self.confirm_open = true;
+            self.save_open = false;
+            self.decor_open = false;
+            self.picking_color = false;
+            return false;
+        }
+        true
+    }
+
+    /// The question asked before discarding annotations, in the middle of `monitor`
+    /// (in points). Returns `Some(true)` to discard and close, `Some(false)` to go back.
+    fn confirm_panel(&self, ctx: &egui::Context, monitor: Rect) -> Option<bool> {
+        let mut answer = None;
+        egui::Area::new(egui::Id::unique("darkshot-confirm-discard"))
+            .order(egui::Order::Foreground)
+            .pivot(Align2::CENTER_CENTER)
+            .fixed_pos(monitor.center())
+            .constrain_to(monitor)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(14.0).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Discard this capture?").strong().size(15.0));
+                    ui.add_space(2.0);
+                    let count = self.annotations.len();
+                    let what = if count == 1 { "1 annotation".to_owned() } else { format!("{count} annotations") };
+                    ui.label(format!("It has {what}, and has not been copied or saved."));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard").on_hover_text("Enter").clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button("Keep editing").on_hover_text("Esc").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+            });
+        answer
     }
 
     fn copy_to_clipboard(img: &RgbaImage) -> AnyResult<()> {
@@ -1390,13 +1533,8 @@ impl Overlay {
                     .on_hover_text("Effect");
             }
             _ => {
-                icons::picker(ui, &mut self.dash, true, &Dash::ALL, |painter, area, dash, color| {
-                    let mut line = sample(ShapeKind::Line, 2.0);
-                    (line.a, line.b, line.color, line.dash) =
-                        (area.left_center(), area.right_center(), color, dash);
-                    line.paint(painter, |p| p, 1.0);
-                })
-                .on_hover_text("Stroke style");
+                icons::picker(ui, &mut self.dash, true, &Dash::ALL, icons::dash_preview)
+                    .on_hover_text("Stroke style");
             }
         }
         if kind == ShapeKind::Arrow {
@@ -1498,6 +1636,12 @@ impl Overlay {
                         if redo.on_hover_text("Redo (Ctrl+Y)").clicked() {
                             self.redo();
                         }
+
+                        ui.separator();
+                        // Lit while a border or shadow is on, so it is not forgotten.
+                        let decorated = self.border_on || self.shadow;
+                        let decor = icons::button(ui, Icon::Decoration, self.decor_open || decorated, true);
+                        out.decor = decor.on_hover_text("Decoration: border and shadow").clicked();
 
                         ui.separator();
                         let action = |ui: &mut egui::Ui, icon, tip| {
@@ -1826,7 +1970,10 @@ impl eframe::App for Overlay {
             ));
         }
 
-        if response.drag_started() {
+        // While the discard question is up, the capture underneath is left alone: only
+        // the question (and the toolbar's Copy and Save) respond.
+        let asking = self.confirm_open;
+        if response.drag_started() && !asking {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
                 if self.picking_color {
                     if let Some(color) = self.pixel_at(to_px(origin)) {
@@ -1871,6 +2018,7 @@ impl eframe::App for Overlay {
         }
 
         // --- Keyboard and wheel ----------------------------------------------------------
+        #[derive(Default)]
         struct Keys {
             nudge: Vec2,
             select_all: bool,
@@ -1924,6 +2072,18 @@ impl eframe::App for Overlay {
             }
         });
 
+        // The discard question takes the keyboard: Enter discards, Esc goes back.
+        let mut discard = false;
+        let keys = if asking {
+            discard = keys.enter;
+            if keys.cancel {
+                self.confirm_open = false;
+            }
+            Keys::default()
+        } else {
+            keys
+        };
+
         // While typing into a text, keys go to the text. Undo, redo, copy and save
         // still work; they finish the edit first.
         let was_editing = self.editing.is_some();
@@ -1952,6 +2112,9 @@ impl eframe::App for Overlay {
         if self.picking_color && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.picking_color = false;
             esc_used = true;
+        } else if self.decor_open && !typing && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.decor_open = false;
+            esc_used = true;
         } else if self.save_open {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.save_open = false;
@@ -1962,6 +2125,7 @@ impl eframe::App for Overlay {
             }
         } else if keys.save && !typing {
             self.save_open = true;
+            self.decor_open = false;
         }
 
         let mut close = false;
@@ -2002,7 +2166,7 @@ impl eframe::App for Overlay {
 
         // Double-click a text with the select tool to edit it.
         let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-        if double && self.tool == Tool::Select && response.hovered() {
+        if double && self.tool == Tool::Select && response.hovered() && !asking {
             if let Some(p) = hover.map(to_px) {
                 let on_text = |a: &Annotation| a.kind == ShapeKind::Text && a.hit(p, tol);
                 if let Some(index) = self.annotations.iter().rposition(on_text) {
@@ -2033,14 +2197,24 @@ impl eframe::App for Overlay {
                 (sel.right_bottom() + vec2(-8.0, -8.0), Align2::RIGHT_BOTTOM)
             };
             toolbar = self.toolbar(&ctx, pos, pivot, monitor);
+            // One panel at a time under the toolbar.
             if toolbar.save {
                 self.save_open = !self.save_open;
+                self.decor_open = false;
+            }
+            if toolbar.decor {
+                self.decor_open = !self.decor_open;
+                self.save_open = false;
             }
             if let (true, Some(rect)) = (self.save_open, toolbar.rect) {
                 save_requested |= self.save_panel(&ctx, rect, pivot == Align2::RIGHT_TOP, monitor);
             }
+            if let (true, Some(rect)) = (self.decor_open, toolbar.rect) {
+                self.decor_panel(&ctx, rect, pivot == Align2::RIGHT_TOP, monitor);
+            }
         } else {
             self.save_open = false;
+            self.decor_open = false;
         }
         self.restyle_selected();
 
@@ -2115,7 +2289,15 @@ impl eframe::App for Overlay {
                 ] {
                     painter.rect_filled(rect, 0.0, dim);
                 }
-                painter.rect_stroke(sel, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+                if self.border_on {
+                    // The border as it will be added: just outside the region.
+                    let b = self.border;
+                    let band = sel_px.expand(b.width.round().max(1.0) / 2.0);
+                    Annotation::stroked(ShapeKind::Rect, band.min, band.max, b.color, b.width.round().max(1.0), b.dash)
+                        .paint(&painter, to_pt, scale);
+                } else {
+                    painter.rect_stroke(sel, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+                }
                 for point in handle_points(sel) {
                     handle(&painter, point, Color32::WHITE);
                 }
@@ -2222,7 +2404,9 @@ impl eframe::App for Overlay {
             }
         }
 
-        let hint = if self.picking_color {
+        let hint = if self.confirm_open {
+            "Enter discard · Esc keep editing"
+        } else if self.picking_color {
             "Click to pick a colour · hold Shift to magnify · Esc cancel"
         } else if self.editing.is_some() {
             "Type · Enter new line · arrows move · Esc or click outside to finish"
@@ -2248,11 +2432,19 @@ impl eframe::App for Overlay {
         if copy || save {
             self.finish_editing();
         }
-        if close || toolbar.close {
+        if self.confirm_open {
+            let monitor = rect_to_pt(self.desktop.monitors[self.current_monitor]);
+            match self.confirm_panel(&ctx, monitor) {
+                Some(true) => discard = true,
+                Some(false) => self.confirm_open = false,
+                None => {}
+            }
+        }
+        if discard || (close || toolbar.close) && self.request_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if copy || save {
             let result = if copy {
-                match self.output() {
+                match self.clipboard_output() {
                     Some(img) => Self::copy_to_clipboard(&img).map(|()| true),
                     None => Ok(false),
                 }
@@ -2436,6 +2628,77 @@ mod tests {
         assert_eq!(overlay.annotations.len(), 1);
         overlay.undo();
         assert!(overlay.annotations.is_empty());
+    }
+
+    #[test]
+    fn closing_asks_only_when_there_is_something_to_lose() {
+        let mut settings = Settings::default();
+        let draw = |overlay: &mut Overlay| {
+            overlay.selection = Some(rect(0.0, 0.0, 100.0, 60.0));
+            overlay.set_tool(Tool::Shape(ShapeKind::Rect));
+            overlay.begin_action(Action::NewShape { anchor: Pos2::new(20.0, 20.0) });
+            overlay.apply_action(Pos2::new(60.0, 40.0), Modifiers::NONE, overlay.bounds());
+            overlay.end_action();
+        };
+        let desktop = || Desktop {
+            shots: vec![RgbaImage::new(100, 60)],
+            bounds: RECT { left: 0, top: 0, right: 100, bottom: 60 },
+            monitors: vec![rect(0.0, 0.0, 100.0, 60.0)],
+            home: 0,
+            snap: Snap::default(),
+        };
+
+        // Off by default: Esc closes at once, annotations or not.
+        let mut overlay = Overlay::with_desktop(desktop(), None, &settings);
+        draw(&mut overlay);
+        assert!(overlay.request_close() && !overlay.confirm_open);
+
+        // Switched on: nothing to lose closes at once; an annotation asks first.
+        settings.confirm_discard = true;
+        let mut overlay = Overlay::with_desktop(desktop(), None, &settings);
+        assert!(overlay.request_close() && !overlay.confirm_open);
+        draw(&mut overlay);
+        overlay.save_open = true;
+        assert!(!overlay.request_close());
+        assert!(overlay.confirm_open && !overlay.save_open);
+        // Undoing the annotation leaves nothing to ask about.
+        overlay.confirm_open = false;
+        overlay.undo();
+        assert!(overlay.request_close());
+    }
+
+    #[test]
+    fn border_and_shadow_surround_the_output() {
+        let blue = image::Rgba([0, 0, 255, 255]);
+        let mut settings = Settings::default();
+        settings.frame.border = true;
+        settings.frame.border_width = 3;
+        settings.frame.border_color = "#FF0000".into();
+        let desktop = Desktop {
+            shots: vec![RgbaImage::from_pixel(100, 60, blue)],
+            bounds: RECT { left: 0, top: 0, right: 100, bottom: 60 },
+            monitors: vec![rect(0.0, 0.0, 100.0, 60.0)],
+            home: 0,
+            snap: Snap::default(),
+        };
+        let mut overlay = Overlay::with_desktop(desktop, None, &settings);
+        overlay.selection = Some(rect(10.0, 10.0, 50.0, 30.0));
+        let out = overlay.output().unwrap();
+        assert_eq!(out.dimensions(), (46, 26));
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(out.get_pixel(3, 3), &blue);
+        assert_eq!(out.get_pixel(42, 22), &blue);
+        assert_eq!(out.get_pixel(43, 23).0, [255, 0, 0, 255]);
+
+        // Switched off for this capture: the plain image again.
+        overlay.border_on = false;
+        assert_eq!(overlay.output().unwrap().dimensions(), (40, 20));
+        assert_eq!(overlay.clipboard_output(), overlay.output());
+
+        // With a shadow the file keeps its transparent margin; the clipboard gets white.
+        overlay.shadow = true;
+        assert_eq!(overlay.output().unwrap().get_pixel(0, 0).0[3], 0);
+        assert_eq!(overlay.clipboard_output().unwrap().get_pixel(0, 0).0, [255, 255, 255, 255]);
     }
 
     #[test]

@@ -31,7 +31,41 @@ pub struct Settings {
     pub marker_color: String,
     /// Light or dark windows and toolbars, or follow Windows.
     pub theme: ThemeSetting,
+    /// Draw the mouse cursor into the capture.
+    pub include_cursor: bool,
+    /// Ask before Esc or Close throws away a capture that has annotations.
+    pub confirm_discard: bool,
     pub save: SaveSettings,
+    pub frame: FrameSettings,
+}
+
+/// A border and a drop shadow added around the image when it is copied or saved.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FrameSettings {
+    pub border: bool,
+    /// The border's colour, as `#RRGGBB`.
+    pub border_color: String,
+    /// The border's thickness in pixels, 1-20.
+    pub border_width: u32,
+    /// The border's line style: `solid`, `dash`, `long-dash`, `dash-dot` or `dot`.
+    pub border_style: crate::annotate::Dash,
+    pub shadow: bool,
+}
+
+pub const DEFAULT_BORDER_COLOR: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
+pub const MAX_BORDER_WIDTH: u32 = 20;
+
+impl Default for FrameSettings {
+    fn default() -> Self {
+        Self {
+            border: false,
+            border_color: to_hex(DEFAULT_BORDER_COLOR),
+            border_width: 1,
+            border_style: crate::annotate::Dash::Solid,
+            shadow: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,7 +148,10 @@ impl Default for Settings {
             disabled_tools: Vec::new(),
             marker_color: to_hex(DEFAULT_MARKER_COLOR),
             theme: ThemeSetting::System,
+            include_cursor: false,
+            confirm_discard: false,
             save: SaveSettings::default(),
+            frame: FrameSettings::default(),
         }
     }
 }
@@ -151,6 +188,7 @@ impl Settings {
             settings.hotkey = DEFAULT_HOTKEY.into();
         }
         settings.save.jpeg_quality = settings.save.jpeg_quality.clamp(1, 100);
+        settings.frame.border_width = settings.frame.border_width.clamp(1, MAX_BORDER_WIDTH);
         let (prefix, suffix) = (settings.save.prefix.take(), settings.save.suffix.take());
         if (prefix.is_some() || suffix.is_some()) && settings.save.name == DEFAULT_NAME {
             settings.save.name = format!("{}{}", prefix.unwrap_or_default(), suffix.unwrap_or_default());
@@ -195,6 +233,16 @@ impl Settings {
 
     pub fn marker(&self) -> Color32 {
         parse_hex(&self.marker_color).unwrap_or(DEFAULT_MARKER_COLOR)
+    }
+
+    /// The border a capture starts with (whether or not it is switched on).
+    pub fn border(&self) -> crate::effects::Border {
+        let f = &self.frame;
+        crate::effects::Border {
+            color: parse_hex(&f.border_color).unwrap_or(DEFAULT_BORDER_COLOR),
+            width: f.border_width.clamp(1, MAX_BORDER_WIDTH) as f32,
+            dash: f.border_style,
+        }
     }
 
     /// The folder the save dialog opens in.
@@ -431,6 +479,21 @@ mod tests {
         t.set_tool_enabled("pen", false);
         t.set_tool_enabled("pen", false);
         assert_eq!(t.disabled_tools, ["pen"]);
+
+        // The newer options are off unless asked for, and out-of-range values are pulled in.
+        let d = Settings::default();
+        assert!(!d.include_cursor && !d.confirm_discard);
+        assert!(!d.frame.border && !d.frame.shadow);
+        let f = Settings::from_toml(
+            "include_cursor = true\n[frame]\nborder = true\nborder_width = 99\nborder_color = \"#102030\"\nborder_style = \"dash-dot\"\nshadow = true",
+        );
+        assert!(f.include_cursor && f.frame.border && f.frame.shadow);
+        let border = crate::effects::Border {
+            color: Color32::from_rgb(0x10, 0x20, 0x30),
+            width: MAX_BORDER_WIDTH as f32,
+            dash: crate::annotate::Dash::DashDot,
+        };
+        assert_eq!(f.border(), border);
 
         // A file that is not TOML at all gives the defaults.
         assert_eq!(Settings::from_toml("not = [valid"), Settings::default());

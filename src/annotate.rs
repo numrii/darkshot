@@ -70,7 +70,8 @@ impl Effect {
 const MARKER_OPACITY: f32 = 0.4;
 
 /// How a stroke is broken up. Dash lengths scale with the stroke width.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Dash {
     #[default]
     Solid,
@@ -145,6 +146,26 @@ pub struct Annotation {
     pub text_style: TextStyle,
     /// For `Blur`.
     pub effect: Effect,
+}
+
+impl Annotation {
+    /// A shape with nothing but an outline: `kind` from `a` to `b`.
+    pub fn stroked(kind: ShapeKind, a: Pos2, b: Pos2, color: Color32, width: f32, dash: Dash) -> Self {
+        Self {
+            kind,
+            a,
+            b,
+            color,
+            width,
+            dash,
+            head: ArrowHead::Triangle,
+            double_head: false,
+            points: Vec::new(),
+            text: String::new(),
+            text_style: TextStyle::Plain,
+            effect: Effect::Pixelate,
+        }
+    }
 }
 
 /// An open or closed run of connected points.

@@ -5,10 +5,43 @@ clipboard or a file on disk. There is no upload and no network code.
 
 ## Next
 
-Nothing scheduled. Ideas welcome.
+Roughly smallest first. Everything stays offline, and opt-in where it changes what a
+capture contains or how long it is kept.
+
+- Edit an existing image: open the clipboard image (tray menu, optional shortcut) or a
+  file (tray menu, dragging it onto the exe, or `darkshot.exe picture.png`) in the
+  overlay with the whole image selected. Window snapping is off; Save suggests the
+  original name plus `-edited`. Images larger than the monitor are shown scaled to fit,
+  with annotations kept in image pixels; zoom and pan can come later. "Open with" in
+  Explorer needs the registry, so only the personal build would offer it.
+- Reopen last capture (opt-in): when the overlay closes, it hands its capture,
+  selection and annotations to the tray process, which keeps them in memory only
+  (never on disk), drops them after a set time or on the next capture, and can reopen
+  them from the tray menu or a shortcut. Gone when Darkshot quits.
+- OCR to clipboard: recognise the text in the selection with Windows' built-in offline
+  OCR (`Windows.Media.Ocr`) and copy it as text.
+- QR codes: decode a QR code in the selection locally and copy its contents as text.
+  Links are copied, never opened.
+
+Considered and left out: scrolling capture (it would mean sending scroll input to other
+apps, which Darkshot avoids), GIF and video recording, and uploads of any kind.
 
 ## Done
 
+- Include the mouse cursor (a setting, off by default): the cursor is drawn into the
+  capture where it was when the capture was asked for.
+- Ask before discarding (a setting, off by default): Esc or Close asks first when a
+  capture has annotations. Enter discards, Esc goes back.
+- Decoration: a toolbar button for a border and a drop shadow around the image, set
+  per capture. The border has a colour, a thickness and a line style like any shape
+  (switching it on takes the toolbar's colour and line style) and is previewed around
+  the region. Both are added outside the image on copy and save. What they leave
+  uncovered is transparent in a PNG file and white on the clipboard and in a JPEG.
+  Settings choose what each capture starts with; both are off by default.
+- HDR monitors: a monitor with HDR switched on is read in its own format (linear
+  16-bit floats, through DXGI desktop duplication) and converted to sRGB using
+  Windows' SDR brightness setting, instead of the ordinary capture, which looks washed
+  out. Other monitors are captured as before. Not yet tried on an HDR display.
 - Tray icon and global capture shortcut; one overlay spanning all monitors.
 - Capture region with resize handles, move, arrow-key nudge, Ctrl+A for the current
   monitor; Shift constrains, Alt works from the centre.

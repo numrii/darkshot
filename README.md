@@ -65,11 +65,19 @@ register.
 The mouse wheel changes thickness, font size, blur strength or step size. Ctrl+Z
 undoes, Ctrl+Y or Ctrl+Shift+Z redoes, and Delete removes the selected annotation.
 
+The Decoration button in the toolbar adds a border, a drop shadow or both around the
+image when it is copied or saved. The border has its own colour, thickness and line
+style, and is shown around the region as you edit; the shadow appears only in the
+result. A PNG file keeps the shadow's margin transparent; the clipboard and JPEG files
+get it on white.
+
 ### Settings
 
 Settings has the capture shortcut, the default colours each capture starts with, a
 light, dark or system theme, the save format and quality, the default folder and the
-file name. Under Enabled tools you can untick the tools you don't use; they leave the
+file name. Two options are off until you turn them on: including the mouse cursor in
+the capture, and asking before Esc or Close discards a capture that has annotations.
+You can also choose the border and shadow each capture starts with (see below). Under Enabled tools you can untick the tools you don't use; they leave the
 toolbar and their keys do nothing. The file name is a
 template that can use `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`,
 `{minute}`, `{second}` and `{counter}` (the next number not yet used in the save

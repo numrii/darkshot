@@ -6,8 +6,10 @@ mod annotate;
 mod appicon;
 #[cfg(feature = "autostart")]
 mod autostart;
+mod cursor;
 mod daemon;
 mod effects;
+mod hdr;
 mod icons;
 mod overlay;
 mod picker;

@@ -22,6 +22,7 @@ pub enum Icon {
     DoubleHead,
     Undo,
     Redo,
+    Decoration,
     Copy,
     Save,
     Close,
@@ -125,6 +126,13 @@ pub fn picker<T: Copy + PartialEq>(
         }
     }
     response
+}
+
+/// Preview of a stroke style: a short line drawn in it.
+pub fn dash_preview(painter: &egui::Painter, area: Rect, dash: crate::annotate::Dash, color: Color32) {
+    use crate::annotate::{Annotation, ShapeKind};
+    Annotation::stroked(ShapeKind::Line, area.left_center(), area.right_center(), color, 2.0, dash)
+        .paint(painter, |p| p, 1.0);
 }
 
 /// Preview of a text style: "Ab" plain, with a halo, or in a box.
@@ -356,6 +364,12 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
             painter.rect_stroke(back, 1.5, stroke, StrokeKind::Middle);
             painter.rect_filled(front, 1.5, background);
             painter.rect_stroke(front, 1.5, stroke, StrokeKind::Middle);
+        }
+        Icon::Decoration => {
+            // A framed picture and the shadow it casts.
+            let r = Rect::from_min_max(p(3.0, 3.0), p(14.0, 14.0));
+            painter.rect_stroke(r, 1.0, stroke, StrokeKind::Middle);
+            line(&[(6.5, 17.0), (17.0, 17.0), (17.0, 6.5)]);
         }
         Icon::Save => {
             // Download into a tray.

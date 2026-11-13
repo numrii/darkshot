@@ -132,7 +132,7 @@ pub fn run() -> AnyResult<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Darkshot settings")
             .with_icon(crate::appicon::window_icon())
-            .with_inner_size([860.0, if cfg!(feature = "autostart") { 700.0 } else { 640.0 }])
+            .with_inner_size([860.0, if cfg!(feature = "autostart") { 880.0 } else { 820.0 }])
             .with_min_inner_size([680.0, 300.0])
             .with_resizable(true),
         ..Default::default()
@@ -433,6 +433,12 @@ impl SettingsApp {
             #[cfg(feature = "free-shortcut")]
             self.free_shortcut_setting(ui, weak);
 
+            section(ui, "Capturing");
+            ui.checkbox(&mut self.settings.include_cursor, "Include the mouse cursor")
+                .on_hover_text("The cursor is drawn into the capture where it was when you pressed the shortcut.");
+            ui.checkbox(&mut self.settings.confirm_discard, "Ask before discarding annotations")
+                .on_hover_text("Esc and Close ask first when a capture with annotations has not been copied or saved.");
+
             section(ui, "Default colours");
             ui.label(
                 RichText::new("The colours every capture starts with. Click one to choose your own.").color(weak).small(),
@@ -513,6 +519,40 @@ impl SettingsApp {
             let mut preview = SaveOptions::from_settings(&self.settings);
             preview.format = Format::from(self.settings.save.format);
             ui.label(RichText::new(format!("Example: {}", preview.file_name())).color(weak).small());
+
+            section(ui, "Border and shadow");
+            ui.label(
+                RichText::new(
+                    "What each capture starts with. The Decoration button in the toolbar changes it for one capture.",
+                )
+                .color(weak)
+                .small(),
+            );
+            ui.add_space(4.0);
+            let frame = &mut self.settings.frame;
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut frame.border, "Border");
+                ui.add_enabled_ui(frame.border, |ui| {
+                    color_setting(ui, &mut frame.border_color, settings::DEFAULT_BORDER_COLOR);
+                    ui.add(
+                        egui::DragValue::new(&mut frame.border_width)
+                            .range(1..=settings::MAX_BORDER_WIDTH)
+                            .speed(0.1)
+                            .suffix(" px"),
+                    )
+                    .on_hover_text("Thickness");
+                    crate::icons::picker(
+                        ui,
+                        &mut frame.border_style,
+                        true,
+                        &crate::annotate::Dash::ALL,
+                        crate::icons::dash_preview,
+                    )
+                    .on_hover_text("Line style");
+                });
+            });
+            ui.checkbox(&mut frame.shadow, "Drop shadow")
+                .on_hover_text("A soft shadow in a margin around the image.");
             ui.add_space(8.0);
         }
     }
