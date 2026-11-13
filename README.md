@@ -32,9 +32,10 @@ Run `darkshot.exe` and it sits in the notification area. Press the capture short
 (Win+Shift+S by default) or click the icon to capture; right-click the icon for
 Settings and Quit.
 
-Windows keeps Win+Shift+S for its own Snipping Tool. The personal build takes it over;
-the restrictive build can use it only once it is freed in Windows, so pick another shortcut
-in Settings if it does not register.
+Windows keeps Win+Shift+S for its own Snipping Tool, so Darkshot can register it only
+once it is freed in Windows. The personal build has a Settings checkbox for that (see
+[Personal](#personal)); otherwise pick another shortcut in Settings if it does not
+register.
 
 ### Capturing
 
@@ -66,8 +67,10 @@ undoes, Ctrl+Y or Ctrl+Shift+Z redoes, and Delete removes the selected annotatio
 
 ### Settings
 
-Settings has the capture shortcut, the default colours, a light, dark or system theme,
-the save format and quality, the default folder and the file name. The file name is a
+Settings has the capture shortcut, the default colours each capture starts with, a
+light, dark or system theme, the save format and quality, the default folder and the
+file name. Under Enabled tools you can untick the tools you don't use; they leave the
+toolbar and their keys do nothing. The file name is a
 template that can use `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`,
 `{minute}`, `{second}` and `{counter}` (the next number not yet used in the save
 folder); hover the `?` beside the field for examples.
@@ -77,6 +80,10 @@ folder); hover the `?` beside the field for examples.
 Darkshot comes in two builds from the same source. Both have the same privacy focus
 and the same capture and annotation tools; they differ only in how much they touch the
 rest of Windows.
+
+Neither build hooks the keyboard or sends key presses of its own: the capture shortcut
+is always an ordinary Windows hotkey. That keeps Darkshot clear of the kind of input
+anti-cheat software in games looks for.
 
 ### Restrictive (the default)
 
@@ -93,15 +100,23 @@ and programs writing outside their folder:
   to and run it.
 
 The trade-off is that shortcuts Windows keeps for itself, such as Win+Shift+S, cannot
-be used unless they are freed in Windows first.
+be used unless they are freed in Windows first: add the letter (`S`) to the text value
+`DisabledHotkeys` under
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced`,
+then sign out and in again.
 
 ### Personal
 
 The same, plus a few conveniences for your own computer:
 
-- **Shortcut takeover**: catches the capture shortcut with a low-level keyboard hook,
-  so Win+Shift+S and other combinations Windows keeps for itself work without
-  changing any Windows setting.
+- **Free a Windows shortcut** (experimental): when the capture shortcut is Win plus a letter or
+  digit that Windows keeps for itself (Win+Shift+S), a Settings checkbox frees it by
+  adding the letter to your account's `DisabledHotkeys` value in the registry. Windows
+  then stops using all its Win+ shortcuts on that letter (for S, also Win+S for
+  search). Unticking gives them back, and other letters in the value are left alone.
+  It takes effect when Explorer restarts (Settings offers a button) or you sign in
+  again. It does not work on every version of Windows; if Windows still keeps the
+  shortcut, choose another one, such as Ctrl+Shift+S.
 - **Start with Windows**: a Settings checkbox that adds Darkshot to your account's
   startup list in the registry.
 - Settings fall back to `%APPDATA%\Darkshot` when the exe's folder is read-only.

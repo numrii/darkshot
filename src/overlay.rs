@@ -38,6 +38,7 @@ use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::Settings;
 use crate::snap::{self, Snap};
 use crate::text::Layout;
+use crate::tools::{ToolInfo, TOOLS};
 use crate::icons::{self, Icon};
 use crate::AnyResult;
 
@@ -487,6 +488,24 @@ enum Tool {
     Shape(ShapeKind),
 }
 
+/// The tool a toolbar icon stands for; `None` for the eyedropper, which is not a tool
+/// you draw with but picks a colour.
+fn tool_for(icon: Icon) -> Option<Tool> {
+    Some(match icon {
+        Icon::Select => Tool::Select,
+        Icon::Rect => Tool::Shape(ShapeKind::Rect),
+        Icon::Ellipse => Tool::Shape(ShapeKind::Ellipse),
+        Icon::Line => Tool::Shape(ShapeKind::Line),
+        Icon::Arrow => Tool::Shape(ShapeKind::Arrow),
+        Icon::Pen => Tool::Shape(ShapeKind::Pen),
+        Icon::Marker => Tool::Shape(ShapeKind::Marker),
+        Icon::Text => Tool::Shape(ShapeKind::Text),
+        Icon::Blur => Tool::Shape(ShapeKind::Blur),
+        Icon::Step => Tool::Shape(ShapeKind::Step),
+        _ => return None,
+    })
+}
+
 /// What the current mouse drag is doing.
 #[derive(Clone)]
 enum Action {
@@ -597,6 +616,8 @@ struct Overlay {
     drag_moved: bool,
 
     tool: Tool,
+    /// The tools in the toolbar, in order: those the settings leave switched on.
+    tools: Vec<&'static ToolInfo>,
     /// The toolbar's colour swatches, from the settings.
     swatches: [Color32; 4],
     /// Style for new annotations; mirrors the selected one, if any.
@@ -660,6 +681,7 @@ impl Overlay {
             action: None,
             pending_undo: None,
             tool: Tool::Select,
+            tools: TOOLS.iter().filter(|t| settings.tool_enabled(t.id)).collect(),
             color: swatches[0],
             width: 4.0,
             dash: Dash::Solid,
@@ -1403,25 +1425,10 @@ impl Overlay {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        let tools = [
-                            (Tool::Select, Icon::Select, "Select, move and resize (V)"),
-                            (Tool::Shape(ShapeKind::Rect), Icon::Rect, "Rectangle (R)"),
-                            (Tool::Shape(ShapeKind::Ellipse), Icon::Ellipse, "Ellipse (E)"),
-                            (Tool::Shape(ShapeKind::Line), Icon::Line, "Line (L)"),
-                            (Tool::Shape(ShapeKind::Arrow), Icon::Arrow, "Arrow (A)"),
-                            (Tool::Shape(ShapeKind::Pen), Icon::Pen, "Pen (P), Shift for a straight line"),
-                            (
-                                Tool::Shape(ShapeKind::Marker),
-                                Icon::Marker,
-                                "Highlighter (M), Shift for a straight line",
-                            ),
-                            (Tool::Shape(ShapeKind::Text), Icon::Text, "Text (T)"),
-                            (Tool::Shape(ShapeKind::Blur), Icon::Blur, "Hide: pixelate, Gaussian blur or redact (B)"),
-                            (Tool::Shape(ShapeKind::Step), Icon::Step, "Numbered step (N)"),
-                        ];
-                        for (tool, icon, tip) in tools {
-                            let button = icons::button(ui, icon, self.tool == tool, true);
-                            if button.on_hover_text(tip).clicked() {
+                        for info in self.tools.clone() {
+                            let Some(tool) = tool_for(info.icon) else { continue };
+                            let button = icons::button(ui, info.icon, self.tool == tool, true);
+                            if button.on_hover_text(info.tip).clicked() {
                                 self.set_tool(tool);
                             }
                         }
@@ -1439,9 +1446,11 @@ impl Overlay {
                                 self.color = swatch;
                             }
                         }
-                        let dropper = icons::button(ui, Icon::Eyedropper, self.picking_color, true);
-                        if dropper.on_hover_text("Pick a colour from the screen (I)").clicked() {
-                            self.picking_color = !self.picking_color;
+                        if let Some(info) = self.tools.iter().find(|t| t.icon == Icon::Eyedropper) {
+                            let dropper = icons::button(ui, Icon::Eyedropper, self.picking_color, true);
+                            if dropper.on_hover_text(info.tip).clicked() {
+                                self.picking_color = !self.picking_color;
+                            }
                         }
                         icons::color_picker_button(ui, &mut self.color)
                             .on_hover_text("Custom colour");
@@ -1877,6 +1886,7 @@ impl eframe::App for Overlay {
             wheel: f32,
         }
         let typing = ctx.egui_wants_keyboard_input();
+        let enabled = &self.tools;
         let keys = ctx.input(|i| {
             let step = if i.modifiers.shift { 10.0 } else { 1.0 };
             let axis = |neg: Key, pos: Key| {
@@ -1884,21 +1894,8 @@ impl eframe::App for Overlay {
             };
             let ctrl = i.modifiers.command;
             let plain = !ctrl && !i.modifiers.alt;
-            let tool = [
-                (Key::V, Tool::Select),
-                (Key::R, Tool::Shape(ShapeKind::Rect)),
-                (Key::E, Tool::Shape(ShapeKind::Ellipse)),
-                (Key::L, Tool::Shape(ShapeKind::Line)),
-                (Key::A, Tool::Shape(ShapeKind::Arrow)),
-                (Key::P, Tool::Shape(ShapeKind::Pen)),
-                (Key::M, Tool::Shape(ShapeKind::Marker)),
-                (Key::T, Tool::Shape(ShapeKind::Text)),
-                (Key::B, Tool::Shape(ShapeKind::Blur)),
-                (Key::N, Tool::Shape(ShapeKind::Step)),
-            ]
-            .into_iter()
-            .find(|(key, _)| plain && i.key_pressed(*key))
-            .map(|(_, tool)| tool);
+            // Keys of tools switched off in the settings do nothing.
+            let pressed = enabled.iter().find(|t| plain && i.key_pressed(t.key)).map(|t| t.icon);
             let wheel: f32 = i
                 .events
                 .iter()
@@ -1921,8 +1918,8 @@ impl eframe::App for Overlay {
                 undo: ctrl && !i.modifiers.shift && i.key_pressed(Key::Z),
                 redo: ctrl && (i.key_pressed(Key::Y) || i.modifiers.shift && i.key_pressed(Key::Z)),
                 delete: i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
-                tool,
-                eyedropper: plain && i.key_pressed(Key::I),
+                tool: pressed.and_then(tool_for),
+                eyedropper: pressed == Some(Icon::Eyedropper),
                 wheel,
             }
         });
@@ -2365,6 +2362,26 @@ mod tests {
             snap: Snap::default(),
         };
         Overlay::with_desktop(desktop, None, &Settings::default())
+    }
+
+    #[test]
+    fn disabled_tools_leave_the_toolbar() {
+        let mut settings = Settings::default();
+        settings.set_tool_enabled("blur", false);
+        settings.set_tool_enabled("eyedropper", false);
+        let desktop = Desktop {
+            shots: vec![RgbaImage::new(10, 10)],
+            bounds: RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            monitors: vec![rect(0.0, 0.0, 10.0, 10.0)],
+            home: 0,
+            snap: Snap::default(),
+        };
+        let overlay = Overlay::with_desktop(desktop, None, &settings);
+        let ids: Vec<&str> = overlay.tools.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), TOOLS.len() - 2);
+        assert!(!ids.contains(&"blur") && !ids.contains(&"eyedropper") && ids.contains(&"pen"));
+        // Every tool but the eyedropper is one you draw or select with.
+        assert!(TOOLS.iter().all(|t| tool_for(t.icon).is_some() == (t.icon != Icon::Eyedropper)));
     }
 
     fn key(key: Key) -> egui::Event {

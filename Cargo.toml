@@ -5,14 +5,15 @@ edition = "2024"
 license = "MIT"
 description = "Privacy-first screenshot and annotation tool: clipboard or file, never uploaded"
 
-# Two builds from one source. The default is the restrictive build: an ordinary
-# registered hotkey, settings only beside the exe, no registry writes and no diagnostic
-# log files. The personal build (`--features personal`) adds the rest.
+# Two builds from one source. The default is the restrictive build: settings only
+# beside the exe, no registry writes and no diagnostic log files. The personal build
+# (`--features personal`) adds the rest. Neither hooks the keyboard or sends key presses:
+# the capture shortcut is always an ordinary registered hotkey.
 [features]
-personal = ["shortcut-takeover", "appdata-fallback", "trace", "autostart"]
-# Take over shortcuts Windows keeps for itself (Win+Shift+S) with a low-level keyboard
-# hook, which also records shortcuts in Settings from anywhere.
-shortcut-takeover = []
+personal = ["free-shortcut", "appdata-fallback", "trace", "autostart"]
+# A setting that frees a Win+ shortcut Windows keeps for itself (Win+Shift+S), through
+# the current user's DisabledHotkeys registry value, so it can be registered.
+free-shortcut = []
 # Store settings in %APPDATA%\Darkshot when the exe's folder cannot be written.
 appdata-fallback = []
 # `--trace` writes frame timings to darkshot-trace.log in the temp folder.

@@ -9,8 +9,6 @@ mod autostart;
 mod daemon;
 mod effects;
 mod icons;
-#[cfg(feature = "shortcut-takeover")]
-mod keyhook;
 mod overlay;
 mod picker;
 mod save;
@@ -18,6 +16,9 @@ mod settings;
 mod settings_window;
 mod snap;
 mod text;
+mod tools;
+#[cfg(feature = "free-shortcut")]
+mod winkeys;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 

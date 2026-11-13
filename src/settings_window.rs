@@ -1,42 +1,24 @@
 //! The settings window (`darkshot --settings`), opened from the tray menu.
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, RichText, Sense, Vec2};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::{
     self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, Settings, ThemeSetting, DEFAULT_HOTKEY,
     DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
 };
+use crate::tools::TOOLS;
 use crate::AnyResult;
 
 use recorder::Recorder;
 
 const VK_ESCAPE: u32 = 0x1B;
-
-/// Recording a shortcut with the low-level keyboard hook, so it also catches
-/// combinations Windows keeps for itself (Win+Shift+S), which would otherwise trigger
-/// Windows' own action instead of reaching this window.
-#[cfg(feature = "shortcut-takeover")]
-mod recorder {
-    use eframe::egui;
-
-    pub struct Recorder(crate::keyhook::Hook);
-
-    impl Recorder {
-        pub fn start() -> Option<Self> {
-            crate::keyhook::Hook::record().map(Self)
-        }
-
-        /// The combination caught, as (virtual-key code, `MOD_*` bits).
-        pub fn recorded(&self, _ctx: &egui::Context) -> Option<(u32, u8)> {
-            self.0.recorded()
-        }
-    }
-}
+/// Errors and warnings.
+const ERROR_RED: Color32 = Color32::from_rgb(0xE5, 0x48, 0x4D);
 
 /// Recording a shortcut from this window's own keyboard input, so only keys pressed
-/// while it has focus are seen. Combinations Windows keeps for itself never arrive.
-#[cfg(not(feature = "shortcut-takeover"))]
+/// while it has focus are seen. Combinations Windows keeps for itself never arrive
+/// (until they are freed from Windows, with `free-shortcut`). No keyboard hook.
 mod recorder {
     use eframe::egui::{self, Key};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LWIN, VK_RWIN};
@@ -150,26 +132,19 @@ pub fn run() -> AnyResult<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Darkshot settings")
             .with_icon(crate::appicon::window_icon())
-            .with_inner_size([480.0, if cfg!(feature = "autostart") { 700.0 } else { 640.0 }])
-            .with_min_inner_size([480.0, 300.0])
+            .with_inner_size([860.0, if cfg!(feature = "autostart") { 700.0 } else { 640.0 }])
+            .with_min_inner_size([680.0, 300.0])
             .with_resizable(true),
         ..Default::default()
     };
-    // Own event loop, with raw device input switched off: with it on, the low-level
-    // keyboard hook used for recording shortcuts (with `shortcut-takeover`) is not
-    // called in this process. Nothing else here needs raw input.
-    let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
-    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
-    let mut app = eframe::create_native(
+    eframe::run_native(
         "Darkshot settings",
         options,
         Box::new(|cc| {
             crate::overlay::setup_text(&cc.egui_ctx);
             Ok(Box::new(SettingsApp::new()))
         }),
-        &event_loop,
-    );
-    event_loop.run_app(&mut app)?;
+    )?;
     Ok(())
 }
 
@@ -183,6 +158,13 @@ struct SettingsApp {
     /// file, and changed as soon as the box is ticked.
     #[cfg(feature = "autostart")]
     autostart: crate::autostart::Status,
+    /// The letters whose Win+ shortcuts Windows leaves alone (`DisabledHotkeys`). Kept
+    /// in the registry, not the settings file, and changed as soon as a box is ticked.
+    #[cfg(feature = "free-shortcut")]
+    freed: String,
+    /// The freed letters changed here, and Explorer has not been restarted since.
+    #[cfg(feature = "free-shortcut")]
+    explorer_stale: bool,
 }
 
 impl SettingsApp {
@@ -195,6 +177,10 @@ impl SettingsApp {
             message: None,
             #[cfg(feature = "autostart")]
             autostart: crate::autostart::status(),
+            #[cfg(feature = "free-shortcut")]
+            freed: crate::winkeys::freed(),
+            #[cfg(feature = "free-shortcut")]
+            explorer_stale: false,
         }
     }
 
@@ -221,7 +207,7 @@ impl SettingsApp {
             return; // cancelled
         }
         match shortcut_text(vk, mods) {
-            Some(text) if shortcut_valid(&text, self.settings.take_over) => {
+            Some(text) if shortcut_valid(&text) => {
                 self.settings.hotkey = text;
                 self.message = None;
             }
@@ -252,12 +238,103 @@ impl SettingsApp {
         }
     }
 
-    /// The "Take over the shortcut from Windows" checkbox.
-    #[cfg(feature = "shortcut-takeover")]
-    fn take_over_setting(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.checkbox(&mut self.settings.take_over, "Take over the shortcut from Windows")
-            .on_hover_text("Lets you use a combination Windows normally keeps for itself, such as Win+Shift+S.");
+    /// Free the shortcut's Win+ letter from Windows, or give letters back; applied at once.
+    #[cfg(feature = "free-shortcut")]
+    fn free_shortcut_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
+        use crate::winkeys;
+        let current = winkeys::letter_of(&self.settings.hotkey);
+        let mut changes = Vec::new();
+        if let Some(letter) = current {
+            ui.add_space(4.0);
+            let mut on = self.freed.contains(letter);
+            let tip = format!(
+                "Windows stops using its own Win+{letter} shortcuts (with any of Ctrl, Alt or Shift), \
+                 so Darkshot can register {}. Untick to give them back to Windows.",
+                self.settings.hotkey
+            );
+            ui.horizontal(|ui| {
+                let label = format!("Free Win+{letter} shortcuts from Windows");
+                if ui.checkbox(&mut on, label).on_hover_text(tip).changed() {
+                    changes.push((letter, on));
+                }
+                // Works on some Windows versions and not others.
+                ui.label(RichText::new("(experimental)").color(ERROR_RED));
+            });
+            let hint = format!(
+                "If Windows still keeps {} after Explorer restarts, choose another shortcut above, \
+                 such as Ctrl+Shift+S.",
+                self.settings.hotkey
+            );
+            ui.label(RichText::new(hint).color(weak).small());
+        }
+        let others: Vec<char> = self.freed.chars().filter(|&c| Some(c) != current).collect();
+        if !others.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                let list: Vec<String> = others.iter().map(|c| format!("Win+{c}")).collect();
+                ui.label(RichText::new(format!("Also freed from Windows: {}", list.join(", "))).color(weak).small());
+                if ui.small_button("Give back").on_hover_text("Let Windows use these shortcuts again").clicked() {
+                    changes.extend(others.iter().map(|&c| (c, false)));
+                }
+            });
+        }
+        if !changes.is_empty() {
+            for (letter, free) in changes {
+                if let Err(e) = winkeys::set(letter, free) {
+                    self.message = Some((format!("Could not change Windows shortcuts: {e}"), true));
+                }
+            }
+            self.freed = winkeys::freed();
+            self.explorer_stale = true;
+        }
+        if self.explorer_stale {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Takes effect when Explorer restarts or you sign in again.").color(weak).small());
+                let restart = ui
+                    .small_button("Restart Explorer now")
+                    .on_hover_text("The taskbar disappears for a moment, and open File Explorer windows close.");
+                if restart.clicked() {
+                    match winkeys::restart_explorer() {
+                        Ok(()) => self.explorer_stale = false,
+                        Err(e) => self.message = Some((format!("Could not restart Explorer: {e}"), true)),
+                    }
+                }
+            });
+        }
+    }
+
+    /// The "Enabled tools" list: a box per tool, with its icon and key.
+    fn tools_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
+        section(ui, "Enabled tools");
+        ui.label(
+            RichText::new("Untick the tools you don't use. They leave the toolbar, and their keys do nothing.")
+                .color(weak)
+                .small(),
+        );
+        ui.add_space(6.0);
+        let (ink, paper) = (ui.visuals().text_color(), ui.visuals().panel_fill);
+        for info in &TOOLS {
+            ui.horizontal(|ui| {
+                let mut on = self.settings.tool_enabled(info.id);
+                let mut changed = ui.checkbox(&mut on, "").changed();
+                let (area, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                crate::icons::paint(ui.painter(), area, info.icon, if on { ink } else { weak }, paper);
+                ui.add_space(4.0);
+                if ui.add(egui::Label::new(info.name).sense(Sense::click())).clicked() {
+                    on = !on;
+                    changed = true;
+                }
+                ui.label(RichText::new(info.key.name()).color(weak).small());
+                if changed {
+                    self.settings.set_tool_enabled(info.id, on);
+                }
+            });
+        }
+        if !self.settings.disabled_tools.is_empty() {
+            ui.add_space(4.0);
+            if ui.small_button("Enable all").clicked() {
+                self.settings.disabled_tools.clear();
+            }
+        }
     }
 }
 
@@ -309,20 +386,27 @@ impl eframe::App for SettingsApp {
                 }
             });
             if let Some((text, error)) = &self.message {
-                let color = if *error { Color32::from_rgb(0xE5, 0x48, 0x4D) } else { weak };
+                let color = if *error { ERROR_RED } else { weak };
                 ui.label(RichText::new(text).color(color));
             }
             ui.add_space(4.0);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.options(ui, weak));
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                // Columns lay out justified (buttons as wide as the column): undo that.
+                let layout = egui::Layout::top_down(egui::Align::Min);
+                ui.columns(2, |columns| {
+                    columns[0].with_layout(layout, |ui| self.options(ui, weak));
+                    columns[1].with_layout(layout, |ui| self.tools_setting(ui, weak));
+                });
+            });
         });
     }
 }
 
 impl SettingsApp {
-    /// Everything above the Save and Cancel buttons.
+    /// The left column: everything but the tools.
     fn options(&mut self, ui: &mut egui::Ui, weak: Color32) {
         {
             section(ui, "Capture shortcut");
@@ -335,21 +419,25 @@ impl SettingsApp {
                 }
                 if ui.button("Reset").on_hover_text(DEFAULT_HOTKEY).clicked() {
                     self.settings.hotkey = DEFAULT_HOTKEY.into();
-                    self.settings.take_over = settings::DEFAULT_TAKE_OVER;
                     self.recorder = None;
                 }
             });
-            let hint = if settings::TAKEOVER_AVAILABLE {
-                "Click the button and press a combination, e.g. Win+Shift+S or PrintScreen."
+            let hint = if settings::FREE_SHORTCUT_AVAILABLE {
+                "Click the button and press a combination, e.g. Ctrl+F9 or PrintScreen. \
+                 Combinations Windows keeps for itself, such as Win+Shift+S, work once freed below."
             } else {
                 "Click the button and press a combination, e.g. Ctrl+F9 or PrintScreen. \
                  Combinations Windows keeps for itself cannot be used."
             };
             ui.label(RichText::new(hint).color(weak).small());
-            #[cfg(feature = "shortcut-takeover")]
-            self.take_over_setting(ui);
+            #[cfg(feature = "free-shortcut")]
+            self.free_shortcut_setting(ui, weak);
 
-            section(ui, "Colours");
+            section(ui, "Default colours");
+            ui.label(
+                RichText::new("The colours every capture starts with. Click one to choose your own.").color(weak).small(),
+            );
+            ui.add_space(4.0);
 
             egui::Grid::new("colours").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("Swatches");

@@ -20,14 +20,18 @@ Nothing scheduled. Ideas welcome.
   undimmed capture around the cursor (hold Shift to magnify it to single pixels), with
   the colour's hex, RGB and HSL values beside it.
 - Restrictive and personal builds from one source (see the README). The default
-  restrictive build has no keyboard hook, stores settings only beside the exe and writes no
-  diagnostic logs; `--features personal` adds the rest.
-- Shortcut takeover (personal build): an optional setting that catches the shortcut
-  with a low-level keyboard hook, so combinations Windows keeps for itself
-  (Win+Shift+S) work without registry changes. Recording a shortcut uses the same hook,
-  so any combination can be recorded. A lone Windows-key release is masked so the Start
-  menu does not open. The restrictive build records shortcuts only from the focused
-  settings window.
+  restrictive build stores settings only beside the exe and writes no diagnostic logs;
+  `--features personal` adds the rest.
+- No keyboard hook in either build, and no synthesized key presses: the capture
+  shortcut is always a registered hotkey, and shortcuts are recorded from the focused
+  settings window. (The personal build used to take shortcuts over with a low-level
+  hook, which had to send a masking key press to keep the Start menu shut; anti-cheat
+  software can read that as automated input.)
+- Free a Windows shortcut (personal build): a setting that adds the shortcut's letter
+  to `DisabledHotkeys`, so Win+Shift+S can be registered normally, with a button to
+  restart Explorer and a way to give letters back.
+- Enabled tools: Settings lists every tool with its icon; unticked ones leave the
+  toolbar and their keys do nothing. All are on by default.
 - Start with Windows (personal build): a Settings checkbox that adds Darkshot to the
   current user's Run key, no administrator rights needed. Either build can instead be
   started from a shortcut in the Startup folder (see the README).
@@ -48,10 +52,11 @@ Nothing scheduled. Ideas welcome.
 - Context-based toolbar options that keep the toolbar's width fixed.
 - Copy to clipboard; save as PNG or JPEG (with quality) through a save panel.
 - Settings file next to the exe (the personal build falls back to `%APPDATA%\Darkshot`)
-  and a settings window: shortcut (including the Windows key), colours, light, dark or
-  system theme, file name, format, quality and default folder. The window can be resized
-  and scrolls; Save and Cancel stay at the bottom.
-- Win+Shift+S is the default shortcut (taken over from Windows in the personal build).
+  and a settings window in two columns: shortcut (including the Windows key), default
+  colours, light, dark or system theme, file name, format, quality and default folder,
+  with the enabled tools on the right. The window can be resized and scrolls; Save and
+  Cancel stay at the bottom.
+- Win+Shift+S is the default shortcut (once freed from Windows).
 - Colour picker: one picker for every colour, with a wheel per tab (an RGB hexagon, an
   HSV ring and square, a CMYK ink wheel), gradient sliders, a hex field with copy, and
   a separate alpha slider. Colour and opacity are kept apart, so lowering alpha or

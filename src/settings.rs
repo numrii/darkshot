@@ -14,19 +14,19 @@ use crate::save::Format;
 
 pub const FILE_NAME: &str = "darkshot.toml";
 
-/// Whether this build can take a shortcut over from Windows with the keyboard hook.
-pub const TAKEOVER_AVAILABLE: bool = cfg!(feature = "shortcut-takeover");
+/// Whether this build can free Win+ shortcuts from Windows (see `winkeys`).
+pub const FREE_SHORTCUT_AVAILABLE: bool = cfg!(feature = "free-shortcut");
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The capture shortcut, such as `Ctrl+F9` or `PrintScreen`.
     pub hotkey: String,
-    /// Catch the shortcut with a low-level keyboard hook instead of registering it, so
-    /// it works even when Windows keeps the combination for itself (Win+Shift+S).
-    pub take_over: bool,
     /// The four colour swatches in the toolbar, as `#RRGGBB`.
     pub swatches: [String; 4],
+    /// Tools left out of the toolbar, by their id in [`crate::tools::TOOLS`]. Listing
+    /// the ones turned off, not on, keeps tools added later switched on.
+    pub disabled_tools: Vec<String>,
     /// The highlighter's starting colour.
     pub marker_color: String,
     /// Light or dark windows and toolbars, or follow Windows.
@@ -97,8 +97,6 @@ impl From<Format> for FormatSetting {
 }
 
 pub const DEFAULT_HOTKEY: &str = "Win+Shift+S";
-/// Win+Shift+S is kept by Windows: where the build can, take it over by default.
-pub const DEFAULT_TAKE_OVER: bool = TAKEOVER_AVAILABLE;
 pub const DEFAULT_NAME: &str = "darkshot-{date}_{time}";
 pub const DEFAULT_SWATCHES: [Color32; 4] = [
     Color32::from_rgb(0xEF, 0x47, 0x6F),
@@ -112,8 +110,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: DEFAULT_HOTKEY.into(),
-            take_over: DEFAULT_TAKE_OVER,
             swatches: DEFAULT_SWATCHES.map(to_hex),
+            disabled_tools: Vec::new(),
             marker_color: to_hex(DEFAULT_MARKER_COLOR),
             theme: ThemeSetting::System,
             save: SaveSettings::default(),
@@ -146,13 +144,10 @@ impl Settings {
 
     /// Parse settings, keeping defaults for anything missing or invalid.
     pub fn from_toml(text: &str) -> Self {
+        // An older file's `take_over` (from when the personal build used a keyboard
+        // hook) is ignored like any unknown key.
         let mut settings: Self = toml::from_str(text).unwrap_or_default();
-        // A file written by the personal build may ask for a takeover this build
-        // cannot do: register the shortcut normally instead.
-        if !TAKEOVER_AVAILABLE {
-            settings.take_over = false;
-        }
-        if !shortcut_valid(&settings.hotkey, settings.take_over) {
+        if !shortcut_valid(&settings.hotkey) {
             settings.hotkey = DEFAULT_HOTKEY.into();
         }
         settings.save.jpeg_quality = settings.save.jpeg_quality.clamp(1, 100);
@@ -183,6 +178,19 @@ impl Settings {
 
     pub fn swatch_colors(&self) -> [Color32; 4] {
         std::array::from_fn(|i| parse_hex(&self.swatches[i]).unwrap_or(DEFAULT_SWATCHES[i]))
+    }
+
+    /// Whether the tool with this id is shown in the toolbar.
+    pub fn tool_enabled(&self, id: &str) -> bool {
+        !self.disabled_tools.iter().any(|t| t == id)
+    }
+
+    /// Show or leave out the tool with this id.
+    pub fn set_tool_enabled(&mut self, id: &str, enabled: bool) {
+        self.disabled_tools.retain(|t| t != id);
+        if !enabled {
+            self.disabled_tools.push(id.to_owned());
+        }
     }
 
     pub fn marker(&self) -> Color32 {
@@ -237,10 +245,9 @@ pub fn parse_hotkey(text: &str) -> Option<global_hotkey::hotkey::HotKey> {
     global_hotkey::hotkey::HotKey::from_str(&normalized.join("+")).ok()
 }
 
-/// Whether `text` can be used as the capture shortcut: registrable as a hotkey, or,
-/// when taken over with the keyboard hook, a key the hook knows.
-pub fn shortcut_valid(text: &str, take_over: bool) -> bool {
-    if take_over { hook_spec(text).is_some() } else { parse_hotkey(text).is_some() }
+/// Whether `text` can be used as the capture shortcut: registrable as a hotkey.
+pub fn shortcut_valid(text: &str) -> bool {
+    parse_hotkey(text).is_some()
 }
 
 /// Write a recorded combination as shortcut text, Windows-style:
@@ -268,7 +275,7 @@ fn key_name(vk: u32) -> Option<String> {
 }
 
 /// Named keys, as written in shortcuts (all understood by both the hotkey parser and
-/// the keyboard hook), and their virtual-key codes.
+/// [`key_spec`]), and their virtual-key codes.
 const NAMED_KEYS: [(&str, u32); 28] = [
     ("PrintScreen", 0x2C),
     ("Pause", 0x13),
@@ -300,16 +307,17 @@ const NAMED_KEYS: [(&str, u32); 28] = [
     ("BracketRight", 0xDD),
 ];
 
-/// Modifier bits used by [`hook_spec`].
+/// Modifier bits used by [`key_spec`].
 pub const MOD_CTRL: u8 = 1;
 pub const MOD_ALT: u8 = 2;
 pub const MOD_SHIFT: u8 = 4;
 pub const MOD_WIN: u8 = 8;
 
-/// A shortcut as the keyboard hook sees it: the Windows virtual-key code of its main
-/// key and the modifiers that must be held (`MOD_*` bits). `None` if the text is not a
-/// single key with optional modifiers, or the key is not one the hook knows.
-pub fn hook_spec(text: &str) -> Option<(u32, u8)> {
+/// A shortcut as Windows sees it: the virtual-key code of its main key and the
+/// modifiers that must be held (`MOD_*` bits). `None` if the text is not a single key
+/// with optional modifiers, or the key has no name here.
+#[cfg_attr(not(any(test, feature = "free-shortcut")), allow(dead_code))]
+pub fn key_spec(text: &str) -> Option<(u32, u8)> {
     let mut mods = 0;
     let mut key = None;
     for token in text.split('+').map(str::trim) {
@@ -334,6 +342,7 @@ pub fn hook_spec(text: &str) -> Option<(u32, u8)> {
 }
 
 /// The Windows virtual-key code for a key name as written in shortcuts.
+#[cfg_attr(not(any(test, feature = "free-shortcut")), allow(dead_code))]
 fn virtual_key(name: &str) -> Option<u32> {
     let name = name.strip_prefix("KEY").filter(|n| n.len() == 1).unwrap_or(name);
     let name = name.strip_prefix("DIGIT").filter(|n| n.len() == 1).unwrap_or(name);
@@ -413,6 +422,16 @@ mod tests {
         assert_eq!(s.theme, ThemeSetting::System);
         assert_eq!(Settings::from_toml("theme = \"light\"").theme, ThemeSetting::Light);
 
+        // Tools are all on by default; turning one off is remembered, and an old
+        // file's `take_over` is ignored.
+        assert!(Settings::default().tool_enabled("blur"));
+        let mut t = Settings::from_toml("take_over = true\ndisabled_tools = [\"blur\"]");
+        assert!(!t.tool_enabled("blur") && t.tool_enabled("pen"));
+        t.set_tool_enabled("blur", true);
+        t.set_tool_enabled("pen", false);
+        t.set_tool_enabled("pen", false);
+        assert_eq!(t.disabled_tools, ["pen"]);
+
         // A file that is not TOML at all gives the defaults.
         assert_eq!(Settings::from_toml("not = [valid"), Settings::default());
     }
@@ -438,26 +457,26 @@ mod tests {
     }
 
     #[test]
-    fn hook_specs() {
-        assert_eq!(hook_spec("Win+Shift+S"), Some((u32::from(b'S'), MOD_WIN | MOD_SHIFT)));
-        assert_eq!(hook_spec("ctrl + f9"), Some((0x78, MOD_CTRL)));
-        assert_eq!(hook_spec("PrintScreen"), Some((0x2C, 0)));
-        assert_eq!(hook_spec("Alt+KeyQ"), Some((u32::from(b'Q'), MOD_ALT)));
-        assert_eq!(hook_spec("Ctrl+Digit1"), Some((u32::from(b'1'), MOD_CTRL)));
-        assert_eq!(hook_spec("Ctrl+F25"), None);
-        assert_eq!(hook_spec("Ctrl+A+B"), None);
-        assert_eq!(hook_spec("Ctrl+Shift"), None);
-        assert_eq!(hook_spec("Ctrl+Banana"), None);
+    fn key_specs() {
+        assert_eq!(key_spec("Win+Shift+S"), Some((u32::from(b'S'), MOD_WIN | MOD_SHIFT)));
+        assert_eq!(key_spec("ctrl + f9"), Some((0x78, MOD_CTRL)));
+        assert_eq!(key_spec("PrintScreen"), Some((0x2C, 0)));
+        assert_eq!(key_spec("Alt+KeyQ"), Some((u32::from(b'Q'), MOD_ALT)));
+        assert_eq!(key_spec("Ctrl+Digit1"), Some((u32::from(b'1'), MOD_CTRL)));
+        assert_eq!(key_spec("Ctrl+F25"), None);
+        assert_eq!(key_spec("Ctrl+A+B"), None);
+        assert_eq!(key_spec("Ctrl+Shift"), None);
+        assert_eq!(key_spec("Ctrl+Banana"), None);
 
         // Recorded combinations come back as text both parsers understand.
         assert_eq!(shortcut_text(u32::from(b'S'), MOD_WIN | MOD_SHIFT).as_deref(), Some("Win+Shift+S"));
         assert_eq!(shortcut_text(0x78, MOD_CTRL | MOD_ALT).as_deref(), Some("Ctrl+Alt+F9"));
         for (name, code) in NAMED_KEYS {
             let text = shortcut_text(code, MOD_CTRL).unwrap();
-            assert_eq!(hook_spec(&text), Some((code, MOD_CTRL)), "{name}");
+            assert_eq!(key_spec(&text), Some((code, MOD_CTRL)), "{name}");
             assert!(parse_hotkey(&text).is_some(), "{name}");
         }
         assert_eq!(shortcut_text(0xE8, 0), None);
-        assert!(shortcut_valid("Win+Shift+S", true) && shortcut_valid("Win+Shift+S", false));
+        assert!(shortcut_valid("Win+Shift+S"));
     }
 }
