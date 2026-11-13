@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::{
-    self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, Settings, DEFAULT_HOTKEY,
+    self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, Settings, ThemeSetting, DEFAULT_HOTKEY,
     DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
 };
 use crate::AnyResult;
@@ -12,9 +12,6 @@ use crate::AnyResult;
 use recorder::Recorder;
 
 const VK_ESCAPE: u32 = 0x1B;
-/// The shortcut suggested when taking over from Windows.
-#[cfg(feature = "shortcut-takeover")]
-const TAKE_OVER_SUGGESTION: &str = "Win+Shift+S";
 
 /// Recording a shortcut with the low-level keyboard hook, so it also catches
 /// combinations Windows keeps for itself (Win+Shift+S), which would otherwise trigger
@@ -153,8 +150,9 @@ pub fn run() -> AnyResult<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Darkshot settings")
             .with_icon(crate::appicon::window_icon())
-            .with_inner_size([470.0, if cfg!(feature = "autostart") { 560.0 } else { 500.0 }])
-            .with_resizable(false),
+            .with_inner_size([480.0, if cfg!(feature = "autostart") { 700.0 } else { 640.0 }])
+            .with_min_inner_size([480.0, 300.0])
+            .with_resizable(true),
         ..Default::default()
     };
     // Own event loop, with raw device input switched off: with it on, the low-level
@@ -240,7 +238,7 @@ impl SettingsApp {
         let mut on = self.autostart == Status::On;
         let toggle = ui
             .checkbox(&mut on, "Start Darkshot when I sign in to Windows")
-            .on_hover_text("Adds Darkshot to your own startup programs. No administrator rights are needed.");
+            .on_hover_text("Darkshot starts in the notification area when you sign in.");
         if toggle.changed() {
             match autostart::set(on) {
                 Ok(()) => self.autostart = autostart::status(),
@@ -249,7 +247,7 @@ impl SettingsApp {
         }
         if let Status::Elsewhere(path) = &self.autostart {
             let weak = ui.visuals().weak_text_color();
-            let text = format!("Windows starts a Darkshot at {path}. Tick the box to start this one instead.");
+            let text = format!("Another copy of Darkshot starts with Windows ({path}). Tick the box to start this copy instead.");
             ui.label(RichText::new(text).color(weak).small());
         }
     }
@@ -258,24 +256,16 @@ impl SettingsApp {
     #[cfg(feature = "shortcut-takeover")]
     fn take_over_setting(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        let take_over = ui
-            .checkbox(&mut self.settings.take_over, "Take over the shortcut from Windows")
-            .on_hover_text(
-                "For combinations Windows keeps for itself, such as Win+Shift+S. Darkshot \
-                 catches the keys before Windows does while it runs; nothing in Windows is changed.",
-            );
-        // Taking over is mostly wanted for Win+Shift+S, so suggest it if the shortcut
-        // has not been changed yet.
-        if take_over.changed() && self.settings.take_over && self.settings.hotkey == DEFAULT_HOTKEY {
-            self.settings.hotkey = TAKE_OVER_SUGGESTION.into();
-        }
+        ui.checkbox(&mut self.settings.take_over, "Take over the shortcut from Windows")
+            .on_hover_text("Lets you use a combination Windows normally keeps for itself, such as Win+Shift+S.");
     }
 }
 
 /// A colour button that edits a `#RRGGBB` setting.
 fn color_setting(ui: &mut egui::Ui, hex: &mut String, fallback: Color32) -> egui::Response {
     let mut color = parse_hex(hex).unwrap_or(fallback);
-    let response = ui.color_edit_button_srgba(&mut color);
+    // Settings store `#RRGGBB`, so no alpha slider here.
+    let response = crate::picker::swatch_button(ui, &mut color, false);
     let new = to_hex(color);
     if *hex != new {
         *hex = new;
@@ -292,10 +282,49 @@ fn section(ui: &mut egui::Ui, title: &str) {
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let theme = self.settings.theme.into();
+        if ctx.options(|o| o.theme_preference) != theme {
+            ctx.set_theme(theme);
+        }
         self.poll_recorder(&ctx);
         let weak = ui.visuals().weak_text_color();
 
+        // Save and Cancel stay at the bottom; the options above scroll if the window is
+        // too short to show them all.
+        egui::Panel::bottom("buttons").show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let changed = self.settings != self.saved;
+                if ui.add_enabled(changed, egui::Button::new("Save")).clicked() {
+                    match self.settings.store() {
+                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => self.message = Some((format!("Could not save settings: {e}"), true)),
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if ui.small_button("Restore all defaults").clicked() {
+                    self.settings = Settings::default();
+                }
+            });
+            if let Some((text, error)) = &self.message {
+                let color = if *error { Color32::from_rgb(0xE5, 0x48, 0x4D) } else { weak };
+                ui.label(RichText::new(text).color(color));
+            }
+            ui.add_space(4.0);
+        });
+
         egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.options(ui, weak));
+        });
+    }
+}
+
+impl SettingsApp {
+    /// Everything above the Save and Cancel buttons.
+    fn options(&mut self, ui: &mut egui::Ui, weak: Color32) {
+        {
             section(ui, "Capture shortcut");
             ui.horizontal(|ui| {
                 let recording = self.recorder.is_some();
@@ -306,7 +335,7 @@ impl eframe::App for SettingsApp {
                 }
                 if ui.button("Reset").on_hover_text(DEFAULT_HOTKEY).clicked() {
                     self.settings.hotkey = DEFAULT_HOTKEY.into();
-                    self.settings.take_over = false;
+                    self.settings.take_over = settings::DEFAULT_TAKE_OVER;
                     self.recorder = None;
                 }
             });
@@ -340,21 +369,24 @@ impl eframe::App for SettingsApp {
                 self.settings.marker_color = defaults.marker_color;
             }
 
+            section(ui, "Appearance");
+            ui.horizontal(|ui| {
+                ui.label("Theme");
+                ui.add_space(8.0);
+                for (value, name) in
+                    [(ThemeSetting::System, "System"), (ThemeSetting::Light, "Light"), (ThemeSetting::Dark, "Dark")]
+                {
+                    ui.selectable_value(&mut self.settings.theme, value, name);
+                }
+            });
+
             #[cfg(feature = "autostart")]
             self.startup_setting(ui);
 
             section(ui, "Saving");
             let save = &mut self.settings.save;
             egui::Grid::new("saving").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Prefix");
-                ui.add(egui::TextEdit::singleline(&mut save.prefix).hint_text("none").desired_width(240.0));
-                ui.end_row();
-                ui.label("Suffix");
-                ui.add(egui::TextEdit::singleline(&mut save.suffix).hint_text("none").desired_width(240.0));
-                ui.end_row();
-                ui.label("");
-                ui.label(RichText::new("{date} and {time} are filled in when saving").color(weak).small());
-                ui.end_row();
+                crate::save::name_row(ui, "File name", &mut save.name, 240.0);
 
                 ui.label("Format");
                 ui.horizontal(|ui| {
@@ -393,28 +425,7 @@ impl eframe::App for SettingsApp {
             let mut preview = SaveOptions::from_settings(&self.settings);
             preview.format = Format::from(self.settings.save.format);
             ui.label(RichText::new(format!("Example: {}", preview.file_name())).color(weak).small());
-
-            ui.add_space(14.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                let changed = self.settings != self.saved;
-                if ui.add_enabled(changed, egui::Button::new("Save")).clicked() {
-                    match self.settings.store() {
-                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        Err(e) => self.message = Some((format!("Could not save settings: {e}"), true)),
-                    }
-                }
-                if ui.button("Cancel").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.small_button("Restore all defaults").clicked() {
-                    self.settings = Settings::default();
-                }
-            });
-            if let Some((text, error)) = &self.message {
-                let color = if *error { Color32::from_rgb(0xE5, 0x48, 0x4D) } else { weak };
-                ui.label(RichText::new(text).color(color));
-            }
-        });
+            ui.add_space(8.0);
+        }
     }
 }

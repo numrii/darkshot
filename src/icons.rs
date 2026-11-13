@@ -175,8 +175,38 @@ pub fn effect_preview(painter: &egui::Painter, area: Rect, effect: Effect, color
     }
 }
 
-/// A colour-wheel button that opens a full colour picker (RGB, HSV and hex). The
-/// centre dot shows the current colour.
+/// A small circled question mark; add its tooltip to the response.
+pub fn help_mark(ui: &mut egui::Ui) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let color = if response.hovered() {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        ui.painter().circle_stroke(rect.center(), 7.5, Stroke::new(1.2, color));
+        ui.painter().text(
+            rect.center() + vec2(0.0, 0.5),
+            egui::Align2::CENTER_CENTER,
+            "?",
+            egui::FontId::proportional(11.0),
+            color,
+        );
+    }
+    response
+}
+
+fn marker_color_id() -> egui::Id {
+    egui::Id::unique("darkshot-marker-colour")
+}
+
+/// The highlighter colour the highlighter icon shows.
+pub fn set_marker_color(ctx: &egui::Context, color: Color32) {
+    ctx.data_mut(|d| d.insert_temp(marker_color_id(), color));
+}
+
+/// A colour-wheel button that opens the colour picker. The centre dot shows the
+/// current colour.
 pub fn color_picker_button(ui: &mut egui::Ui, color: &mut Color32) -> Response {
     let popup_id = ui.auto_id_with("color-picker");
     let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
@@ -208,16 +238,9 @@ pub fn color_picker_button(ui: &mut egui::Ui, color: &mut Color32) -> Response {
         ui.painter().circle_stroke(center, 3.0, Stroke::new(1.0, edge));
     }
 
-    egui::Popup::menu(&response)
-        .id(popup_id)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
-            ui.spacing_mut().slider_width = 275.0;
-            let alpha = egui::widgets::color_picker::Alpha::OnlyBlend;
-            if egui::widgets::color_picker::color_picker_color32(ui, color, alpha) {
-                response.mark_changed();
-            }
-        });
+    if crate::picker::popup(&response, popup_id, color, true) {
+        response.mark_changed();
+    }
     response
 }
 
@@ -271,8 +294,13 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
         }
         Icon::Marker => {
             // A highlighter with a chisel tip, over a translucent stroke.
+            // The stripe shows the highlighter colour, so the icon reads as a highlighter.
             let swatch = Rect::from_min_max(p(2.0, 15.5), p(18.0, 19.0));
-            painter.rect_filled(swatch, 1.0, color.gamma_multiply(0.35));
+            let ink = painter
+                .ctx()
+                .data(|d| d.get_temp::<Color32>(marker_color_id()))
+                .unwrap_or(crate::settings::DEFAULT_MARKER_COLOR);
+            painter.rect_filled(swatch, 1.0, ink);
             let body = [(12.0, 1.5), (17.5, 7.0), (11.0, 13.5), (5.5, 8.0)];
             painter.add(Shape::closed_line(body.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
             triangle([(5.5, 8.0), (11.0, 13.5), (4.0, 14.0)]);

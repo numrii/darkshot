@@ -12,6 +12,7 @@ mod icons;
 #[cfg(feature = "shortcut-takeover")]
 mod keyhook;
 mod overlay;
+mod picker;
 mod save;
 mod settings;
 mod settings_window;

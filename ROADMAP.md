@@ -48,5 +48,17 @@ Nothing scheduled. Ideas welcome.
 - Context-based toolbar options that keep the toolbar's width fixed.
 - Copy to clipboard; save as PNG or JPEG (with quality) through a save panel.
 - Settings file next to the exe (the personal build falls back to `%APPDATA%\Darkshot`)
-  and a settings window: shortcut (including the Windows key), colours, file name prefix and suffix with `{date}` and `{time}`, format,
-  quality and default folder.
+  and a settings window: shortcut (including the Windows key), colours, light, dark or
+  system theme, file name, format, quality and default folder. The window can be resized
+  and scrolls; Save and Cancel stay at the bottom.
+- Win+Shift+S is the default shortcut (taken over from Windows in the personal build).
+- Colour picker: one picker for every colour, with a wheel per tab (an RGB hexagon, an
+  HSV ring and square, a CMYK ink wheel), gradient sliders, a hex field with copy, and
+  a separate alpha slider. Colour and opacity are kept apart, so lowering alpha or
+  passing through black never loses the colour.
+- File names from one template with `{date}`, `{time}`, `{year}`, `{month}`, `{day}`,
+  `{hour}`, `{minute}`, `{second}` and `{counter}` (the next free number in the save
+  folder). Characters Windows forbids are refused, and reserved device names avoided.
+- Popups and tooltips stay on the monitor they open on; tooltips wrap.
+- The overlay draws at most one frame per display refresh.
+- Sharp at any display scaling: per-monitor DPI awareness declared in the manifest.

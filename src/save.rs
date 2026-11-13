@@ -4,8 +4,136 @@ use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
-use crate::settings::{expand, Settings};
+use eframe::egui;
+
+use crate::settings::Settings;
 use crate::AnyResult;
+
+/// Characters Windows does not allow in file names.
+pub const INVALID_CHARS: &str = r#"<>:"/\|?*"#;
+
+/// The name macros, with an example of what each becomes.
+const MACROS: [(&str, &str); 9] = [
+    ("{date}", "2026-11-13"),
+    ("{time}", "16-24-03"),
+    ("{year}", "2026"),
+    ("{month}", "11"),
+    ("{day}", "13"),
+    ("{hour}", "16"),
+    ("{minute}", "24"),
+    ("{second}", "03"),
+    ("{counter}", "0001, 0002, 0003 ..."),
+];
+
+/// The tooltip next to a name field: each macro in code style with an example.
+fn name_help(ui: &mut egui::Ui) {
+    egui::Grid::new("name-macros").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
+        for (name, example) in MACROS {
+            ui.label(egui::RichText::new(name).code());
+            ui.label(example);
+            ui.end_row();
+        }
+    });
+    ui.add_space(6.0);
+    ui.label(
+        "The counter takes the lowest number no file in your save folder has yet: \
+         shot-0003 if shot-0001 and shot-0002 are already there.",
+    );
+    ui.add_space(4.0);
+    ui.label("File names can't contain < > : \" / \\ | ? *");
+}
+
+/// The moment a capture is named after, in local time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub year: u16,
+    pub month: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+}
+
+impl Stamp {
+    pub fn now() -> Self {
+        let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+        Self { year: t.wYear, month: t.wMonth, day: t.wDay, hour: t.wHour, minute: t.wMinute, second: t.wSecond }
+    }
+
+    /// `YYYY-MM-DD`.
+    pub fn date(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    /// `HH-MM-SS`.
+    pub fn time(&self) -> String {
+        format!("{:02}-{:02}-{:02}", self.hour, self.minute, self.second)
+    }
+}
+
+/// Fill in the name macros (see [`MACROS`]).
+pub fn expand(template: &str, stamp: &Stamp, counter: u32) -> String {
+    let two = |n: u16| format!("{n:02}");
+    template
+        .replace("{date}", &stamp.date())
+        .replace("{time}", &stamp.time())
+        .replace("{year}", &format!("{:04}", stamp.year))
+        .replace("{month}", &two(stamp.month))
+        .replace("{day}", &two(stamp.day))
+        .replace("{hour}", &two(stamp.hour))
+        .replace("{minute}", &two(stamp.minute))
+        .replace("{second}", &two(stamp.second))
+        .replace("{counter}", &format!("{counter:04}"))
+}
+
+/// Make `name` (without extension) a valid Windows file name: forbidden and control
+/// characters become `_`, surrounding spaces and trailing dots go, names Windows
+/// reserves for devices (`CON`, `NUL`, `COM1`...) get a `_` in front, and very long
+/// names are shortened. May return an empty string.
+pub fn clean_file_name(name: &str) -> String {
+    let name: String =
+        name.chars().map(|c| if INVALID_CHARS.contains(c) || c.is_control() { '_' } else { c }).collect();
+    let mut name: String = name.trim().trim_end_matches(['.', ' ']).chars().take(200).collect();
+    name = name.trim_end_matches(['.', ' ']).to_owned();
+    let base = name.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        name.insert(0, '_');
+    }
+    name
+}
+
+/// A file name field with a macro help mark, as two grid cells and one row. Characters
+/// Windows does not allow are refused as they are typed, with a note under the field.
+pub fn name_row(ui: &mut egui::Ui, label: &str, name: &mut String, width: f32) -> egui::Response {
+    ui.label(label);
+    let response = ui
+        .horizontal(|ui| {
+            let field = ui.add(egui::TextEdit::singleline(name).hint_text("date and time").desired_width(width));
+            crate::icons::help_mark(ui).on_hover_ui(name_help);
+            field
+        })
+        .inner;
+    ui.end_row();
+    let refused_id = response.id.with("refused");
+    if response.changed() {
+        let before = name.chars().count();
+        name.retain(|c| !INVALID_CHARS.contains(c) && !c.is_control());
+        let refused = name.chars().count() != before;
+        ui.data_mut(|d| d.insert_temp(refused_id, refused));
+    }
+    if ui.data(|d| d.get_temp::<bool>(refused_id)).unwrap_or(false) {
+        ui.label("");
+        let text = "File names can't contain < > : \" / \\ | ? *";
+        ui.label(egui::RichText::new(text).color(ui.visuals().warn_fg_color).small());
+        ui.end_row();
+    }
+    response
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -37,10 +165,8 @@ pub const QUALITY_MEDIUM: u8 = 75;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SaveOptions {
-    /// The file name is `prefix` + `suffix` + extension; both may contain `{date}` and
-    /// `{time}`.
-    pub prefix: String,
-    pub suffix: String,
+    /// The file name without extension; may contain `{date}`, `{time}` and `{counter}`.
+    pub name: String,
     pub format: Format,
     /// JPEG quality, 1-100.
     pub quality: u8,
@@ -57,28 +183,35 @@ impl Default for SaveOptions {
 impl SaveOptions {
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
-            prefix: settings.save.prefix.clone(),
-            suffix: settings.save.suffix.clone(),
+            name: settings.save.name.clone(),
             format: settings.save.format.into(),
             quality: settings.save.jpeg_quality,
             folder: settings.save_folder(),
         }
     }
 
-    /// The suggested file name: prefix + suffix with `{date}` and `{time}` filled in,
-    /// cleaned of characters Windows does not allow, plus the format's extension. If
-    /// both are empty, the date and time are used.
+    /// The suggested file name: the name with its macros filled in, made valid for
+    /// Windows, plus the format's extension. If the name ends up empty, the date and
+    /// time are used. `{counter}` is the lowest four-digit number whose file does not
+    /// exist yet in the save folder.
     pub fn file_name(&self) -> String {
-        let (date, time) = local_date_time();
-        let name = expand(&format!("{}{}", self.prefix, self.suffix), &date, &time);
-        let name: String = name
-            .trim()
-            .chars()
-            .map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c })
-            .collect();
-        let name = name.trim_end_matches('.');
+        self.file_name_at(&Stamp::now())
+    }
+
+    fn file_name_at(&self, stamp: &Stamp) -> String {
         let ext = self.format.extension();
-        if name.is_empty() { format!("{date}_{time}.{ext}") } else { format!("{name}.{ext}") }
+        let build = |counter: u32| {
+            let name = clean_file_name(&expand(&self.name, stamp, counter));
+            if name.is_empty() {
+                format!("{}_{}.{ext}", stamp.date(), stamp.time())
+            } else {
+                format!("{name}.{ext}")
+            }
+        };
+        match self.folder.as_ref().filter(|_| self.name.contains("{counter}")) {
+            Some(folder) => (1..=9999).map(build).find(|name| !folder.join(name).exists()).unwrap_or_else(|| build(10000)),
+            None => build(1),
+        }
     }
 
     /// Ask where to save, starting in the configured folder with the suggested name.
@@ -156,15 +289,6 @@ pub fn write(img: &RgbaImage, path: &Path, format: Format, quality: u8) -> AnyRe
     Ok(path)
 }
 
-/// The local date (`YYYY-MM-DD`) and time (`HH-MM-SS`).
-pub fn local_date_time() -> (String, String) {
-    let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
-    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
-    (
-        format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay),
-        format!("{:02}-{:02}-{:02}", t.wHour, t.wMinute, t.wSecond),
-    )
-}
 
 #[cfg(test)]
 mod tests {
@@ -173,28 +297,65 @@ mod tests {
     #[test]
     fn file_names() {
         let stamp_len = "2026-11-12_21-50-03".len();
-        // Default: prefix + date and time.
+        // Default: darkshot- and the date and time.
         let name = SaveOptions::default().file_name();
         assert!(name.starts_with("darkshot-20") && name.ends_with(".png"), "{name}");
         assert_eq!(name.len(), "darkshot-".len() + stamp_len + ".png".len());
 
         // Characters Windows forbids are replaced.
-        let mut options = SaveOptions { prefix: " my:shot?-".into(), ..Default::default() };
+        let mut options = SaveOptions { name: " my:shot?-{date}".into(), ..Default::default() };
         assert!(options.file_name().starts_with("my_shot_-20"), "{}", options.file_name());
 
-        // Fixed text only, placeholders in the prefix, and nothing at all.
-        options.prefix = "bug-report".into();
-        options.suffix = String::new();
+        // Fixed text only, a macro in the middle, and nothing at all.
+        options.name = "bug-report".into();
         assert_eq!(options.file_name(), "bug-report.png");
-        options.prefix = "{date} ".into();
-        options.suffix = "notes".into();
+        options.name = "{date} notes".into();
         let name = options.file_name();
         assert!(name.starts_with("20") && name.ends_with(" notes.png") && !name.contains('{'), "{name}");
-        options.prefix.clear();
-        options.suffix.clear();
+        options.name.clear();
         options.format = Format::Jpeg;
         let name = options.file_name();
         assert!(name.starts_with("20") && name.len() == stamp_len + ".jpg".len(), "{name}");
+    }
+
+    #[test]
+    fn macros() {
+        let stamp = Stamp { year: 2026, month: 3, day: 7, hour: 9, minute: 5, second: 1 };
+        assert_eq!(expand(crate::settings::DEFAULT_NAME, &stamp, 1), "darkshot-2026-03-07_09-05-01");
+        assert_eq!(
+            expand("{year}/{month}/{day} {hour}.{minute}.{second} #{counter}", &stamp, 42),
+            "2026/03/07 09.05.01 #0042"
+        );
+        assert_eq!(expand("plain {unknown}", &stamp, 1), "plain {unknown}");
+        // Slashes from the template still end up valid.
+        let options = SaveOptions { name: "{year}/{month}".into(), folder: None, ..Default::default() };
+        assert_eq!(options.file_name_at(&stamp), "2026_03.png");
+    }
+
+    #[test]
+    fn windows_file_names() {
+        assert_eq!(clean_file_name(r#"a<b>c:d"e/f\g|h?i*j"#), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(clean_file_name("  tabs\tand\nlines  "), "tabs_and_lines");
+        assert_eq!(clean_file_name("ends with dots... "), "ends with dots");
+        assert_eq!(clean_file_name("con"), "_con");
+        assert_eq!(clean_file_name("NUL.backup"), "_NUL.backup");
+        assert_eq!(clean_file_name("com7"), "_com7");
+        assert_eq!(clean_file_name("console"), "console");
+        assert_eq!(clean_file_name("COMA"), "COMA");
+        assert_eq!(clean_file_name(&"x".repeat(300)).len(), 200);
+        assert_eq!(clean_file_name("..."), "");
+    }
+
+    #[test]
+    fn counter_takes_the_next_free_number() {
+        let dir = std::env::temp_dir().join(format!("darkshot-counter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = SaveOptions { name: "shot {counter}".into(), folder: Some(dir.clone()), ..Default::default() };
+        assert_eq!(options.file_name(), "shot 0001.png");
+        std::fs::write(dir.join("shot 0001.png"), b"").unwrap();
+        std::fs::write(dir.join("shot 0002.png"), b"").unwrap();
+        assert_eq!(options.file_name(), "shot 0003.png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

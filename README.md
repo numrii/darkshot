@@ -51,7 +51,10 @@ It needs no other files. Settings are saved as `darkshot.toml` in the same folde
 first time you save them, so the folder can be moved or copied as a whole.
 
 Running `darkshot.exe` puts an icon in the notification area. Press the capture
-shortcut (Ctrl+F9 by default) or click the icon to capture. Right-click the icon for
+shortcut (Win+Shift+S by default) or click the icon to capture. Windows keeps
+Win+Shift+S for its own Snipping Tool: the personal build takes it over, while the office
+build can only use it once it is freed in Windows; otherwise pick another shortcut in
+Settings. Right-click the icon for
 Settings and Quit.
 
 ### Security

@@ -29,21 +29,46 @@ pub struct Settings {
     pub swatches: [String; 4],
     /// The highlighter's starting colour.
     pub marker_color: String,
+    /// Light or dark windows and toolbars, or follow Windows.
+    pub theme: ThemeSetting,
     pub save: SaveSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SaveSettings {
-    /// The file name is `prefix` + `suffix` + extension. Either may be empty, and both
-    /// may contain `{date}` (2026-11-12) and `{time}` (21-50-03).
-    pub prefix: String,
-    pub suffix: String,
+    /// The file name, without extension. May contain `{date}` (2026-11-12), `{time}`
+    /// (21-50-03) and `{counter}` (0001, the next number not used in the save folder).
+    pub name: String,
+    /// Older versions split the name in two. Read so the name carries over; never written.
+    #[serde(skip_serializing)]
+    prefix: Option<String>,
+    #[serde(skip_serializing)]
+    suffix: Option<String>,
     pub format: FormatSetting,
     /// JPEG quality, 1-100.
     pub jpeg_quality: u8,
     /// The folder the save dialog opens in. Empty means the Pictures folder.
     pub folder: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeSetting {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl From<ThemeSetting> for eframe::egui::ThemePreference {
+    fn from(t: ThemeSetting) -> Self {
+        match t {
+            ThemeSetting::System => Self::System,
+            ThemeSetting::Light => Self::Light,
+            ThemeSetting::Dark => Self::Dark,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,12 +96,15 @@ impl From<Format> for FormatSetting {
     }
 }
 
-pub const DEFAULT_HOTKEY: &str = "Ctrl+F9";
+pub const DEFAULT_HOTKEY: &str = "Win+Shift+S";
+/// Win+Shift+S is kept by Windows: where the build can, take it over by default.
+pub const DEFAULT_TAKE_OVER: bool = TAKEOVER_AVAILABLE;
+pub const DEFAULT_NAME: &str = "darkshot-{date}_{time}";
 pub const DEFAULT_SWATCHES: [Color32; 4] = [
-    Color32::from_rgb(0xE5, 0x48, 0x4D),
-    Color32::from_rgb(0x30, 0xA4, 0x6C),
-    Color32::from_rgb(0x3E, 0x63, 0xDD),
-    Color32::from_rgb(0xFF, 0xE6, 0x00),
+    Color32::from_rgb(0xEF, 0x47, 0x6F),
+    Color32::from_rgb(0xFF, 0xD1, 0x66),
+    Color32::from_rgb(0x06, 0xD6, 0xA0),
+    Color32::from_rgb(0x11, 0x8A, 0xB2),
 ];
 pub const DEFAULT_MARKER_COLOR: Color32 = Color32::from_rgb(0xFF, 0xE6, 0x00);
 
@@ -84,9 +112,10 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: DEFAULT_HOTKEY.into(),
-            take_over: false,
+            take_over: DEFAULT_TAKE_OVER,
             swatches: DEFAULT_SWATCHES.map(to_hex),
             marker_color: to_hex(DEFAULT_MARKER_COLOR),
+            theme: ThemeSetting::System,
             save: SaveSettings::default(),
         }
     }
@@ -95,8 +124,9 @@ impl Default for Settings {
 impl Default for SaveSettings {
     fn default() -> Self {
         Self {
-            prefix: "darkshot-".into(),
-            suffix: "{date}_{time}".into(),
+            name: DEFAULT_NAME.into(),
+            prefix: None,
+            suffix: None,
             format: FormatSetting::Png,
             jpeg_quality: crate::save::QUALITY_HIGH,
             folder: String::new(),
@@ -126,6 +156,10 @@ impl Settings {
             settings.hotkey = DEFAULT_HOTKEY.into();
         }
         settings.save.jpeg_quality = settings.save.jpeg_quality.clamp(1, 100);
+        let (prefix, suffix) = (settings.save.prefix.take(), settings.save.suffix.take());
+        if (prefix.is_some() || suffix.is_some()) && settings.save.name == DEFAULT_NAME {
+            settings.save.name = format!("{}{}", prefix.unwrap_or_default(), suffix.unwrap_or_default());
+        }
         settings
     }
 
@@ -357,11 +391,6 @@ pub fn parse_hex(text: &str) -> Option<Color32> {
     Some(Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
-/// Fill in `{date}` and `{time}` with the given parts.
-pub fn expand(template: &str, date: &str, time: &str) -> String {
-    template.replace("{date}", date).replace("{time}", time)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,16 +400,18 @@ mod tests {
         let settings = Settings::default();
         let text = toml::to_string_pretty(&settings).unwrap();
         assert_eq!(Settings::from_toml(&text), settings);
-        assert!(text.contains("hotkey = \"Ctrl+F9\""), "{text}");
+        assert!(text.contains("hotkey = \"Win+Shift+S\""), "{text}");
+        assert!(!text.contains("prefix"), "{text}");
 
         // Missing fields and bad values fall back to defaults; good ones are kept.
-        let partial = "hotkey = \"Banana+Q\"\n[save]\nprefix = \"shot \"\njpeg_quality = 250\n";
+        let partial = "hotkey = \"Banana+Q\"\n[save]\nprefix = \"shot \"\nsuffix = \"{counter}\"\njpeg_quality = 250\n";
         let s = Settings::from_toml(partial);
         assert_eq!(s.hotkey, DEFAULT_HOTKEY);
-        assert_eq!(s.save.prefix, "shot ");
-        assert_eq!(s.save.suffix, "{date}_{time}");
+        assert_eq!(s.save.name, "shot {counter}"); // an old prefix and suffix carry over
         assert_eq!(s.save.jpeg_quality, 100);
         assert_eq!(s.swatch_colors(), DEFAULT_SWATCHES);
+        assert_eq!(s.theme, ThemeSetting::System);
+        assert_eq!(Settings::from_toml("theme = \"light\"").theme, ThemeSetting::Light);
 
         // A file that is not TOML at all gives the defaults.
         assert_eq!(Settings::from_toml("not = [valid"), Settings::default());
@@ -404,8 +435,6 @@ mod tests {
         assert_eq!((win.mods, win.key), (Modifiers::META | Modifiers::SHIFT, Code::KeyS));
         assert_eq!(parse_hotkey("windows + shift + s"), Some(win));
 
-        assert_eq!(expand("darkshot-{date}_{time}", "2026-11-12", "21-50-03"), "darkshot-2026-11-12_21-50-03");
-        assert_eq!(expand("plain", "d", "t"), "plain");
     }
 
     #[test]

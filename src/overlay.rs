@@ -103,11 +103,13 @@ pub fn run() -> AnyResult<()> {
                 (b.right - b.left) as f32 / scale,
                 (b.bottom - b.top) as f32 / scale,
             ]),
-        // Present immediately with a one-frame queue, for the lowest latency between
-        // the cursor and what is drawn under it.
+        // Wait for the display's refresh with a one-frame queue: the lowest latency that
+        // never draws more frames than the screen shows. Without the wait, moving the
+        // mouse drew hundreds of frames a second, which kept the GPU busy in bursts
+        // (audible as coil whine on some machines) for frames nobody could see.
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration::default().with_surface_config(
             eframe::egui_wgpu::SurfaceConfig {
-                present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+                present_mode: eframe::wgpu::PresentMode::AutoVsync,
                 desired_maximum_frame_latency: Some(1),
             },
         ),
@@ -579,6 +581,8 @@ struct Overlay {
     hwnd: Option<HWND>,
     /// The monitor the pointer was last on; Ctrl+A and the hint bar use it.
     current_monitor: usize,
+    /// The monitor popups and tooltips are kept on (see `raw_input_hook`).
+    ui_monitor: usize,
     /// The capture region in desktop pixels.
     selection: Option<Rect>,
     action: Option<Action>,
@@ -648,6 +652,7 @@ impl Overlay {
             mods: Modifiers::NONE,
             drag_moved: false,
             current_monitor: desktop.home,
+            ui_monitor: desktop.home,
             desktop,
             textures: Vec::new(),
             hwnd,
@@ -687,7 +692,10 @@ impl Overlay {
     fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop) -> Self {
         trace("window created");
         setup_text(&cc.egui_ctx);
-        let overlay = Self::with_desktop(desktop, hwnd_of(cc), &Settings::load());
+        let settings = Settings::load();
+        cc.egui_ctx.set_theme(settings.theme);
+        icons::set_marker_color(&cc.egui_ctx, settings.marker());
+        let overlay = Self::with_desktop(desktop, hwnd_of(cc), &settings);
         if let Some(hwnd) = overlay.hwnd {
             // Switch off the window's fade-in. During that animation the live desktop
             // shows through the frozen capture, which looks like ghosting when
@@ -965,6 +973,12 @@ impl Overlay {
                 if self.annotations.last().is_some_and(Annotation::is_degenerate) {
                     self.annotations.pop();
                     self.history.forget_last();
+                    self.selected = None;
+                }
+                // Steps are placed one after another, often in different colours: leave
+                // a placed step unselected so picking a colour for the next one does not
+                // recolour it.
+                if self.annotations.last().is_some_and(|a| a.kind == ShapeKind::Step) {
                     self.selected = None;
                 }
             }
@@ -1510,17 +1524,9 @@ impl Overlay {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(300.0);
                     egui::Grid::new("save-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                        for (label, text, hint) in [
-                            ("Prefix", &mut options.prefix, "none"),
-                            ("Suffix", &mut options.suffix, "none"),
-                        ] {
-                            ui.label(label);
-                            let field = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(200.0));
-                            let tip = "Can include {date} and {time}";
-                            if field.on_hover_text(tip).lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                                save = true;
-                            }
-                            ui.end_row();
+                        let field = crate::save::name_row(ui, "Name", &mut options.name, 176.0);
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            save = true;
                         }
 
                         ui.label("Format");
@@ -1598,6 +1604,8 @@ pub(crate) fn setup_text(ctx: &egui::Context) {
         ));
     }
     ctx.all_styles_mut(|style| {
+        // Tooltips cannot reach outside the window, so wrap them well inside it.
+        style.spacing.tooltip_width = 300.0;
         style.visuals.text_options.subpixel_binning = false;
         style.visuals.text_options.font_hinting = true;
     });
@@ -1710,6 +1718,38 @@ fn handle_points(r: Rect) -> impl Iterator<Item = Pos2> {
 }
 
 impl eframe::App for Overlay {
+    /// Keep popups, tooltips and menus on one monitor. egui places them inside its
+    /// content rect, which for this window spans every monitor, so one opened near a
+    /// monitor's edge could land on the next monitor or off screen. Narrowing the content
+    /// rect (through the safe-area insets) to the pointer's monitor keeps them on it.
+    /// While a popup is open its monitor is kept, so it does not jump when the pointer
+    /// leaves it.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let viewport = raw.screen_rect.unwrap_or_else(|| ctx.viewport_rect());
+        if viewport.width() <= 0.0 || self.desktop.monitors.is_empty() {
+            return;
+        }
+        let scale = self.bounds().width() / viewport.width();
+        let pointer = raw.events.iter().rev().find_map(|e| match e {
+            egui::Event::PointerMoved(p) => Some(*p),
+            _ => None,
+        });
+        if let Some(p) = pointer.filter(|_| !egui::Popup::is_any_open(ctx)) {
+            let px = ((p - viewport.min) * scale).to_pos2();
+            if let Some(i) = self.desktop.monitors.iter().position(|m| m.contains(px)) {
+                self.ui_monitor = i;
+            }
+        }
+        let m = self.desktop.monitors[self.ui_monitor.min(self.desktop.monitors.len() - 1)];
+        let (min, max) = (viewport.min + m.min.to_vec2() / scale, viewport.min + m.max.to_vec2() / scale);
+        raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
+            left: (min.x - viewport.left()).max(0.0),
+            right: (viewport.right() - max.x).max(0.0),
+            top: (min.y - viewport.top()).max(0.0),
+            bottom: (viewport.bottom() - max.y).max(0.0),
+        }));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.hwnd.is_none() {
@@ -1719,7 +1759,9 @@ impl eframe::App for Overlay {
             ctx.request_repaint(); // check again next frame that the move stuck
         }
 
-        let screen = ctx.content_rect();
+        // The whole window, across every monitor. (The content rect is only the monitor
+        // popups are kept on; see `raw_input_hook`.)
+        let screen = ctx.viewport_rect();
         let response = ui.allocate_rect(screen, Sense::drag());
         let painter = ui.painter_at(screen);
 
@@ -2096,8 +2138,9 @@ impl eframe::App for Overlay {
         }
 
         // With Ctrl held over a spot where a click would start a new region, outline the
-        // window a click would select.
-        if mods.ctrl && self.action.is_none() && response.hovered() {
+        // window a click would select. Only before an area is chosen: afterwards Ctrl is
+        // mostly pressed for shortcuts (Ctrl+C, Ctrl+S), and the outline would flash.
+        if mods.ctrl && self.selection.is_none() && self.action.is_none() && response.hovered() {
             if let Some(p) = hover.map(to_px) {
                 if let Action::Region(Drag::Create { .. }) = self.pick_action(p, tol) {
                     if let Some(window) = self.desktop.snap.window_at(p) {
@@ -2150,9 +2193,12 @@ impl eframe::App for Overlay {
                 if let Some(color) = self.pixel_at(px) {
                     // Desktop pixels per point inside the spotlight.
                     let density = if mods.shift { 1.0 / SPOTLIGHT_ZOOM } else { scale };
-                    // Spotlight point to desktop pixel, and back.
-                    let to_desktop = |q: Pos2| px + (q - p) * density;
-                    let from_desktop = |d: Pos2| p + (d - px) / density;
+                    // Spotlight point to desktop pixel, and back. The centre of the pixel
+                    // a click picks sits under the cursor (the cursor itself points at a
+                    // pixel's corner), so the magnified pixel is centred on the crosshair.
+                    let centre = Pos2::new(px.x.floor() + 0.5, px.y.floor() + 0.5);
+                    let to_desktop = |q: Pos2| centre + (q - p) * density;
+                    let from_desktop = |d: Pos2| p + (d - centre) / density;
                     painter.circle_filled(p, SPOTLIGHT_RADIUS, Color32::BLACK);
                     for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
                         let area = Rect::from_min_max(from_desktop(m.min), from_desktop(m.max));
