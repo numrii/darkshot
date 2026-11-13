@@ -4,6 +4,10 @@ A privacy-first screenshot and annotation tool for Windows. Captures leave Darks
 only through the clipboard or a file you choose to save. There is no upload and no
 installer, and nothing starts with Windows unless you set it up.
 
+![Darkshot's capture overlay: a selected region with numbered steps, arrows, a dashed circle, a highlighted label and a pixelated figure, above the toolbar](docs/screenshot.jpg)
+
+<sub>Background photo: "Alone in the unspoilt wilderness" by David Marcu, CC0, via Wikimedia Commons.</sub>
+
 ## Using Darkshot
 
 Run `darkshot.exe` and it sits in the notification area. Press the capture shortcut
