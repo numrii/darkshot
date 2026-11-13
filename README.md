@@ -120,3 +120,7 @@ Neither way needs administrator rights, and both affect only your own account.
   This adds Darkshot to `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
   and takes effect at once; untick to remove it. If you move the exe, Settings shows
   that the entry points to the old location, and ticking the box again fixes it.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
