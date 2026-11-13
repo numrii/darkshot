@@ -18,8 +18,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PostThreadMessageW, TranslateMessage, MSG, WM_APP, WM_QUIT,
 };
 
+#[cfg(feature = "shortcut-takeover")]
 use crate::keyhook::Hook;
-use crate::settings::{hook_spec, parse_hotkey, Settings};
+#[cfg(feature = "shortcut-takeover")]
+use crate::settings::hook_spec;
+use crate::settings::{parse_hotkey, Settings};
 use crate::AnyResult;
 
 const MENU_CAPTURE: &str = "capture";
@@ -37,6 +40,7 @@ enum Shortcut {
     /// Registered with Windows as an ordinary hotkey.
     Hotkey(HotKey),
     /// Caught by a low-level keyboard hook (taking it over from Windows).
+    #[cfg(feature = "shortcut-takeover")]
     Hook(Hook),
 }
 
@@ -45,6 +49,7 @@ fn release(hotkeys: &GlobalHotKeyManager, active: &mut Option<Shortcut>) {
         Some(Shortcut::Hotkey(hotkey)) => {
             let _ = hotkeys.unregister(hotkey);
         }
+        #[cfg(feature = "shortcut-takeover")]
         Some(Shortcut::Hook(hook)) => drop(hook),
         None => {}
     }
@@ -145,6 +150,24 @@ pub fn run() -> AnyResult<()> {
     Ok(())
 }
 
+/// Catch `label` with the low-level keyboard hook, which tells `main_thread` when it
+/// is pressed.
+#[cfg(feature = "shortcut-takeover")]
+fn take_over(label: &str, main_thread: u32) -> Result<Shortcut, String> {
+    match hook_spec(label) {
+        Some((vk, mods)) => Hook::watch(vk, mods, main_thread, WM_HOOK_CAPTURE)
+            .map(Shortcut::Hook)
+            .ok_or_else(|| "the keyboard hook could not be installed".to_owned()),
+        None => Err("not a valid key combination".to_owned()),
+    }
+}
+
+/// This build has no keyboard hook; settings never ask for it (see `Settings::from_toml`).
+#[cfg(not(feature = "shortcut-takeover"))]
+fn take_over(_label: &str, _main_thread: u32) -> Result<Shortcut, String> {
+    Err("this build cannot take shortcuts over from Windows".to_owned())
+}
+
 /// Read the shortcut from the settings and start catching it, replacing whatever was
 /// caught before: as an ordinary hotkey, or with the keyboard hook if the settings say
 /// to take it over. Updates the menu and tooltip, and explains if it is not available.
@@ -159,12 +182,7 @@ fn apply_hotkey(
     let settings = Settings::load();
     let label = settings.hotkey.trim().to_owned();
     let result = if settings.take_over {
-        match hook_spec(&label) {
-            Some((vk, mods)) => Hook::watch(vk, mods, main_thread, WM_HOOK_CAPTURE)
-                .map(Shortcut::Hook)
-                .ok_or_else(|| "the keyboard hook could not be installed".to_owned()),
-            None => Err("not a valid key combination".to_owned()),
-        }
+        take_over(&label, main_thread)
     } else {
         match parse_hotkey(&label) {
             Some(hotkey) => hotkeys
@@ -190,8 +208,8 @@ fn apply_hotkey(
                 .set_description(format!(
                     "The capture shortcut {label} could not be registered. Windows or another \
                      application may already use it.\n\nYou can still capture by clicking the \
-                     Darkshot tray icon. Under Settings you can choose another shortcut, or let \
-                     Darkshot take this one over."
+                     Darkshot tray icon. Under Settings you can choose another shortcut{}.",
+                    if crate::settings::TAKEOVER_AVAILABLE { ", or let Darkshot take this one over" } else { "" }
                 ))
                 .show();
         }

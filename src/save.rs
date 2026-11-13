@@ -84,7 +84,9 @@ impl SaveOptions {
     /// Ask where to save, starting in the configured folder with the suggested name.
     /// Returns `None` if the user cancelled.
     pub fn ask_path(&self, parent: &eframe::Frame) -> Option<PathBuf> {
-        // Test hook: save straight into this folder, without a dialog.
+        // Test hook: save straight into this folder, without a dialog. Debug builds
+        // only: in a release build Save always asks.
+        #[cfg(debug_assertions)]
         if let Some(dir) = std::env::var_os("DARKSHOT_SAVE_TO") {
             return Some(PathBuf::from(dir).join(self.file_name()));
         }
@@ -95,14 +97,30 @@ impl SaveOptions {
         if let Some(folder) = self.folder.as_ref().filter(|f| f.is_dir()) {
             dialog = dialog.set_directory(folder);
         }
-        dialog.save_file()
+        let chosen = dialog.save_file()?;
+        // The dialog only confirmed overwriting the name as typed. If the extension has
+        // to be added, the file actually written is a different one: confirm that too.
+        let path = final_path(&chosen, self.format);
+        if path != chosen && path.exists() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let replace = rfd::MessageDialog::new()
+                .set_parent(parent)
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Darkshot")
+                .set_description(format!("{name} already exists.\n\nDo you want to replace it?"))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if replace != rfd::MessageDialogResult::Yes {
+                return None;
+            }
+        }
+        Some(path)
     }
 }
 
-/// Write `img` to `path` in `format`. The extension is corrected if it does not
-/// match the format, so a file never claims to be something it is not. Returns the
-/// path actually written.
-pub fn write(img: &RgbaImage, path: &Path, format: Format, quality: u8) -> AnyResult<PathBuf> {
+/// `path` with the format's extension added if it does not already end in one that
+/// matches, so a file never claims to be something it is not.
+pub fn final_path(path: &Path, format: Format) -> PathBuf {
     let mut path = path.to_path_buf();
     let ext_ok = path.extension().and_then(|e| e.to_str()).is_some_and(|e| match format {
         Format::Png => e.eq_ignore_ascii_case("png"),
@@ -114,6 +132,13 @@ pub fn write(img: &RgbaImage, path: &Path, format: Format, quality: u8) -> AnyRe
         name.push(format.extension());
         path.set_file_name(name);
     }
+    path
+}
+
+/// Write `img` to `path` in `format`, at [`final_path`]. Returns the path actually
+/// written.
+pub fn write(img: &RgbaImage, path: &Path, format: Format, quality: u8) -> AnyResult<PathBuf> {
+    let path = final_path(path, format);
     let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
     match format {
         Format::Png => img.write_with_encoder(image::codecs::png::PngEncoder::new(file))?,
@@ -170,6 +195,18 @@ mod tests {
         options.format = Format::Jpeg;
         let name = options.file_name();
         assert!(name.starts_with("20") && name.len() == stamp_len + ".jpg".len(), "{name}");
+    }
+
+    #[test]
+    fn final_paths() {
+        let p = |s: &str, f| final_path(Path::new(s), f).to_string_lossy().into_owned();
+        assert_eq!(p(r"C:\a\shot.png", Format::Png), r"C:\a\shot.png");
+        assert_eq!(p(r"C:\a\shot.PNG", Format::Png), r"C:\a\shot.PNG");
+        assert_eq!(p(r"C:\a\shot.jpeg", Format::Jpeg), r"C:\a\shot.jpeg");
+        // A different extension is kept and the right one added: the file written is
+        // not the one the dialog confirmed, which `ask_path` checks for.
+        assert_eq!(p(r"C:\a\notes.txt", Format::Png), r"C:\a\notes.txt.png");
+        assert_eq!(p(r"C:\a\shot", Format::Jpeg), r"C:\a\shot.jpg");
     }
 
     #[test]

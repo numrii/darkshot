@@ -1,1 +1,7 @@
 /target
+
+# Local output that should never be committed: settings written when running the exe
+# from the repository, logs, and ad-hoc debug dumps.
+darkshot.toml
+*.log
+*debug*.txt

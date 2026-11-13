@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2024"
 description = "Privacy-first screenshot and annotation tool: clipboard or file, never uploaded"
 
+# Two builds from one source. The default is the office build: an ordinary registered
+# hotkey, settings only beside the exe, no diagnostic log files. The personal build
+# (`--features personal`) adds the rest.
+[features]
+personal = ["shortcut-takeover", "appdata-fallback", "trace", "autostart"]
+# Take over shortcuts Windows keeps for itself (Win+Shift+S) with a low-level keyboard
+# hook, which also records shortcuts in Settings from anywhere.
+shortcut-takeover = []
+# Store settings in %APPDATA%\Darkshot when the exe's folder cannot be written.
+appdata-fallback = []
+# `--trace` writes frame timings to darkshot-trace.log in the temp folder.
+trace = []
+# A "Start with Windows" setting, stored in the current user's Run registry key.
+autostart = []
+
 [dependencies]
 arboard = "3.7.0"
 # Only what Darkshot uses. The default features include "links", which compiles in
@@ -19,7 +34,7 @@ tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "
 toml = "1.2.1"
 tray-icon = "0.26.1"
 ttf-parser = "0.25.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Registry"] }
 winit = "0.30"
 xcap = "0.9.10"
 

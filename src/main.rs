@@ -4,9 +4,12 @@
 
 mod annotate;
 mod appicon;
+#[cfg(feature = "autostart")]
+mod autostart;
 mod daemon;
 mod effects;
 mod icons;
+#[cfg(feature = "shortcut-takeover")]
 mod keyhook;
 mod overlay;
 mod save;
@@ -20,7 +23,8 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// `darkshot`            sits in the tray and waits for the hotkey.
 /// `darkshot --capture`  takes one capture right now and exits.
 /// `darkshot --settings` opens the settings window.
-/// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder.
+/// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder
+/// (debug builds and builds with the `trace` feature only).
 fn main() -> AnyResult<()> {
     if std::env::args().any(|a| a == "--capture") {
         overlay::run()

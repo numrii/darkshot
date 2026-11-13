@@ -1,6 +1,7 @@
 //! User settings, stored as `darkshot.toml` next to the exe so Darkshot stays
-//! portable. If that folder cannot be written (say, the exe is in Program Files), the
-//! file goes to `%APPDATA%\Darkshot` instead. Missing or unreadable values fall back
+//! portable. With the `appdata-fallback` feature, if that folder cannot be written
+//! (say, the exe is in Program Files), the file goes to `%APPDATA%\Darkshot` instead;
+//! without it, saving settings fails with an error. Missing or unreadable values fall back
 //! to their defaults, so an old or hand-edited file never stops Darkshot starting.
 
 use std::path::PathBuf;
@@ -12,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::save::Format;
 
 pub const FILE_NAME: &str = "darkshot.toml";
+
+/// Whether this build can take a shortcut over from Windows with the keyboard hook.
+pub const TAKEOVER_AVAILABLE: bool = cfg!(feature = "shortcut-takeover");
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -113,6 +117,11 @@ impl Settings {
     /// Parse settings, keeping defaults for anything missing or invalid.
     pub fn from_toml(text: &str) -> Self {
         let mut settings: Self = toml::from_str(text).unwrap_or_default();
+        // A file written by the personal build may ask for a takeover this build
+        // cannot do: register the shortcut normally instead.
+        if !TAKEOVER_AVAILABLE {
+            settings.take_over = false;
+        }
         if !shortcut_valid(&settings.hotkey, settings.take_over) {
             settings.hotkey = DEFAULT_HOTKEY.into();
         }
@@ -120,7 +129,8 @@ impl Settings {
         settings
     }
 
-    /// Write the settings next to the exe, or to `%APPDATA%\Darkshot` if that fails.
+    /// Write the settings next to the exe, or (with `appdata-fallback`) to
+    /// `%APPDATA%\Darkshot` if that fails.
     /// Returns where they were written.
     pub fn store(&self) -> std::io::Result<PathBuf> {
         let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -157,12 +167,13 @@ impl Settings {
 }
 
 /// Where the settings file may be, in order of preference: next to the exe (portable),
-/// then `%APPDATA%\Darkshot`.
+/// then, with `appdata-fallback`, `%APPDATA%\Darkshot`.
 fn candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)) {
         paths.push(dir.join(FILE_NAME));
     }
+    #[cfg(feature = "appdata-fallback")]
     if let Some(appdata) = std::env::var_os("APPDATA") {
         paths.push(PathBuf::from(appdata).join("Darkshot").join(FILE_NAME));
     }
@@ -198,7 +209,7 @@ pub fn shortcut_valid(text: &str, take_over: bool) -> bool {
     if take_over { hook_spec(text).is_some() } else { parse_hotkey(text).is_some() }
 }
 
-/// Write a combination caught by the keyboard hook as shortcut text, Windows-style:
+/// Write a recorded combination as shortcut text, Windows-style:
 /// `Win+Ctrl+Alt+Shift+Key`. `None` for keys without a name here.
 pub fn shortcut_text(vk: u32, mods: u8) -> Option<String> {
     let key = key_name(vk)?;

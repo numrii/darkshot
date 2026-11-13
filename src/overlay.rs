@@ -47,7 +47,11 @@ const HANDLE_SIZE: f32 = 7.0;
 
 /// Where trace lines go: `--trace` writes `darkshot-trace.log` in the temp folder,
 /// the `DARKSHOT_TRACE` environment variable writes to stderr. `None` = tracing off.
+/// Only builds with the `trace` feature, and debug builds, can trace at all.
 fn trace_sink() -> Option<&'static Mutex<Box<dyn Write + Send>>> {
+    if !cfg!(any(feature = "trace", debug_assertions)) {
+        return None;
+    }
     static SINK: OnceLock<Option<Mutex<Box<dyn Write + Send>>>> = OnceLock::new();
     SINK.get_or_init(|| {
         if std::env::args().any(|a| a == "--trace") {
@@ -1269,13 +1273,25 @@ impl Overlay {
         Some((img, area))
     }
 
+    /// Blur regions in the order they are applied: pixelate and Gaussian first, then
+    /// every redaction. Pixelate and blur are computed from the original capture, so
+    /// one applied after an overlapping redaction would put content derived from the
+    /// hidden pixels back on top of it.
+    fn blur_order(&self) -> Vec<usize> {
+        let blurs = (0..self.annotations.len()).filter(|&i| self.annotations[i].kind == ShapeKind::Blur);
+        let (redactions, mut order): (Vec<_>, Vec<_>) =
+            blurs.partition(|&i| self.annotations[i].effect == Effect::Redact);
+        order.extend(redactions);
+        order
+    }
+
     /// The final image: the cropped capture with blur regions applied and every other
     /// annotation drawn on top. Blur regions always act on the capture itself, below
     /// all other annotations, both here and on screen.
     fn output(&self) -> Option<RgbaImage> {
         let origin = self.selection?.intersect(self.bounds()).min.round();
         let mut img = self.cropped()?;
-        for shape in self.annotations.iter().filter(|a| a.kind == ShapeKind::Blur) {
+        for shape in self.blur_order().into_iter().map(|i| &self.annotations[i]) {
             if let Some((blurred, area)) = self.blurred(shape) {
                 let offset = area.min - origin;
                 image::imageops::replace(&mut img, &blurred, offset.x as i64, offset.y as i64);
@@ -1287,12 +1303,17 @@ impl Overlay {
 
     fn copy_to_clipboard(img: &RgbaImage) -> AnyResult<()> {
         // Test hook: write the "copied" image to a file instead, so automated checks
-        // can inspect the output without touching the user's clipboard.
+        // can inspect the output without touching the user's clipboard. Debug builds
+        // only: in a release build Copy always goes to the clipboard.
+        #[cfg(debug_assertions)]
         if let Some(path) = std::env::var_os("DARKSHOT_COPY_TO") {
             img.save(path)?;
             return Ok(());
         }
-        arboard::Clipboard::new()?.set_image(arboard::ImageData {
+        // Keep screenshots out of Windows' clipboard history (Win+V) and cloud clipboard
+        // sync: a copy should live only until the next one replaces it.
+        use arboard::SetExtWindows;
+        arboard::Clipboard::new()?.set().exclude_from_history().exclude_from_cloud().image(arboard::ImageData {
             width: img.width() as usize,
             height: img.height() as usize,
             bytes: Cow::Borrowed(img.as_raw()),
@@ -1599,6 +1620,79 @@ fn label(painter: &egui::Painter, pos: Pos2, anchor: Align2, text: String, color
     let rect = anchor.anchor_size(pos, galley.size());
     painter.rect_filled(rect.expand2(vec2(6.0, 3.0)), 4.0, Color32::from_black_alpha(200));
     painter.galley(rect.min, galley, color);
+}
+
+/// The eyedropper spotlight's radius, in points.
+const SPOTLIGHT_RADIUS: f32 = 80.0;
+/// Points per captured pixel in the spotlight while Shift magnifies it.
+const SPOTLIGHT_ZOOM: f32 = 12.0;
+
+/// A disc of radius `radius` around `centre` (in points) textured with `texture`,
+/// where `uv` gives the texture coordinate for a point.
+fn spotlight_mesh(texture: egui::TextureId, centre: Pos2, radius: f32, uv: impl Fn(Pos2) -> Pos2) -> egui::Mesh {
+    const SEGMENTS: u32 = 96;
+    let mut mesh = egui::Mesh::with_texture(texture);
+    let mut vertex = |pos: Pos2| mesh.vertices.push(egui::epaint::Vertex { pos, uv: uv(pos), color: Color32::WHITE });
+    vertex(centre);
+    for i in 0..SEGMENTS {
+        let angle = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        vertex(centre + vec2(angle.cos(), angle.sin()) * radius);
+    }
+    for i in 0..SEGMENTS {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % SEGMENTS);
+    }
+    mesh
+}
+
+/// The picked colour's values beside the spotlight at `centre`: a swatch, hex, RGB and
+/// HSL. On the right of the spotlight, or on its left near the screen's right edge.
+fn color_readout(painter: &egui::Painter, centre: Pos2, radius: f32, color: Color32, screen: Rect) {
+    let (h, s, l) = hsl(color);
+    let text = format!(
+        "{}\nRGB  {}, {}, {}\nHSL  {h}°, {s}%, {l}%",
+        crate::settings::to_hex(color),
+        color.r(),
+        color.g(),
+        color.b()
+    );
+    let galley = painter.layout_no_wrap(text, FontId::monospace(13.0), Color32::WHITE);
+    const SWATCH: f32 = 22.0;
+    const PAD: f32 = 8.0;
+    let size = vec2(SWATCH + PAD + galley.size().x, galley.size().y.max(SWATCH)) + Vec2::splat(2.0 * PAD);
+    let gap = radius + 14.0;
+    let mut rect = Align2::LEFT_CENTER.anchor_size(centre + vec2(gap, 0.0), size);
+    if rect.right() > screen.right() - 4.0 {
+        rect = Align2::RIGHT_CENTER.anchor_size(centre - vec2(gap, 0.0), size);
+    }
+    // Keep it on screen vertically too.
+    let below_top = (screen.top() + 4.0 - rect.top()).max(0.0);
+    let above_bottom = (screen.bottom() - 4.0 - rect.bottom()).min(0.0);
+    let rect = rect.translate(vec2(0.0, below_top + above_bottom));
+    painter.rect_filled(rect, 6.0, Color32::from_black_alpha(215));
+    let swatch = Rect::from_min_size(rect.min + Vec2::splat(PAD), Vec2::splat(SWATCH));
+    painter.rect_filled(swatch, 3.0, color);
+    painter.rect_stroke(swatch, 3.0, Stroke::new(1.0, Color32::from_gray(200)), StrokeKind::Outside);
+    painter.galley(Pos2::new(swatch.right() + PAD, rect.top() + PAD), galley, Color32::WHITE);
+}
+
+/// Hue in degrees, saturation and lightness in percent, all rounded.
+fn hsl(color: Color32) -> (u32, u32, u32) {
+    let [r, g, b] = [color.r(), color.g(), color.b()].map(|c| f32::from(c) / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d == 0.0 {
+        return (0, 0, (l * 100.0).round() as u32);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    ((h * 60.0).round() as u32 % 360, (s * 100.0).round() as u32, (l * 100.0).round() as u32)
 }
 
 /// A small square grab handle centred on `at` (in points).
@@ -1915,8 +2009,10 @@ impl eframe::App for Overlay {
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
         // Blur regions first: they act on the capture, below every other annotation.
+        // Redactions go last, as in the output.
         let mut used = HashSet::new();
-        for annotation in self.annotations.iter().filter(|a| a.kind == ShapeKind::Blur) {
+        for i in self.blur_order() {
+            let annotation = &self.annotations[i];
             let key = layer_key(annotation);
             if !self.blur_layers.contains_key(&key) {
                 if let Some((img, area)) = self.blurred(annotation) {
@@ -1962,8 +2058,7 @@ impl eframe::App for Overlay {
         }
         self.layers.retain(|key, _| used.contains(key));
 
-        // No dimming while picking a colour, so the screen shows the true colours.
-        let dim = if self.picking_color { Color32::TRANSPARENT } else { Color32::from_black_alpha(130) };
+        let dim = Color32::from_black_alpha(130);
         match self.selection {
             Some(sel_px) => {
                 let sel = rect_to_pt(sel_px);
@@ -2046,23 +2141,46 @@ impl eframe::App for Overlay {
             painter.line_segment(caret, Stroke::new(1.5, ACCENT));
         }
 
-        // The eyedropper's preview: the colour under the cursor, next to it.
+        // The eyedropper: a spotlight of the true, undimmed capture around the cursor
+        // (magnified while Shift is held) and the values of the colour under it.
         if self.picking_color {
             ctx.set_cursor_icon(CursorIcon::Crosshair);
             if let Some(p) = hover {
-                if let Some(color) = self.pixel_at(to_px(p)) {
-                    let centre = p + vec2(26.0, 26.0);
-                    painter.circle_filled(centre, 15.0, color);
-                    painter.circle_stroke(centre, 15.0, Stroke::new(2.0, Color32::WHITE));
-                    painter.circle_stroke(centre, 16.5, Stroke::new(1.0, Color32::from_black_alpha(160)));
-                    let hex = crate::settings::to_hex(color);
-                    label(&painter, centre + vec2(22.0, 0.0), Align2::LEFT_CENTER, hex, Color32::WHITE);
+                let px = to_px(p);
+                if let Some(color) = self.pixel_at(px) {
+                    // Desktop pixels per point inside the spotlight.
+                    let density = if mods.shift { 1.0 / SPOTLIGHT_ZOOM } else { scale };
+                    // Spotlight point to desktop pixel, and back.
+                    let to_desktop = |q: Pos2| px + (q - p) * density;
+                    let from_desktop = |d: Pos2| p + (d - px) / density;
+                    painter.circle_filled(p, SPOTLIGHT_RADIUS, Color32::BLACK);
+                    for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
+                        let area = Rect::from_min_max(from_desktop(m.min), from_desktop(m.max));
+                        if !area.expand(SPOTLIGHT_RADIUS).contains(p) {
+                            continue;
+                        }
+                        let uv = |q: Pos2| {
+                            let d = to_desktop(q);
+                            Pos2::new((d.x - m.min.x) / m.width(), (d.y - m.min.y) / m.height())
+                        };
+                        painter.with_clip_rect(area).add(spotlight_mesh(texture.id(), p, SPOTLIGHT_RADIUS, uv));
+                    }
+                    if mods.shift {
+                        // Outline the pixel that a click picks.
+                        let pixel = from_desktop(Pos2::new(px.x.floor(), px.y.floor()));
+                        let r = Rect::from_min_size(pixel, Vec2::splat(SPOTLIGHT_ZOOM));
+                        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
+                        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
+                    }
+                    painter.circle_stroke(p, SPOTLIGHT_RADIUS, Stroke::new(2.0, Color32::WHITE));
+                    painter.circle_stroke(p, SPOTLIGHT_RADIUS + 1.5, Stroke::new(1.0, Color32::from_black_alpha(160)));
+                    color_readout(&painter, p, SPOTLIGHT_RADIUS, color, screen);
                 }
             }
         }
 
         let hint = if self.picking_color {
-            "Click to pick a colour · Esc cancel"
+            "Click to pick a colour · hold Shift to magnify · Esc cancel"
         } else if self.editing.is_some() {
             "Type · Enter new line · arrows move · Esc or click outside to finish"
         } else if self.selection.is_none() {
@@ -2292,6 +2410,49 @@ mod tests {
             assert_eq!(out.get_pixel(x, y).0, [r, g, b, 255]);
         }
         assert_ne!(out.get_pixel(51, 20).0, [r, g, b, 255]); // desktop x 61: outside
+    }
+
+    #[test]
+    fn hsl_values() {
+        assert_eq!(hsl(Color32::from_rgb(0, 0, 0)), (0, 0, 0));
+        assert_eq!(hsl(Color32::from_rgb(255, 255, 255)), (0, 0, 100));
+        assert_eq!(hsl(Color32::from_rgb(255, 0, 0)), (0, 100, 50));
+        assert_eq!(hsl(Color32::from_rgb(0, 255, 0)), (120, 100, 50));
+        assert_eq!(hsl(Color32::from_rgb(0, 0, 255)), (240, 100, 50));
+        assert_eq!(hsl(Color32::from_rgb(255, 0, 128)), (330, 100, 50));
+        assert_eq!(hsl(Color32::from_rgb(0x33, 0x66, 0x99)), (210, 50, 40));
+    }
+
+    #[test]
+    fn redactions_stay_solid_under_later_blurs() {
+        let shot = RgbaImage::from_fn(100, 60, |x, _| {
+            if x % 2 == 0 { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
+        });
+        let mut overlay = plain_overlay(100, 60, shot);
+        overlay.selection = Some(rect(0.0, 0.0, 100.0, 60.0));
+        overlay.set_tool(Tool::Shape(ShapeKind::Blur));
+        // A redaction, then a pixelate and a Gaussian region drawn over part of it.
+        for (effect, from, to) in [
+            (Effect::Redact, Pos2::new(10.0, 10.0), Pos2::new(50.0, 50.0)),
+            (Effect::Pixelate, Pos2::new(30.0, 20.0), Pos2::new(80.0, 40.0)),
+            (Effect::Gaussian, Pos2::new(5.0, 5.0), Pos2::new(25.0, 25.0)),
+        ] {
+            overlay.effect = effect;
+            overlay.begin_action(Action::NewShape { anchor: from });
+            overlay.apply_action(to, Modifiers::NONE, overlay.bounds());
+            overlay.end_action();
+        }
+        assert_eq!(overlay.annotations.len(), 3);
+        assert_eq!(overlay.annotations[0].effect, Effect::Redact);
+        let out = overlay.output().unwrap();
+        for y in 10..50 {
+            for x in 10..50 {
+                assert_eq!(out.get_pixel(x, y).0, [0, 0, 0, 255], "({x}, {y})");
+            }
+        }
+        // The pixelate region still applies outside the redaction.
+        let outside = out.get_pixel(60, 30).0;
+        assert!((100..=155).contains(&outside[0]), "{outside:?}");
     }
 
     #[test]
