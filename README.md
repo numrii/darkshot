@@ -46,6 +46,16 @@ register.
 - Ctrl+A selects the whole monitor under the cursor.
 - Ctrl+C or Enter copies, Ctrl+S saves, Esc cancels.
 
+### Editing an existing image
+
+Open a PNG or JPEG in the same editor: drag it onto `darkshot.exe`, run
+`darkshot.exe picture.png`, or choose Open image… in the tray menu. Edit clipboard image
+in the tray menu opens whatever image is on the clipboard. The whole image starts
+selected; crop it by resizing the region, and Ctrl+A selects all of it again. Save
+suggests the original name with `-edited` added, in the same folder and format. A
+large image is shown scaled down to fit the screen, but annotations, copies and saves
+are in its own pixels. Photos are turned the right way up from their camera data.
+
 ### Annotating
 
 | Key | Tool |

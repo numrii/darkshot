@@ -110,7 +110,7 @@ pub fn read(kind: Kind, img: &RgbaImage, as_is: bool) -> Outcome {
 
 /// The text in `img`, read the way up it is.
 pub fn text_as_is(img: &RgbaImage) -> Outcome {
-    outcome(ocr::recognize(img))
+    outcome(ocr::recognize_any_size(img))
 }
 
 /// The text in `img`, one line per line of text, or why there is none. Text that is
@@ -278,7 +278,7 @@ impl Turn {
 /// as a7f3k9q2, say) is then still read as it is, not swapped for gibberish that
 /// happens to look like words.
 fn any_way_up(img: &RgbaImage) -> windows::core::Result<Option<Vec<Line>>> {
-    let Some(upright) = ocr::recognize(img)? else { return Ok(None) };
+    let Some(upright) = ocr::recognize_any_size(img)? else { return Ok(None) };
     let score = plausibility(&upright);
     if plausible_at_least(score, 85) && score.1 >= 20 {
         return Ok(Some(upright));
@@ -375,9 +375,35 @@ mod ocr {
     /// keeps a whole screen quick.
     const UPSCALE_UP_TO: u32 = 2_500_000;
 
+    /// Sizes to read at again, relative to the usual one, when nothing is found.
+    /// Windows' recognition misses some text at particular sizes, short codes without
+    /// a word in them most of all, and reads it at another, with no pattern to which:
+    /// "a7f3k9q2" drawn at 24 px read at 0.3, 0.4, 1.1, 1.7 and 1.9 times the usual
+    /// size, and at none between. Small nudges rescued most misses tried: 1.1 alone
+    /// six of seven, 1.4 the last.
+    const OTHER_SIZES: [f32; 4] = [1.1, 1.4, 1.7, 0.7];
+
+    /// The recognised lines, as [`recognize`] gives them, read again at other sizes
+    /// while nothing is found.
+    pub fn recognize_any_size(img: &RgbaImage) -> windows::core::Result<Option<Vec<super::Line>>> {
+        let mut lines = recognize(img)?;
+        for size in OTHER_SIZES {
+            match &lines {
+                Some(found) if found.iter().all(|l| l.text.trim().is_empty()) => lines = recognize_at(img, size)?,
+                _ => break,
+            }
+        }
+        Ok(lines)
+    }
+
     /// The recognised lines, or `None` when Windows has no recognition for any of the
     /// user's languages.
     pub fn recognize(img: &RgbaImage) -> windows::core::Result<Option<Vec<super::Line>>> {
+        recognize_at(img, 1.0)
+    }
+
+    /// As [`recognize`], with the image read at `size` times the usual size.
+    fn recognize_at(img: &RgbaImage, size: f32) -> windows::core::Result<Option<Vec<super::Line>>> {
         let Ok(engine) = OcrEngine::TryCreateFromUserProfileLanguages() else { return Ok(None) };
         let max = OcrEngine::MaxImageDimension()?;
         let (w, h) = img.dimensions();
@@ -385,7 +411,8 @@ mod ocr {
             return Ok(Some(Vec::new()));
         }
         // Shrunk only if Windows' size limit demands it.
-        let factor = if w * h <= UPSCALE_UP_TO && w.max(h) * 2 <= max { 2.0 } else { (max as f32 / w.max(h) as f32).min(1.0) };
+        let usual = if w * h <= UPSCALE_UP_TO && w.max(h) * 2 <= max { 2.0 } else { 1.0 };
+        let factor = (usual * size).min(max as f32 / w.max(h) as f32);
         let scaled;
         let img = if factor == 1.0 {
             img
@@ -630,6 +657,24 @@ Blueberry muffin 3.25"),
         let hash = written("REF a7f3k9q2", 24.0);
         let as_is = joined(&ocr::recognize(&hash).unwrap().unwrap());
         assert_eq!(text(&hash).map(|l| joined(&l)), Ok(as_is));
+    }
+
+    /// Short codes without a word in them, which Windows misses at some sizes, are
+    /// read at another.
+    #[test]
+    fn reads_lone_codes_at_any_size() {
+        let mut img = written("a7f3k9q2", 24.0);
+        if let Err(e) = text(&img) {
+            if e.starts_with("Text recognition is not") {
+                return eprintln!("skipped: {e}");
+            }
+        }
+        let cases = [("a7f3k9q2", 12.0), ("a7f3k9q2", 18.0), ("a7f3k9q2", 24.0), ("zz91ab", 12.0), ("zz91ab", 22.0), ("3f2a9c", 16.0), ("q8w7e6r5", 12.0)];
+        for (code, size) in cases {
+            img = written(code, size);
+            assert_eq!(text(&img).map(|l| joined(&l)), Ok(code.to_owned()), "{code} at {size}px");
+            assert_eq!(read(Kind::Text, &img, true).map(|l| joined(&l)), Ok(code.to_owned()), "{code} at {size}px as is");
+        }
     }
 
     #[test]

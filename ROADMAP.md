@@ -11,12 +11,9 @@ capture contains or how long it is kept.
 - Try HDR capture on a real HDR display: colours and brightness should match the screen,
   not look washed out. Not yet possible here.
 
-- Edit an existing image: open the clipboard image (tray menu, optional shortcut) or a
-  file (tray menu, dragging it onto the exe, or `darkshot.exe picture.png`) in the
-  overlay with the whole image selected. Window snapping is off; Save suggests the
-  original name plus `-edited`. Images larger than the monitor are shown scaled to fit,
-  with annotations kept in image pixels; zoom and pan can come later. "Open with" in
-  Explorer needs the registry, so only the personal build would offer it.
+- Editing an existing image, later additions: a shortcut for Edit clipboard image;
+  zoom and pan for large images; "Open with" in Explorer (needs the registry, so only
+  the personal build would offer it).
 - Reopen last capture (opt-in): when the overlay closes, it hands its capture,
   selection and annotations to the tray process, which keeps them in memory only
   (never on disk), drops them after a set time or on the next capture, and can reopen
@@ -28,6 +25,14 @@ for or downloading updates (that needs network code, which Darkshot has none of)
 
 ## Done
 
+- Edit an existing image: a PNG or JPEG (dragged onto the exe, `darkshot.exe
+  picture.png`, or Open image… in the tray menu) or the clipboard image (Edit clipboard
+  image) opens in the overlay with the whole image selected. No window snapping; Save
+  suggests the original name plus `-edited`, in its folder and format. Large images are
+  shown scaled to fit, with annotations, copies and saves in image pixels. Photos are
+  turned upright from their EXIF orientation.
+- Copy text reads again at a few other sizes when Windows finds nothing: its
+  recognition misses some short codes at particular sizes and reads them at others.
 - Copy text (O) and Read QR code (Q): read the region's text with Windows' built-in
   offline OCR (`Windows.Media.Ocr`), or decode its QR codes locally (`rqrr`). Results
   show in an editable panel; each line or code is outlined on the capture and can be

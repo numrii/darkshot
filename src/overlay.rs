@@ -79,14 +79,46 @@ fn trace(what: &str) {
 }
 
 /// Capture all monitors and run the overlay until the user copies, saves or cancels.
-pub fn run() -> AnyResult<()> {
+/// What the overlay opens with.
+pub enum Source {
+    /// A capture of the screen, taken now.
+    Capture,
+    /// An image file to edit; `None` asks which one.
+    File(Option<std::path::PathBuf>),
+    /// The image on the clipboard, to edit.
+    Clipboard,
+}
+
+pub fn run(source: Source) -> AnyResult<()> {
     // Must happen first: without it Windows reports scaled, not physical, coordinates.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
     // Grab the screen before our own window exists so the overlay is never in the shot.
     trace("start");
     let settings = Settings::load();
-    let desktop = Desktop::capture(settings.include_cursor)?;
+    let desktop = match source {
+        Source::Capture => Desktop::capture(settings.include_cursor)?,
+        Source::File(path) => {
+            let path = path.or_else(|| {
+                rfd::FileDialog::new()
+                    .set_title("Open an image to edit")
+                    .add_filter("Images", &["png", "jpg", "jpeg"])
+                    .pick_file()
+            });
+            let Some(path) = path else { return Ok(()) };
+            match open_file(&path) {
+                Ok(desktop) => desktop,
+                Err(e) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    return complain(&format!("Could not open {name}.\n\n{e}"));
+                }
+            }
+        }
+        Source::Clipboard => match clipboard_image() {
+            Some(img) => Desktop::open(img, Opened::default()),
+            None => return complain("There is no image on the clipboard to edit."),
+        },
+    };
     trace("captured");
 
     // Create the window at its final size. If it were created small and resized
@@ -135,7 +167,74 @@ pub fn run() -> AnyResult<()> {
     Ok(())
 }
 
-/// A frozen capture of the whole virtual desktop.
+/// Tell the user why there is nothing to show, and stop.
+fn complain(message: &str) -> AnyResult<()> {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Darkshot")
+        .set_description(message)
+        .show();
+    Ok(())
+}
+
+/// An image file to edit, the right way up: photos taken with the camera turned say
+/// so in their EXIF data rather than in their pixels.
+fn open_file(path: &std::path::Path) -> AnyResult<Desktop> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let unreadable = |e: image::ImageError| -> Box<dyn std::error::Error> {
+        match e {
+            image::ImageError::Unsupported(_) | image::ImageError::Decoding(_) => {
+                "Darkshot opens PNG and JPEG images, and could not read this file as either.".into()
+            }
+            e => e.into(),
+        }
+    };
+    let mut decoder = reader.into_decoder().map_err(unreadable)?;
+    let orientation = decoder.orientation()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(unreadable)?;
+    img.apply_orientation(orientation);
+    let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+    let opened = Opened {
+        stem: path.file_stem().map(|s| s.to_string_lossy().into_owned()),
+        folder: path.parent().map(std::path::Path::to_path_buf),
+        format: match extension.as_deref() {
+            Some("png") => Some(Format::Png),
+            Some("jpg" | "jpeg") => Some(Format::Jpeg),
+            _ => None,
+        },
+    };
+    Ok(Desktop::open(img.to_rgba8(), opened))
+}
+
+/// The image on the clipboard, if there is one.
+fn clipboard_image() -> Option<RgbaImage> {
+    let data = arboard::Clipboard::new().ok()?.get_image().ok()?;
+    RgbaImage::from_raw(data.width as u32, data.height as u32, data.bytes.into_owned())
+}
+
+/// Where an opened image came from, for saving it again.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Opened {
+    /// Its file name without extension.
+    stem: Option<String>,
+    folder: Option<std::path::PathBuf>,
+    /// Its format, to save it in the same one.
+    format: Option<Format>,
+}
+
+/// An image opened for editing, on a monitor `screen` pixels in size: the pixel space
+/// the overlay works in, and where the image sits in it. The space has the monitor's
+/// shape, enlarged when the image does not fit with room round it for the toolbar, so
+/// a large image is shown scaled down while staying in its own pixels.
+fn place_image(image: Vec2, screen: Vec2) -> (Vec2, Rect) {
+    let k = 1f32.max(image.x / (screen.x * 0.9)).max(image.y / (screen.y * 0.85));
+    let space = (screen * k).ceil();
+    let at = ((space - image) / 2.0).floor().to_pos2();
+    (space, Rect::from_min_size(at, image))
+}
+
+/// A frozen capture of the whole virtual desktop, or an image opened for editing.
 struct Desktop {
     /// One capture per monitor, in physical pixels. Kept separate (never composited
     /// up front) so opening the overlay stays fast on large multi-monitor desktops.
@@ -149,6 +248,15 @@ struct Desktop {
     home: usize,
     /// The windows on screen at capture time, for Ctrl-snapping.
     snap: Snap,
+    /// The areas the toolbar, popups and hints are kept in, in desktop pixels: the
+    /// monitors. For an opened image `monitors` is just the image; this is the screen.
+    screens: Vec<Rect>,
+    /// The size of the space desktop pixels are in: the virtual desktop, or for an
+    /// opened image, its monitor enlarged as needed to fit it (see `place_image`).
+    /// `bounds` is where the window goes on screen.
+    space: Vec2,
+    /// Where an opened image came from; `None` for a capture.
+    opened: Option<Opened>,
 }
 
 impl Desktop {
@@ -201,9 +309,58 @@ impl Desktop {
             shots: shots.into_iter().map(|s| s.2).collect(),
             bounds: RECT { left, top, right, bottom },
             snap: Snap::new(snap::visible_windows(left, top), &monitors),
+            screens: monitors.clone(),
+            space: vec2((right - left) as f32, (bottom - top) as f32),
             monitors,
             home,
+            opened: None,
         })
+    }
+
+    /// `img` opened for editing on the monitor under the mouse pointer.
+    fn open(img: RgbaImage, opened: Opened) -> Self {
+        use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        let mut cursor = POINT { x: 0, y: 0 };
+        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        unsafe {
+            GetCursorPos(&mut cursor);
+            GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mut info);
+        }
+        Self::open_on(img, opened, info.rcMonitor)
+    }
+
+    /// `img` opened for editing on the monitor at `monitor` (screen pixels).
+    fn open_on(img: RgbaImage, opened: Opened, monitor: RECT) -> Self {
+        let screen = vec2((monitor.right - monitor.left) as f32, (monitor.bottom - monitor.top) as f32);
+        let (space, image) = place_image(vec2(img.width() as f32, img.height() as f32), screen);
+        Self {
+            shots: vec![img],
+            bounds: monitor,
+            monitors: vec![image],
+            home: 0,
+            // No windows to snap to: they are not in the picture.
+            snap: Snap::default(),
+            screens: vec![Rect::from_min_size(Pos2::ZERO, space)],
+            space,
+            opened: Some(opened),
+        }
+    }
+
+    /// For tests: a capture of these monitors.
+    #[cfg(test)]
+    fn new(shots: Vec<RgbaImage>, bounds: RECT, monitors: Vec<Rect>, home: usize, snap: Snap) -> Self {
+        let space = vec2((bounds.right - bounds.left) as f32, (bounds.bottom - bounds.top) as f32);
+        Self { shots, bounds, screens: monitors.clone(), monitors, home, snap, space, opened: None }
+    }
+
+    /// What Ctrl+A selects with the pointer on screen `i`: that monitor, or the whole
+    /// opened image.
+    fn whole(&self, i: usize) -> Rect {
+        match self.opened {
+            Some(_) => self.monitors[0],
+            None => self.screens[i.min(self.screens.len() - 1)],
+        }
     }
 }
 
@@ -901,6 +1058,16 @@ struct ToolbarOutput {
 impl Overlay {
     fn with_desktop(desktop: Desktop, hwnd: Option<HWND>, settings: &Settings) -> Self {
         let swatches = settings.swatch_colors();
+        // An opened image starts selected, and saves next to itself as "name-edited".
+        let mut save_options = SaveOptions::from_settings(settings);
+        let selection = desktop.opened.as_ref().map(|_| desktop.monitors[0]);
+        if let Some(opened) = &desktop.opened {
+            if let Some(stem) = &opened.stem {
+                save_options.name = format!("{stem}-edited");
+            }
+            save_options.folder = opened.folder.clone().or(save_options.folder);
+            save_options.format = opened.format.unwrap_or(save_options.format);
+        }
         Self {
             swatches,
             mods: Modifiers::NONE,
@@ -912,7 +1079,7 @@ impl Overlay {
             smooth_textures: Vec::new(),
             rotation: Rotation::NONE,
             hwnd,
-            selection: None,
+            selection,
             action: None,
             pending_undo: None,
             tool: Tool::Select,
@@ -935,7 +1102,7 @@ impl Overlay {
             picking_color: false,
             ignore_drag: false,
             save_open: false,
-            save_options: SaveOptions::from_settings(settings),
+            save_options,
             border_on: settings.frame.border,
             border: settings.border(),
             border_unset: !settings.frame.border,
@@ -1001,11 +1168,7 @@ impl Overlay {
     }
 
     fn bounds(&self) -> Rect {
-        let b = self.desktop.bounds;
-        Rect::from_min_size(
-            Pos2::ZERO,
-            vec2((b.right - b.left) as f32, (b.bottom - b.top) as f32),
-        )
+        Rect::from_min_size(Pos2::ZERO, self.desktop.space)
     }
 
     /// Where the round handle that turns the capture is, in desktop pixels: above the
@@ -2311,7 +2474,7 @@ impl eframe::App for Overlay {
     /// leaves it.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         let viewport = raw.screen_rect.unwrap_or_else(|| ctx.viewport_rect());
-        if viewport.width() <= 0.0 || self.desktop.monitors.is_empty() {
+        if viewport.width() <= 0.0 || self.desktop.screens.is_empty() {
             return;
         }
         let scale = self.bounds().width() / viewport.width();
@@ -2321,11 +2484,11 @@ impl eframe::App for Overlay {
         });
         if let Some(p) = pointer.filter(|_| !egui::Popup::is_any_open(ctx)) {
             let px = ((p - viewport.min) * scale).to_pos2();
-            if let Some(i) = self.desktop.monitors.iter().position(|m| m.contains(px)) {
+            if let Some(i) = self.desktop.screens.iter().position(|m| m.contains(px)) {
                 self.ui_monitor = i;
             }
         }
-        let m = self.desktop.monitors[self.ui_monitor.min(self.desktop.monitors.len() - 1)];
+        let m = self.desktop.screens[self.ui_monitor.min(self.desktop.screens.len() - 1)];
         let (min, max) = (viewport.min + m.min.to_vec2() / scale, viewport.min + m.max.to_vec2() / scale);
         raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
             left: (min.x - viewport.left()).max(0.0),
@@ -2371,6 +2534,8 @@ impl eframe::App for Overlay {
             }
         }
         if self.rotation.is_none() {
+            // Round an opened image, and in gaps between monitors of different sizes.
+            painter.rect_filled(screen, 0.0, Color32::from_gray(24));
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
                 painter.image(texture.id(), rect_to_pt(*m), uv, Color32::WHITE);
@@ -2400,7 +2565,7 @@ impl eframe::App for Overlay {
         self.mods = mods;
         if let Some(i) = hover.and_then(|p| {
             let p = to_px(p);
-            self.desktop.monitors.iter().position(|m| m.contains(p))
+            self.desktop.screens.iter().position(|m| m.contains(p))
         }) {
             self.current_monitor = i;
         }
@@ -2625,7 +2790,7 @@ impl eframe::App for Overlay {
             } else if keys.delete {
                 self.delete_selected();
             } else if keys.select_all {
-                self.selection = Some(self.desktop.monitors[self.current_monitor]);
+                self.selection = Some(self.desktop.whole(self.current_monitor));
             } else if keys.nudge != Vec2::ZERO {
                 // Arrows move the selected annotation if there is one, else the region.
                 if let Some(index) = self.selected {
@@ -2677,11 +2842,11 @@ impl eframe::App for Overlay {
             let corner = sel_px.max - vec2(1.0, 1.0);
             let monitor = self
                 .desktop
-                .monitors
+                .screens
                 .iter()
                 .find(|m| m.contains(corner))
                 .copied()
-                .unwrap_or(self.desktop.monitors[self.current_monitor]);
+                .unwrap_or(self.desktop.screens[self.current_monitor]);
             let monitor = rect_to_pt(monitor);
             let (pos, pivot) = if monitor.bottom() - sel.bottom() > 48.0 {
                 (sel.right_bottom() + vec2(0.0, 8.0), Align2::RIGHT_TOP)
@@ -2956,7 +3121,7 @@ impl eframe::App for Overlay {
         } else {
             "V select · R rect · E ellipse · L line · A arrow · P pen · M marker · T text · B blur · Shift constrain/straight · Ctrl+Z undo"
         };
-        let monitor = self.desktop.monitors[self.current_monitor];
+        let monitor = self.desktop.screens[self.current_monitor];
         let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);
         label(&painter, bottom, Align2::CENTER_BOTTOM, hint.to_owned(), Color32::WHITE);
         if let Some(err) = &self.error {
@@ -2972,7 +3137,7 @@ impl eframe::App for Overlay {
             self.finish_editing();
         }
         if self.confirm_open {
-            let monitor = rect_to_pt(self.desktop.monitors[self.current_monitor]);
+            let monitor = rect_to_pt(self.desktop.screens[self.current_monitor]);
             match self.confirm_panel(&ctx, monitor) {
                 Some(true) => discard = true,
                 Some(false) => self.confirm_open = false,
@@ -3061,13 +3226,13 @@ mod tests {
 
     #[test]
     fn highlighter_keeps_its_own_colour_and_width() {
-        let desktop = Desktop {
-            shots: vec![RgbaImage::new(4, 4)],
-            bounds: RECT { left: 0, top: 0, right: 4, bottom: 4 },
-            monitors: vec![rect(0.0, 0.0, 4.0, 4.0)],
-            home: 0,
-            snap: Snap::default(),
-        };
+        let desktop = Desktop::new(
+            vec![RgbaImage::new(4, 4)],
+            RECT { left: 0, top: 0, right: 4, bottom: 4 },
+            vec![rect(0.0, 0.0, 4.0, 4.0)],
+            0,
+            Snap::default(),
+        );
         let mut overlay = Overlay::with_desktop(desktop, None, &Settings::default());
         let marker = Tool::Shape(ShapeKind::Marker);
         let rect_tool = Tool::Shape(ShapeKind::Rect);
@@ -3090,14 +3255,65 @@ mod tests {
     }
 
     fn plain_overlay(w: u32, h: u32, shot: RgbaImage) -> Overlay {
-        let desktop = Desktop {
-            shots: vec![shot],
-            bounds: RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
-            monitors: vec![rect(0.0, 0.0, w as f32, h as f32)],
-            home: 0,
-            snap: Snap::default(),
-        };
+        let desktop = Desktop::new(
+            vec![shot],
+            RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+            vec![rect(0.0, 0.0, w as f32, h as f32)],
+            0,
+            Snap::default(),
+        );
         Overlay::with_desktop(desktop, None, &Settings::default())
+    }
+
+    #[test]
+    fn large_images_are_placed_to_fit_in_their_own_pixels() {
+        // Small: at 1:1, centred, the space is the screen.
+        let (space, at) = place_image(vec2(800.0, 600.0), vec2(1920.0, 1080.0));
+        assert_eq!(space, vec2(1920.0, 1080.0));
+        assert_eq!(at, rect(560.0, 240.0, 1360.0, 840.0));
+        // A 4000 x 3000 photo: the space grows to fit it with room round it, so it
+        // shows scaled down, and it keeps every one of its pixels.
+        let (space, at) = place_image(vec2(4000.0, 3000.0), vec2(1920.0, 1080.0));
+        assert!((space.y * 0.85 - 3000.0).abs() < 1.0 && (space.x / space.y - 1920.0 / 1080.0).abs() < 1e-3, "{space:?}");
+        assert_eq!(at.size(), vec2(4000.0, 3000.0));
+        assert!(rect(0.0, 0.0, space.x, space.y).contains_rect(at));
+    }
+
+    #[test]
+    fn an_opened_image_starts_selected_and_saves_beside_itself() {
+        let photo = RgbaImage::from_fn(3000, 2000, |x, y| image::Rgba([(x % 251) as u8, (y % 241) as u8, 9, 255]));
+        let opened = Opened { stem: Some("receipt".into()), folder: Some(r"C:\photos".into()), format: Some(Format::Jpeg) };
+        let monitor = RECT { left: 1920, top: 0, right: 3840, bottom: 1080 };
+        let overlay = Overlay::with_desktop(Desktop::open_on(photo.clone(), opened, monitor), None, &Settings::default());
+        // The whole image is selected, and copied or saved at its own size.
+        assert_eq!(overlay.selection, Some(overlay.desktop.monitors[0]));
+        assert_eq!(overlay.output().unwrap(), photo);
+        assert_eq!(overlay.save_options.file_name(), "receipt-edited.jpg");
+        assert_eq!(overlay.save_options.folder.as_deref(), Some(std::path::Path::new(r"C:\photos")));
+        // The window covers just that monitor; Ctrl+A selects the image, not the screen.
+        assert_eq!((overlay.desktop.bounds.left, overlay.desktop.bounds.right), (1920, 3840));
+        assert_eq!(overlay.desktop.whole(0), overlay.desktop.monitors[0]);
+    }
+
+    #[test]
+    fn opens_image_files() {
+        let dir = std::env::temp_dir().join(format!("darkshot-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        let img = RgbaImage::from_fn(30, 20, |x, y| image::Rgba([x as u8 * 8, y as u8 * 12, 200, 255]));
+        img.save(&png).unwrap();
+        let desktop = open_file(&png).unwrap();
+        assert_eq!(desktop.shots[0], img);
+        assert_eq!(
+            desktop.opened,
+            Some(Opened { stem: Some("shot".into()), folder: Some(dir.clone()), format: Some(Format::Png) })
+        );
+        // Not an image: says which formats it opens.
+        let text = dir.join("notes.png");
+        std::fs::write(&text, "not a picture").unwrap();
+        let error = open_file(&text).err().unwrap().to_string();
+        assert!(error.contains("PNG and JPEG"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3270,13 +3486,13 @@ mod tests {
         let mut settings = Settings::default();
         settings.set_tool_enabled("blur", false);
         settings.set_tool_enabled("eyedropper", false);
-        let desktop = Desktop {
-            shots: vec![RgbaImage::new(10, 10)],
-            bounds: RECT { left: 0, top: 0, right: 10, bottom: 10 },
-            monitors: vec![rect(0.0, 0.0, 10.0, 10.0)],
-            home: 0,
-            snap: Snap::default(),
-        };
+        let desktop = Desktop::new(
+            vec![RgbaImage::new(10, 10)],
+            RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            vec![rect(0.0, 0.0, 10.0, 10.0)],
+            0,
+            Snap::default(),
+        );
         let overlay = Overlay::with_desktop(desktop, None, &settings);
         let ids: Vec<&str> = overlay.tools.iter().map(|t| t.id).collect();
         assert_eq!(ids.len(), TOOLS.len() - 2);
@@ -3350,13 +3566,13 @@ mod tests {
             overlay.apply_action(Pos2::new(60.0, 40.0), Modifiers::NONE, overlay.bounds());
             overlay.end_action();
         };
-        let desktop = || Desktop {
-            shots: vec![RgbaImage::new(100, 60)],
-            bounds: RECT { left: 0, top: 0, right: 100, bottom: 60 },
-            monitors: vec![rect(0.0, 0.0, 100.0, 60.0)],
-            home: 0,
-            snap: Snap::default(),
-        };
+        let desktop = || Desktop::new(
+            vec![RgbaImage::new(100, 60)],
+            RECT { left: 0, top: 0, right: 100, bottom: 60 },
+            vec![rect(0.0, 0.0, 100.0, 60.0)],
+            0,
+            Snap::default(),
+        );
 
         // Off by default: Esc closes at once, annotations or not.
         let mut overlay = Overlay::with_desktop(desktop(), None, &settings);
@@ -3384,13 +3600,13 @@ mod tests {
         settings.frame.border = true;
         settings.frame.border_width = 3;
         settings.frame.border_color = "#FF0000".into();
-        let desktop = Desktop {
-            shots: vec![RgbaImage::from_pixel(100, 60, blue)],
-            bounds: RECT { left: 0, top: 0, right: 100, bottom: 60 },
-            monitors: vec![rect(0.0, 0.0, 100.0, 60.0)],
-            home: 0,
-            snap: Snap::default(),
-        };
+        let desktop = Desktop::new(
+            vec![RgbaImage::from_pixel(100, 60, blue)],
+            RECT { left: 0, top: 0, right: 100, bottom: 60 },
+            vec![rect(0.0, 0.0, 100.0, 60.0)],
+            0,
+            Snap::default(),
+        );
         let mut overlay = Overlay::with_desktop(desktop, None, &settings);
         overlay.selection = Some(rect(10.0, 10.0, 50.0, 30.0));
         let out = overlay.output().unwrap();
@@ -3541,13 +3757,13 @@ mod tests {
         // Two 4x4 monitors side by side: left is red, right is blue and sits 2 px lower.
         let solid = |c: [u8; 4]| RgbaImage::from_pixel(4, 4, image::Rgba(c));
         let mut overlay = Overlay::with_desktop(
-            Desktop {
-                shots: vec![solid([255, 0, 0, 255]), solid([0, 0, 255, 255])],
-                bounds: RECT { left: -4, top: 0, right: 4, bottom: 6 },
-                monitors: vec![rect(0.0, 0.0, 4.0, 4.0), rect(4.0, 2.0, 8.0, 6.0)],
-                home: 0,
-            snap: Snap::default(),
-            },
+            Desktop::new(
+                vec![solid([255, 0, 0, 255]), solid([0, 0, 255, 255])],
+                RECT { left: -4, top: 0, right: 4, bottom: 6 },
+                vec![rect(0.0, 0.0, 4.0, 4.0), rect(4.0, 2.0, 8.0, 6.0)],
+                0,
+                Snap::default(),
+            ),
             None,
             &Settings::default(),
         );

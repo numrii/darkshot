@@ -26,9 +26,12 @@ mod winkeys;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// `darkshot`            sits in the tray and waits for the hotkey.
-/// `darkshot --capture`  takes one capture right now and exits.
-/// `darkshot --settings` opens the settings window.
+/// `darkshot`              sits in the tray and waits for the hotkey.
+/// `darkshot --capture`    takes one capture right now and exits.
+/// `darkshot --settings`   opens the settings window.
+/// `darkshot picture.png`  opens an image to edit (also: dragging it onto the exe).
+/// `darkshot --open`       asks which image to edit.
+/// `darkshot --clipboard`  edits the image on the clipboard.
 /// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder
 /// (debug builds and builds with the `trace` feature only).
 fn main() -> AnyResult<()> {
@@ -39,10 +42,17 @@ fn main() -> AnyResult<()> {
     use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
     unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
 
-    if std::env::args().any(|a| a == "--capture") {
-        overlay::run()
-    } else if std::env::args().any(|a| a == "--settings") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let file = args.iter().find(|a| !a.starts_with("--")).map(std::path::PathBuf::from);
+    if flag("--capture") {
+        overlay::run(overlay::Source::Capture)
+    } else if flag("--settings") {
         settings_window::run()
+    } else if flag("--clipboard") {
+        overlay::run(overlay::Source::Clipboard)
+    } else if flag("--open") || file.is_some() {
+        overlay::run(overlay::Source::File(file))
     } else {
         daemon::run()
     }

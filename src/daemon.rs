@@ -23,6 +23,8 @@ use crate::AnyResult;
 
 const MENU_CAPTURE: &str = "capture";
 const MENU_SETTINGS: &str = "settings";
+const MENU_OPEN: &str = "open";
+const MENU_CLIPBOARD: &str = "clipboard";
 const MENU_QUIT: &str = "quit";
 
 /// Thread messages to the main thread, which owns the hotkey and the tray.
@@ -57,6 +59,9 @@ pub fn run() -> AnyResult<()> {
     let capture_item = MenuItem::with_id(MENU_CAPTURE, "Capture", true, None);
     let menu = Menu::with_items(&[
         &capture_item,
+        &MenuItem::with_id(MENU_OPEN, "Open image…", true, None),
+        &MenuItem::with_id(MENU_CLIPBOARD, "Edit clipboard image", true, None),
+        &PredefinedMenuItem::separator(),
         &MenuItem::with_id(MENU_SETTINGS, "Settings…", true, None),
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(MENU_QUIT, "Quit Darkshot", true, None),
@@ -86,6 +91,10 @@ pub fn run() -> AnyResult<()> {
             let post = |message| unsafe { PostThreadMessageW(main_thread, message, 0, 0) };
             if e.id == MENU_CAPTURE {
                 start_capture(&overlay);
+            } else if e.id == MENU_OPEN {
+                start_overlay(&overlay, "--open");
+            } else if e.id == MENU_CLIPBOARD {
+                start_overlay(&overlay, "--clipboard");
             } else if e.id == MENU_SETTINGS {
                 post(WM_OPEN_SETTINGS);
             } else if e.id == MENU_QUIT {
@@ -186,8 +195,14 @@ fn open_settings(main_thread: u32) -> bool {
     }
 }
 
-/// Launch the overlay as a child process, unless one is already on screen.
+/// Launch the overlay to capture the screen, unless one is already on screen.
 fn start_capture(overlay: &Mutex<Option<Child>>) {
+    start_overlay(overlay, "--capture");
+}
+
+/// Launch the overlay as a child process with `mode` (`--capture`, `--open` or
+/// `--clipboard`), unless one is already on screen.
+fn start_overlay(overlay: &Mutex<Option<Child>>, mode: &str) {
     let mut slot = overlay.lock().unwrap();
     if let Some(child) = slot.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
@@ -198,8 +213,8 @@ fn start_capture(overlay: &Mutex<Option<Child>>) {
         .and_then(|exe| {
             // Pass our own flags (such as `--trace`) on to the overlay.
             Command::new(exe)
-                .arg("--capture")
-                .args(std::env::args().skip(1).filter(|a| a != "--capture"))
+                .arg(mode)
+                .args(std::env::args().skip(1).filter(|a| a.starts_with("--") && !["--capture", "--open", "--clipboard"].contains(&a.as_str())))
                 .spawn()
         });
     match spawned {
