@@ -8,6 +8,9 @@ clipboard or a file on disk. There is no upload and no network code.
 Roughly smallest first. Everything stays offline, and opt-in where it changes what a
 capture contains or how long it is kept.
 
+- Try HDR capture on a real HDR display: colours and brightness should match the screen,
+  not look washed out. Not yet possible here.
+
 - Edit an existing image: open the clipboard image (tray menu, optional shortcut) or a
   file (tray menu, dragging it onto the exe, or `darkshot.exe picture.png`) in the
   overlay with the whole image selected. Window snapping is off; Save suggests the
@@ -31,6 +34,28 @@ for or downloading updates (that needs network code, which Darkshot has none of)
   clicked to copy only it (Shift+click for single words). Blurs and redactions apply
   before reading. Text goes to the clipboard kept out of history and cloud sync; links
   are never opened. Both can be switched off under Enabled tools.
+- Copied images go on the clipboard twice: as PNG with transparency (a drop shadow
+  keeps its soft edge in programs that read PNG) and as a bitmap on white for the rest.
+  Both are kept out of clipboard history and cloud sync; the clipboard library used
+  before did that for text but not for images.
+- The colour picker shows the same hue ring and saturation/value square in every tab
+  (the RGB and CMYK wheels went dark and grey with the colour). The border colour can
+  be see-through.
+- Turn the capture: a round handle above the region turns the captured screen under it,
+  so a photo at an angle (a receipt) can be straightened before annotating. Copy, save,
+  blur, Copy text and the eyedropper all see the straightened image. Turns freely,
+  Shift for 15° steps. Annotations stay put while the capture turns under them,
+  so it can be corrected after marking up; blur follows what is under it, live.
+  Right-click the handle to reset. Turned by hand, Copy text reads as it is, without
+  trying other ways up.
+- Read QR code reads styled codes (dots, colour, ornaments): when the plain read fails,
+  the region is tried as hard black and white and enlarged and softened. Moving,
+  resizing or turning with the reading panel open reads the region again.
+- Copy text reads text any way up: Windows straightens tilts itself (up to about 40°);
+  when the region reads as nothing or gibberish, it is read again turned a quarter, half
+  and three-quarter turn, and the reading that looks most like words is kept.
+- Version and a link to the GitHub repository in Settings. The link is opened by the
+  browser, only when clicked; Darkshot itself still connects to nothing.
 - Include the mouse cursor (a setting, off by default): the cursor is drawn into the
   capture where it was when the capture was asked for.
 - Ask before discarding (a setting, off by default): Esc or Close asks first when a

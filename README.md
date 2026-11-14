@@ -67,18 +67,32 @@ register.
 The mouse wheel changes thickness, font size, blur strength or step size. Ctrl+Z
 undoes, Ctrl+Y or Ctrl+Shift+Z redoes, and Delete removes the selected annotation.
 
+To straighten something photographed at an angle, such as a receipt, drag the round
+handle above the region before annotating: the capture turns under the region, which
+stays upright, and what you copy or save is the straightened image. It follows the
+pointer freely; Shift turns in 15° steps. Right-click the handle to put the capture
+back as it was taken.
+The handle stays after you start annotating, for small corrections: what you drew stays
+where it is, and blur regions blur whatever ends up under them, as shown while you turn.
+
 Copy text (O) and Read QR code (Q) show what they find in a panel, where you can edit
 it before copying. Each line of text, or each QR code, is outlined on the capture: click
-lines to copy only those, or Shift+click single words. Both work offline. Text
+lines to copy only those, or Shift+click single words. Text that is tilted, sideways or
+upside down is read too, which helps with photos of receipts. Both work offline. Text
 recognition is the one built into Windows, in the languages you have installed;
-anything you blurred or redacted is hidden from it too. A link in a QR code is copied
-as text and never opened.
+anything you blurred or redacted is hidden from it too. Styled QR codes, drawn with
+dots, colour or ornaments, are tried several more ways when the plain read fails. Moving
+or resizing the region, or turning the capture, with the panel open reads it again. A
+link in a QR code is copied as text and never opened. Once you have turned the capture
+by hand, Copy text takes the text to be the way up you put it and reads it as it is.
 
 The Decoration button in the toolbar adds a border, a drop shadow or both around the
 image when it is copied or saved. The border has its own colour, thickness and line
-style, and is shown around the region as you edit; the shadow appears only in the
-result. A PNG file keeps the shadow's margin transparent; the clipboard and JPEG files
-get it on white.
+style (its colour can be see-through), and is shown around the region as you edit;
+the shadow appears only in the result. A PNG file keeps the shadow's margin
+transparent, and a JPEG file has it on white. Copy puts both on the clipboard:
+programs that paste PNG (browsers, Office, chat apps, most image editors) get the
+transparent shadow, and the rest (Paint, older programs) get it on white.
 
 ### Settings
 
@@ -178,7 +192,11 @@ first time you save them, so the folder can be moved or copied as a whole.
 
 ### Security
 
-- No network code: nothing in Darkshot or its dependencies uploads or downloads.
+- No network code: nothing in Darkshot or its dependencies uploads or downloads. The one
+  link, to Darkshot's GitHub page in Settings, is opened by your browser, and only when
+  you click it; links found in QR codes are never opened.
+- Everything Darkshot copies, images and text, is kept out of Windows' clipboard
+  history (Win+V) and cloud clipboard sync: it lives only until the next copy.
 - Runs as the signed-in user. Its manifest never asks for administrator rights.
 - The exe carries version information naming its build (restrictive or personal), shown
   under Properties → Details.

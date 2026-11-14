@@ -97,13 +97,6 @@ pub struct Frame {
     pub shadow: bool,
 }
 
-impl Frame {
-    /// Nothing is added.
-    pub fn is_empty(&self) -> bool {
-        self.border.is_none() && !self.shadow
-    }
-}
-
 /// The margin on every side of an image with a shadow.
 const SHADOW_MARGIN: u32 = 28;
 /// How far the shadow sits below the image.

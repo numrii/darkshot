@@ -1,22 +1,23 @@
 //! Darkshot's colour picker: one popup used for every colour in the app.
 //!
-//! A wheel on top picks the hue, three tabs (RGB, HSV, CMYK) hold sliders for the
-//! exact values, and an alpha slider sits at the bottom. The colour being edited is
+//! A hue ring around a saturation and value square sits on top, the same in every
+//! tab; three tabs (RGB, HSV, CMYK) hold sliders for the exact values, and an alpha
+//! slider sits at the bottom. (Wheels drawn per model, an RGB hexagon at the current
+//! brightness or a CMYK disc at the current black, went dark and grey along with the
+//! colour, and took slider work to get out of.) The colour being edited is
 //! kept as hue, saturation, value and a separate alpha, so lowering alpha, or passing
 //! through black or grey, never loses the hue or brightness.
 
 use eframe::egui::{
-    self, Align2, Color32, FontId, Id, Key, Mesh, Modifiers, Pos2, Rect, Response, Sense, Stroke,
+    self, Color32, FontId, Id, Key, Mesh, Modifiers, Pos2, Rect, Response, Sense, Stroke,
     StrokeKind, Vec2, text::CCursorRange, vec2,
 };
-use std::f32::consts::{FRAC_PI_6, TAU};
+use std::f32::consts::TAU;
 
 use crate::icons::{self, Icon};
 
 /// Size of the wheel area.
 const WHEEL: f32 = 200.0;
-/// Radius of the RGB hexagon and the CMYK disc.
-const RADIUS: f32 = 84.0;
 /// The HSV tab's hue ring and the saturation/value square inside it.
 const RING_OUTER: f32 = 90.0;
 const RING_INNER: f32 = 72.0;
@@ -426,7 +427,7 @@ fn slider(
     changed
 }
 
-/// The wheel for the current tab, with a marker on the current colour.
+/// The hue ring and saturation/value square, with markers on the current colour.
 fn wheel(ui: &mut egui::Ui, state: &mut State) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(WHEEL), Sense::click_and_drag());
     let c = rect.center();
@@ -434,28 +435,16 @@ fn wheel(ui: &mut egui::Ui, state: &mut State) {
         if let Some(p) = response.interact_pointer_pos() {
             let d = p - c;
             let (r, angle) = (d.length(), angle_of(d));
-            match state.tab {
-                Tab::Rgb => {
-                    state.h = angle;
-                    state.s = (r / hex_edge(angle)).min(1.0);
-                }
-                Tab::Cmyk => {
-                    state.h = (angle + 0.5) % 1.0;
-                    state.s = (r / RADIUS).min(1.0);
-                }
-                Tab::Hsv => {
-                    let part = *state.drag.get_or_insert(if r >= RING_INNER - 4.0 {
-                        WheelPart::Ring
-                    } else {
-                        WheelPart::Square
-                    });
-                    match part {
-                        WheelPart::Ring => state.h = angle,
-                        WheelPart::Square => {
-                            state.s = ((d.x + SQUARE / 2.0) / SQUARE).clamp(0.0, 1.0);
-                            state.v = 1.0 - ((d.y + SQUARE / 2.0) / SQUARE).clamp(0.0, 1.0);
-                        }
-                    }
+            let part = *state.drag.get_or_insert(if r >= RING_INNER - 4.0 {
+                WheelPart::Ring
+            } else {
+                WheelPart::Square
+            });
+            match part {
+                WheelPart::Ring => state.h = angle,
+                WheelPart::Square => {
+                    state.s = ((d.x + SQUARE / 2.0) / SQUARE).clamp(0.0, 1.0);
+                    state.v = 1.0 - ((d.y + SQUARE / 2.0) / SQUARE).clamp(0.0, 1.0);
                 }
             }
         }
@@ -468,101 +457,39 @@ fn wheel(ui: &mut egui::Ui, state: &mut State) {
 
     let painter = ui.painter();
     let at = |angle: f32, r: f32| c + vec2((angle * TAU).sin(), -(angle * TAU).cos()) * r;
-    let label_color = ui.visuals().weak_text_color();
-    let label = |text: &str, angle: f32| {
-        painter.text(
-            at(angle, RADIUS + 9.0),
-            Align2::CENTER_CENTER,
-            text,
-            FontId::proportional(12.0),
-            label_color,
-        );
-    };
     let mut mesh = Mesh::default();
-    let marker;
-    match state.tab {
-        Tab::Rgb => {
-            // The RGB cube seen from white down to black: a hexagon with the primaries
-            // and secondaries on its corners. Colour runs linearly along each triangle,
-            // so six triangles draw it exactly.
-            mesh.colored_vertex(c, rgb_color(hsv_to_rgb(0.0, 0.0, state.v), 255));
-            for i in 0..6 {
-                let hue = i as f32 / 6.0;
-                mesh.colored_vertex(
-                    at(hue, RADIUS),
-                    rgb_color(hsv_to_rgb(hue, 1.0, state.v), 255),
-                );
-                mesh.add_triangle(0, 1 + i, 1 + (i + 1) % 6);
+    // A hue ring around a square of saturation (across) and value (down).
+    const SEGMENTS: u32 = 96;
+    for seg in 0..SEGMENTS {
+        let angle = seg as f32 / SEGMENTS as f32;
+        let color = rgb_color(hsv_to_rgb(angle, 1.0, 1.0), 255);
+        mesh.colored_vertex(at(angle, RING_INNER), color);
+        mesh.colored_vertex(at(angle, RING_OUTER), color);
+        let (n, next) = (seg * 2, ((seg + 1) % SEGMENTS) * 2);
+        mesh.add_triangle(n, n + 1, next);
+        mesh.add_triangle(n + 1, next + 1, next);
+    }
+    const CELLS: u32 = 12;
+    let base = mesh.vertices.len() as u32;
+    let corner = c - Vec2::splat(SQUARE / 2.0);
+    for y in 0..=CELLS {
+        for x in 0..=CELLS {
+            let (s, t) = (x as f32 / CELLS as f32, y as f32 / CELLS as f32);
+            mesh.colored_vertex(
+                corner + vec2(s, t) * SQUARE,
+                rgb_color(hsv_to_rgb(state.h, s, 1.0 - t), 255),
+            );
+            if x > 0 && y > 0 {
+                let i = base + y * (CELLS + 1) + x;
+                let (up, left) = (i - CELLS - 1, i - 1);
+                mesh.add_triangle(up - 1, up, left);
+                mesh.add_triangle(up, i, left);
             }
-            painter.add(mesh);
-            for (i, name) in ["R", "Y", "G", "C", "B", "M"].into_iter().enumerate() {
-                label(name, i as f32 / 6.0);
-            }
-            marker = at(state.h, state.s * hex_edge(state.h));
-        }
-        Tab::Cmyk => {
-            // Inks at 120° steps, cyan on top, darkened by the current black.
-            let k = rgb_to_cmyk(state.rgb())[3];
-            const SEGMENTS: u32 = 72;
-            const RINGS: u32 = 6;
-            for ring in 0..=RINGS {
-                let s = ring as f32 / RINGS as f32;
-                for seg in 0..SEGMENTS {
-                    let angle = seg as f32 / SEGMENTS as f32;
-                    let rgb = hsv_to_rgb((angle + 0.5) % 1.0, s, 1.0).map(|x| x * (1.0 - k));
-                    mesh.colored_vertex(at(angle, s * RADIUS), rgb_color(rgb, 255));
-                    if ring > 0 {
-                        let (here, next) = (
-                            ring * SEGMENTS + seg,
-                            ring * SEGMENTS + (seg + 1) % SEGMENTS,
-                        );
-                        mesh.add_triangle(here - SEGMENTS, next - SEGMENTS, here);
-                        mesh.add_triangle(next - SEGMENTS, next, here);
-                    }
-                }
-            }
-            painter.add(mesh);
-            for (i, name) in ["C", "M", "Y"].into_iter().enumerate() {
-                label(name, i as f32 / 3.0);
-            }
-            marker = at((state.h + 0.5) % 1.0, state.s * RADIUS);
-        }
-        Tab::Hsv => {
-            // A hue ring around a square of saturation (across) and value (down).
-            const SEGMENTS: u32 = 96;
-            for seg in 0..SEGMENTS {
-                let angle = seg as f32 / SEGMENTS as f32;
-                let color = rgb_color(hsv_to_rgb(angle, 1.0, 1.0), 255);
-                mesh.colored_vertex(at(angle, RING_INNER), color);
-                mesh.colored_vertex(at(angle, RING_OUTER), color);
-                let (n, next) = (seg * 2, ((seg + 1) % SEGMENTS) * 2);
-                mesh.add_triangle(n, n + 1, next);
-                mesh.add_triangle(n + 1, next + 1, next);
-            }
-            const CELLS: u32 = 12;
-            let base = mesh.vertices.len() as u32;
-            let corner = c - Vec2::splat(SQUARE / 2.0);
-            for y in 0..=CELLS {
-                for x in 0..=CELLS {
-                    let (s, t) = (x as f32 / CELLS as f32, y as f32 / CELLS as f32);
-                    mesh.colored_vertex(
-                        corner + vec2(s, t) * SQUARE,
-                        rgb_color(hsv_to_rgb(state.h, s, 1.0 - t), 255),
-                    );
-                    if x > 0 && y > 0 {
-                        let i = base + y * (CELLS + 1) + x;
-                        let (up, left) = (i - CELLS - 1, i - 1);
-                        mesh.add_triangle(up - 1, up, left);
-                        mesh.add_triangle(up, i, left);
-                    }
-                }
-            }
-            painter.add(mesh);
-            draw_marker(painter, at(state.h, (RING_INNER + RING_OUTER) / 2.0));
-            marker = corner + vec2(state.s, 1.0 - state.v) * SQUARE;
         }
     }
-    draw_marker(painter, marker);
+    painter.add(mesh);
+    draw_marker(painter, at(state.h, (RING_INNER + RING_OUTER) / 2.0));
+    draw_marker(painter, corner + vec2(state.s, 1.0 - state.v) * SQUARE);
 }
 
 fn draw_marker(painter: &egui::Painter, p: Pos2) {
@@ -593,12 +520,6 @@ fn checkerboard(painter: &egui::Painter, rect: Rect, cell: f32) {
 /// The angle of `d` as a fraction of a turn, clockwise from straight up.
 fn angle_of(d: Vec2) -> f32 {
     (d.x.atan2(-d.y) / TAU).rem_euclid(1.0)
-}
-
-/// Distance from the centre to the hexagon's edge at `angle` (a fraction of a turn).
-fn hex_edge(angle: f32) -> f32 {
-    let t = ((angle * 6.0).fract() - 0.5) * (TAU / 6.0);
-    RADIUS * FRAC_PI_6.cos() / t.cos()
 }
 
 fn to_u8(x: f32) -> u8 {
@@ -719,9 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn hexagon_edge() {
-        assert!((hex_edge(0.0) - RADIUS).abs() < 0.01); // a corner
-        assert!((hex_edge(1.0 / 12.0) - RADIUS * FRAC_PI_6.cos()).abs() < 0.01); // mid edge
+    fn wheel_angles() {
         assert!((angle_of(vec2(0.0, -1.0))).abs() < 1e-6);
         assert!((angle_of(vec2(1.0, 0.0)) - 0.25).abs() < 1e-6);
     }

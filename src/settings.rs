@@ -439,18 +439,36 @@ pub fn to_hex(c: Color32) -> String {
     format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
 }
 
+/// `#RRGGBB`, or `#RRGGBBAA` when `c` is not fully opaque.
+pub fn to_hex_alpha(c: Color32) -> String {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    if a == 255 { format!("#{r:02X}{g:02X}{b:02X}") } else { format!("#{r:02X}{g:02X}{b:02X}{a:02X}") }
+}
+
+/// `#RRGGBB`, or `#RRGGBBAA` with alpha.
 pub fn parse_hex(text: &str) -> Option<Color32> {
     let hex = text.trim().trim_start_matches('#');
-    if hex.len() != 6 {
+    if !hex.is_ascii() || (hex.len() != 6 && hex.len() != 8) {
         return None;
     }
     let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-    Some(Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?))
+    let a = if hex.len() == 8 { byte(6)? } else { 255 };
+    Some(Color32::from_rgba_unmultiplied(byte(0)?, byte(2)?, byte(4)?, a))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_with_and_without_alpha() {
+        let half = Color32::from_rgba_unmultiplied(0x12, 0x34, 0x56, 0x80);
+        assert_eq!(to_hex_alpha(half), "#12345680");
+        assert_eq!(parse_hex("#12345680").unwrap().to_srgba_unmultiplied(), [0x12, 0x34, 0x56, 0x80]);
+        assert_eq!(to_hex_alpha(Color32::from_rgb(1, 2, 3)), "#010203");
+        assert_eq!(parse_hex("#010203"), Some(Color32::from_rgb(1, 2, 3)));
+        assert_eq!(parse_hex("#0102030"), None);
+    }
 
     #[test]
     fn round_trip_and_defaults() {

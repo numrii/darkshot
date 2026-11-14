@@ -6,6 +6,7 @@ mod annotate;
 mod appicon;
 #[cfg(feature = "autostart")]
 mod autostart;
+mod clipboard;
 mod cursor;
 mod daemon;
 mod effects;

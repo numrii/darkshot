@@ -1,7 +1,6 @@
 //! The capture overlay: freeze every monitor, show the frozen desktop in one window
 //! spanning all of them, let the user pick and adjust a region, then copy or save it.
 
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -539,6 +538,10 @@ enum Action {
     PlaceText { anchor: Pos2 },
     /// A click inside the text being edited: moves the caret there.
     Caret { at: Pos2 },
+    /// Turning the capture by the region's round handle, around `pivot` (the region's
+    /// centre). `from` is the pointer's direction from the pivot when the drag began,
+    /// `orig` the rotation then.
+    Rotate { pivot: Pos2, from: f32, orig: Rotation },
 }
 
 /// Default annotation colours: red, green, blue, and the highlighter's yellow (so the
@@ -607,12 +610,125 @@ fn byte_at(s: &str, index: usize) -> usize {
 }
 /// Freehand points closer than this to the previous one are skipped while drawing.
 const MIN_POINT_SPACING: f32 = 1.5;
+/// How far the round handle that turns the capture sits from the region, and its
+/// radius, in points.
+const ROTATE_HANDLE_GAP: f32 = 30.0;
+const ROTATE_HANDLE_RADIUS: f32 = 10.0;
+
+/// How the capture is turned on screen, so that what the region holds is straight:
+/// desktop point = the captured point turned by `angle` (clockwise on screen, in
+/// radians), then moved by `offset`. The whole capture turns, not the region, so the
+/// region stays an upright rectangle and everything that reads the capture (copy,
+/// save, blur, Copy text, the eyedropper) sees it straightened.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rotation {
+    angle: f32,
+    offset: Vec2,
+}
+
+impl Rotation {
+    /// The capture as it was taken.
+    const NONE: Self = Self { angle: 0.0, offset: Vec2::ZERO };
+
+    fn is_none(&self) -> bool {
+        *self == Self::NONE
+    }
+
+    /// Where captured point `s` shows on the desktop.
+    fn to_desktop(&self, s: Pos2) -> Pos2 {
+        let (sin, cos) = self.angle.sin_cos();
+        Pos2::new(cos * s.x - sin * s.y, sin * s.x + cos * s.y) + self.offset
+    }
+
+    /// The captured point that shows at desktop point `d`.
+    fn to_source(&self, d: Pos2) -> Pos2 {
+        let v = d - self.offset;
+        let (sin, cos) = self.angle.sin_cos();
+        Pos2::new(cos * v.x + sin * v.y, -sin * v.x + cos * v.y)
+    }
+
+    /// Turned by `delta` more, around desktop point `pivot`. Back at no turn at all,
+    /// the capture is back where it was taken.
+    fn turned(self, delta: f32, pivot: Pos2) -> Self {
+        use std::f32::consts::{PI, TAU};
+        let angle = (self.angle + delta + PI).rem_euclid(TAU) - PI;
+        if angle.abs() < 1e-4 {
+            return Self::NONE;
+        }
+        let (sin, cos) = delta.sin_cos();
+        let v = self.offset - pivot.to_vec2();
+        Self { angle, offset: vec2(cos * v.x - sin * v.y, sin * v.x + cos * v.y) + pivot.to_vec2() }
+    }
+
+    /// The turn in whole degrees, -179 to 180, for showing.
+    fn degrees(&self) -> i32 {
+        let d = self.angle.to_degrees().round() as i32;
+        if d <= -180 { d + 360 } else { d }
+    }
+}
+
+/// A turning arrow: most of a circle of radius `r` round `centre`, clockwise, with an
+/// arrowhead at its end.
+fn rotate_glyph(painter: &egui::Painter, centre: Pos2, r: f32, color: Color32) {
+    let (start, end) = (-60f32.to_radians(), 220f32.to_radians());
+    let at = |a: f32| centre + vec2(a.cos(), a.sin()) * r;
+    let points: Vec<Pos2> = (0..=24).map(|i| at(start + (end - start) * i as f32 / 24.0)).collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.6, color)));
+    // The arrowhead points along the circle, clockwise.
+    let tip = at(end);
+    let along = vec2(-end.sin(), end.cos());
+    let out = vec2(end.cos(), end.sin());
+    let size = r * 0.75;
+    let head = vec![tip + along * size * 0.6, tip - along * size * 0.2 + out * size * 0.55, tip - along * size * 0.2 - out * size * 0.55];
+    painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
+}
+
+/// The direction of `v`, in radians, clockwise from pointing right.
+fn angle_of(v: Vec2) -> f32 {
+    v.y.atan2(v.x)
+}
+
+/// One monitor's capture as a quad with its corners placed by `place` (captured
+/// pixels to screen points), for drawing it turned.
+fn turned_quad(texture: egui::TextureId, monitor: Rect, place: impl Fn(Pos2) -> Pos2) -> egui::Mesh {
+    let mut mesh = egui::Mesh::with_texture(texture);
+    let corners = [monitor.left_top(), monitor.right_top(), monitor.right_bottom(), monitor.left_bottom()];
+    let uvs = [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0)];
+    for (corner, uv) in corners.into_iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex { pos: place(corner), uv, color: Color32::WHITE });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    mesh
+}
+
+/// The colour at continuous point `p` of `img` (pixel centres at .5), blended from the
+/// four pixels around it; edges extend outward.
+fn bilinear(img: &RgbaImage, p: Pos2) -> image::Rgba<u8> {
+    let (x, y) = (p.x - 0.5, p.y - 0.5);
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (w, h) = (img.width() as i64 - 1, img.height() as i64 - 1);
+    let at = |x: f32, y: f32| img.get_pixel((x as i64).clamp(0, w) as u32, (y as i64).clamp(0, h) as u32).0;
+    let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+    let mut out = [0u8; 4];
+    for i in 0..4 {
+        let top = f32::from(a[i]) * (1.0 - fx) + f32::from(b[i]) * fx;
+        let bottom = f32::from(c[i]) * (1.0 - fx) + f32::from(d[i]) * fx;
+        out[i] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+    }
+    image::Rgba(out)
+}
 
 struct Overlay {
     desktop: Desktop,
     /// One texture per monitor, so no texture exceeds the GPU's size limit. Created on
     /// the first frame: the real limit is not known before then.
     textures: Vec<egui::TextureHandle>,
+    /// The same, smoothly sampled, for drawing the capture turned. Made when first needed.
+    smooth_textures: Vec<egui::TextureHandle>,
+    /// How the capture is turned under the region (see `Rotation`).
+    rotation: Rotation,
     hwnd: Option<HWND>,
     /// The monitor the pointer was last on; Ctrl+A and the hint bar use it.
     current_monitor: usize,
@@ -667,6 +783,9 @@ struct Overlay {
     decor_open: bool,
     /// The panel showing text or QR codes read from the region, while it is open.
     reading: Option<Reading>,
+    /// The region was moved, resized or turned with the reading panel open: read it
+    /// again on the next frame.
+    reread: bool,
     /// Ask before closing without copying or saving when there are annotations.
     confirm_discard: bool,
     /// That question is on screen.
@@ -717,8 +836,8 @@ impl Reading {
         let p = (p - self.origin).to_pos2();
         self.lines().iter().enumerate().find_map(|(i, line)| {
             // A little slack round each word, so the gaps between them count too.
-            let slack = (line.rect().height() * 0.25).max(2.0);
-            let j = line.words.iter().position(|w| w.rect.expand2(eframe::egui::vec2(slack * 1.6, slack)).contains(p))?;
+            let slack = (line.quad.height() * 0.25).max(2.0);
+            let j = line.words.iter().position(|w| w.quad.expand(slack * 1.6, slack).contains(p))?;
             Some((i, j))
         })
     }
@@ -790,6 +909,8 @@ impl Overlay {
             ui_monitor: desktop.home,
             desktop,
             textures: Vec::new(),
+            smooth_textures: Vec::new(),
+            rotation: Rotation::NONE,
             hwnd,
             selection: None,
             action: None,
@@ -821,6 +942,7 @@ impl Overlay {
             shadow: settings.frame.shadow,
             decor_open: false,
             reading: None,
+            reread: false,
             confirm_discard: settings.confirm_discard,
             confirm_open: false,
             annotations: Vec::new(),
@@ -886,6 +1008,30 @@ impl Overlay {
         )
     }
 
+    /// Where the round handle that turns the capture is, in desktop pixels: above the
+    /// region's top edge, or below its bottom edge when there is no room above. `tol`
+    /// is the grab tolerance in desktop pixels, which also gives the screen's scale.
+    ///
+    /// Also once things are drawn, to straighten it a little more: annotations stay
+    /// where they are on the region, and the capture turns under them. Blur regions
+    /// blur whatever is under them after the turn, recomputed live while turning, so
+    /// what is seen hidden is what the output hides.
+    fn rotate_handle(&self, sel: Rect, tol: f32) -> Option<Pos2> {
+        if sel.width() < 8.0 || sel.height() < 8.0 {
+            return None;
+        }
+        let gap = ROTATE_HANDLE_GAP * tol / GRAB_TOLERANCE;
+        let above = sel.center_top() - vec2(0.0, gap);
+        Some(if above.y >= self.bounds().top() + tol { above } else { sel.center_bottom() + vec2(0.0, gap) })
+    }
+
+    /// Back to the capture as it was taken, reading again if the panel is open.
+    fn reset_rotation(&mut self) {
+        self.rotation = Rotation::NONE;
+        self.blur_layers.clear();
+        self.reread = self.reading.is_some();
+    }
+
     // --- Mouse interaction -----------------------------------------------------------
 
     /// What a drag starting at `p` would do. Pure, so it also drives the cursor shape.
@@ -918,6 +1064,12 @@ impl Overlay {
             }
         }
 
+        if let Some(handle) = self.rotate_handle(sel, tol) {
+            if p.distance(handle) <= (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE {
+                let pivot = sel.center();
+                return Action::Rotate { pivot, from: angle_of(p - pivot), orig: self.rotation };
+            }
+        }
         if let Some((hx, hy)) = edges_at(sel, p, tol) {
             return Action::Region(Drag::Resize { start: p, orig: sel, hx, hy });
         }
@@ -968,6 +1120,7 @@ impl Overlay {
             Action::PlaceText { .. } => self.selected = None,
             Action::Region(Drag::Create { .. } | Drag::Move { .. }) => self.selected = None,
             Action::Region(Drag::Resize { .. }) => {}
+            Action::Rotate { .. } => self.selected = None,
             Action::NewShape { anchor } => {
                 let Tool::Shape(kind) = self.tool else { return };
                 self.history.record(&self.annotations, None);
@@ -1009,6 +1162,19 @@ impl Overlay {
         let Some(action) = self.action.clone() else { return };
         match action {
             Action::PlaceText { .. } | Action::Caret { .. } => {}
+            Action::Rotate { pivot, from, orig } => {
+                if p.distance(pivot) < 1.0 {
+                    return;
+                }
+                // Follows the pointer freely; Shift turns in 15-degree steps.
+                let mut angle = orig.angle + angle_of(p - pivot) - from;
+                if mods.shift {
+                    let step = 15f32.to_radians();
+                    angle = (angle / step).round() * step;
+                }
+                self.rotation = orig.turned(angle - orig.angle, pivot);
+                self.blur_layers.clear();
+            }
             Action::Region(drag) => {
                 // A stray click outside the region must not replace it with nothing.
                 if let Drag::Create { anchor } = drag {
@@ -1018,8 +1184,9 @@ impl Overlay {
                 }
                 self.drag_moved = true;
                 let mut region = drag.apply(p, mods, bounds);
-                // Ctrl: pull the edges being dragged onto nearby window or monitor edges.
-                if mods.ctrl {
+                // Ctrl: pull the edges being dragged onto nearby window or monitor edges
+                // (where they were captured: not once the capture is turned).
+                if mods.ctrl && self.rotation.is_none() {
                     let snap = &self.desktop.snap;
                     region = match drag {
                         Drag::Create { .. } => snap.edges(region, true, true, true, true),
@@ -1092,6 +1259,12 @@ impl Overlay {
     }
 
     fn end_action(&mut self) {
+        // The region now holds something else: what was read is read again.
+        let changed = matches!(self.action, Some(Action::Rotate { .. }))
+            || (matches!(self.action, Some(Action::Region(_))) && self.drag_moved);
+        if changed && self.reading.is_some() {
+            self.reread = true;
+        }
         // A click (no change) on a text with the text tool starts editing it.
         if let Some(Action::MoveShape { index, start, .. }) = self.action {
             let unchanged = self.pending_undo.is_some();
@@ -1128,7 +1301,7 @@ impl Overlay {
             Some(Action::Region(drag)) => {
                 // Ctrl+click: select the window under the pointer.
                 if let Drag::Create { anchor } = drag {
-                    if !self.drag_moved && self.mods.ctrl {
+                    if !self.drag_moved && self.mods.ctrl && self.rotation.is_none() {
                         if let Some(window) = self.desktop.snap.window_at(anchor) {
                             self.selection = Some(window.intersect(self.bounds()));
                             self.selected = None;
@@ -1220,6 +1393,7 @@ impl Overlay {
 
     /// The captured colour at desktop pixel `p` (undimmed, without annotations).
     fn pixel_at(&self, p: Pos2) -> Option<Color32> {
+        let p = self.rotation.to_source(p);
         let (monitor, shot) =
             self.desktop.monitors.iter().zip(&self.desktop.shots).find(|(m, _)| m.contains(p))?;
         let (x, y) = ((p.x - monitor.min.x) as u32, (p.y - monitor.min.y) as u32);
@@ -1383,6 +1557,9 @@ impl Overlay {
         if w == 0 || h == 0 {
             return None;
         }
+        if !self.rotation.is_none() {
+            return Some(self.crop_turned(sel, w, h));
+        }
         let mut out = RgbaImage::new(w, h);
         for (monitor, shot) in self.desktop.monitors.iter().zip(&self.desktop.shots) {
             let part = sel.intersect(*monitor);
@@ -1404,6 +1581,24 @@ impl Overlay {
             );
         }
         Some(out)
+    }
+
+    /// The `w` by `h` pixels at `sel` (desktop pixels) of the turned capture, each
+    /// blended from the captured pixels around where it came from. Areas that came from
+    /// outside every monitor stay transparent.
+    fn crop_turned(&self, sel: Rect, w: u32, h: u32) -> RgbaImage {
+        let origin = self.rotation.to_source(sel.min + vec2(0.5, 0.5));
+        // One pixel right, and one down, on the desktop, as steps in the capture.
+        let right = self.rotation.to_source(sel.min + vec2(1.5, 0.5)) - origin;
+        let down = self.rotation.to_source(sel.min + vec2(0.5, 1.5)) - origin;
+        let sources: Vec<(&Rect, &RgbaImage)> = self.desktop.monitors.iter().zip(&self.desktop.shots).collect();
+        RgbaImage::from_fn(w, h, |x, y| {
+            let s = origin + right * x as f32 + down * y as f32;
+            match sources.iter().find(|(m, _)| m.contains(s)) {
+                Some((m, shot)) => bilinear(shot, s - m.min.to_vec2()),
+                None => image::Rgba([0; 4]),
+            }
+        })
     }
 
     /// A blur region's processed pixels and the desktop area they cover.
@@ -1477,10 +1672,12 @@ impl Overlay {
         self.picking_color = false;
         let Some(img) = self.redacted() else { return };
         let Some(origin) = self.selection.map(|s| s.intersect(self.bounds()).min.round()) else { return };
+        // Turned by hand, the text is taken to be the way up the user put it.
+        let as_is = !self.rotation.is_none();
         let (send, receive) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = send.send(read::read(kind, &img));
+            let _ = send.send(read::read(kind, &img, as_is));
             ctx.request_repaint();
         });
         self.reading =
@@ -1556,7 +1753,7 @@ impl Overlay {
                         if button.on_hover_text("Copy and close (Ctrl+Enter)").clicked() {
                             copy = Some(reading.text.clone());
                         }
-                        if found && !reading.picked.is_empty() && ui.button("Pick none").clicked() {
+                        if found && !reading.picked.is_empty() && ui.button("Reset picks").clicked() {
                             reading.picked.clear();
                             reading.text = reading.picked_text();
                         }
@@ -1579,19 +1776,22 @@ impl Overlay {
     /// picked words filled.
     fn paint_reading(&self, painter: &egui::Painter, to_pt: impl Fn(Pos2) -> Pos2, hover: Option<(usize, usize)>, word_only: bool) {
         let Some(reading) = &self.reading else { return };
-        let area = |r: Rect| {
-            let r = r.translate(reading.origin.to_vec2()).expand(2.0);
-            Rect::from_min_max(to_pt(r.min), to_pt(r.max))
-        };
+        // While the region moves or the capture turns, they no longer sit on what they
+        // mark; it is read again when the drag ends.
+        if matches!(self.action, Some(Action::Region(_) | Action::Rotate { .. })) {
+            return;
+        }
+        // At the text's own angle, a little outside it.
+        let area = |q: read::Quad| q.expand(2.0, 2.0).map(|p| to_pt(p + reading.origin.to_vec2())).0.to_vec();
         for (i, line) in reading.lines().iter().enumerate() {
             let hovered_line = hover.is_some_and(|(h, _)| h == i) && !word_only;
             let outline = if hovered_line { ACCENT } else { ACCENT.gamma_multiply(0.55) };
-            painter.rect_stroke(area(line.rect()), 2.0, Stroke::new(1.0, outline), StrokeKind::Outside);
+            painter.add(egui::Shape::closed_line(area(line.quad), Stroke::new(1.0, outline)));
             for (j, word) in line.words.iter().enumerate() {
                 if reading.picked.contains(&(i, j)) {
-                    painter.rect_filled(area(word.rect), 2.0, ACCENT.gamma_multiply(0.35));
+                    painter.add(egui::Shape::convex_polygon(area(word.quad), ACCENT.gamma_multiply(0.35), Stroke::NONE));
                 } else if word_only && hover == Some((i, j)) {
-                    painter.rect_stroke(area(word.rect), 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+                    painter.add(egui::Shape::closed_line(area(word.quad), Stroke::new(1.0, ACCENT)));
                 }
             }
         }
@@ -1614,16 +1814,6 @@ impl Overlay {
         effects::Frame { border: self.border_on.then_some(self.border), shadow: self.shadow }
     }
 
-    /// The image for the clipboard. With a border or shadow it is put on white: what
-    /// they leave transparent would be pasted as black by many programs.
-    fn clipboard_output(&self) -> Option<RgbaImage> {
-        let mut img = self.output()?;
-        if !self.frame().is_empty() {
-            effects::flatten(&mut img);
-        }
-        Some(img)
-    }
-
     /// The decoration panel, next to the toolbar: the border and the drop shadow.
     fn decor_panel(&mut self, ctx: &egui::Context, toolbar: Rect, below: bool, within: Rect) {
         let (pos, pivot) = if below {
@@ -1643,7 +1833,7 @@ impl Overlay {
                         if ui.checkbox(&mut self.border_on, "Border").changed() && self.border_on {
                             // The colour and line style in use, as for a new shape.
                             if std::mem::take(&mut self.border_unset) {
-                                self.border.color = self.color.to_opaque();
+                                self.border.color = self.color;
                                 self.border.dash = self.dash;
                             }
                         }
@@ -1665,8 +1855,6 @@ impl Overlay {
                     });
                     ui.checkbox(&mut self.shadow, "Drop shadow")
                         .on_hover_text("A soft shadow around the image. Not shown here: it appears in the copied or saved image.");
-                    // The picker opens with full opacity only; keep it that way.
-                    self.border.color = self.border.color.to_opaque();
                 });
             });
     }
@@ -1725,15 +1913,9 @@ impl Overlay {
             img.save(path)?;
             return Ok(());
         }
-        // Keep screenshots out of Windows' clipboard history (Win+V) and cloud clipboard
-        // sync: a copy should live only until the next one replaces it.
-        use arboard::SetExtWindows;
-        arboard::Clipboard::new()?.set().exclude_from_history().exclude_from_cloud().image(arboard::ImageData {
-            width: img.width() as usize,
-            height: img.height() as usize,
-            bytes: Cow::Borrowed(img.as_raw()),
-        })?;
-        Ok(())
+        // As PNG with its transparency and as a bitmap on white, kept out of clipboard
+        // history and cloud sync (see `clipboard`).
+        crate::clipboard::set_image(img)
     }
 
     // --- Toolbar -----------------------------------------------------------------------
@@ -2188,9 +2370,28 @@ impl eframe::App for Overlay {
                 ));
             }
         }
-        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
-            painter.image(texture.id(), rect_to_pt(*m), uv, Color32::WHITE);
+        if self.rotation.is_none() {
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
+                painter.image(texture.id(), rect_to_pt(*m), uv, Color32::WHITE);
+            }
+        } else {
+            // Turned: smoothly sampled, on black where no monitor turns into view.
+            if self.smooth_textures.is_empty() {
+                for (i, shot) in self.desktop.shots.iter().enumerate() {
+                    let size = [shot.width() as usize, shot.height() as usize];
+                    self.smooth_textures.push(ctx.load_texture(
+                        format!("monitor-smooth-{i}"),
+                        egui::ColorImage::from_rgba_unmultiplied(size, shot.as_raw()),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+            painter.rect_filled(screen, 0.0, Color32::BLACK);
+            let rotation = self.rotation;
+            for (m, texture) in self.desktop.monitors.iter().zip(&self.smooth_textures) {
+                painter.add(turned_quad(texture.id(), *m, |p| to_pt(rotation.to_desktop(p))));
+            }
         }
 
         // --- Mouse ---------------------------------------------------------------------
@@ -2224,7 +2425,12 @@ impl eframe::App for Overlay {
         // the question (and the toolbar's Copy and Save) respond.
         let asking = self.confirm_open;
         // With text or QR codes read, a click on one picks it.
-        let read_hit = |overlay: &Self, p: Pos2| overlay.reading.as_ref().and_then(|r| r.hit(to_px(p)));
+        // Only inside the region: nothing is read outside it, and the slack round words
+        // must not reach the rotation handle or the region's edges.
+        let read_hit = |overlay: &Self, p: Pos2| {
+            let p = to_px(p);
+            overlay.selection.filter(|s| s.contains(p)).and_then(|_| overlay.reading.as_ref()?.hit(p))
+        };
         if response.drag_started() && !asking {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
                 if let (Some(hit), Some(reading)) = (read_hit(self, origin), self.reading.as_mut()) {
@@ -2255,6 +2461,19 @@ impl eframe::App for Overlay {
                 self.end_action();
             }
         }
+        // Right-click on the rotation handle: back to no turn.
+        let right_click = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary).then(|| i.pointer.interact_pos()).flatten());
+        if let Some(p) = right_click.filter(|_| !asking && self.action.is_none()) {
+            if matches!(self.pick_action(to_px(p), tol), Action::Rotate { .. }) && !self.rotation.is_none() {
+                self.reset_rotation();
+            }
+        }
+        if std::mem::take(&mut self.reread) {
+            match (self.reading.as_ref().map(|r| r.kind), self.selection) {
+                (Some(kind), Some(_)) => self.start_reading(&ctx, kind),
+                _ => self.reading = None,
+            }
+        }
 
         // Cursor reflects what a drag would do from here. Over the toolbar, egui decides.
         let preview = self.action.clone().or_else(|| {
@@ -2269,7 +2488,7 @@ impl eframe::App for Overlay {
                 Action::Region(Drag::Resize { hx, hy, .. })
                 | Action::ResizeBox { drag: Drag::Resize { hx, hy, .. }, .. } => resize_cursor(hx, hy),
                 Action::Region(Drag::Move { .. }) | Action::MoveShape { .. } => CursorIcon::Move,
-                Action::MoveEnd { .. } => CursorIcon::Grab,
+                Action::MoveEnd { .. } | Action::Rotate { .. } => CursorIcon::Grab,
                 Action::PlaceText { .. } | Action::Caret { .. } => CursorIcon::Text,
                 _ => CursorIcon::Crosshair,
             });
@@ -2588,6 +2807,21 @@ impl eframe::App for Overlay {
                 for point in handle_points(sel) {
                     handle(&painter, point, Color32::WHITE);
                 }
+                // The round handle that turns the capture, on a stem from the region.
+                let turning = matches!(self.action, Some(Action::Rotate { .. }));
+                if let Some(knob) = self.rotate_handle(sel_px, tol).map(to_pt) {
+                    let stem = if knob.y < sel.top() { sel.center_top() } else { sel.center_bottom() };
+                    painter.line_segment([stem, knob], Stroke::new(1.0, Color32::WHITE));
+                    let fill = if turning { ACCENT } else { Color32::WHITE };
+                    painter.circle_filled(knob, ROTATE_HANDLE_RADIUS, fill);
+                    painter.circle_stroke(knob, ROTATE_HANDLE_RADIUS, Stroke::new(1.0, Color32::from_black_alpha(160)));
+                    rotate_glyph(&painter, knob, ROTATE_HANDLE_RADIUS * 0.55, Color32::from_gray(40));
+                    if turning || !self.rotation.is_none() {
+                        let degrees = format!("{}°", self.rotation.degrees());
+                        let at = knob + vec2(ROTATE_HANDLE_RADIUS + 6.0, 0.0);
+                        label(&painter, at, Align2::LEFT_CENTER, degrees, Color32::WHITE);
+                    }
+                }
 
                 // Size readout above the selection, or inside it when there is no room.
                 let size = format!("{} x {}", sel_px.width() as u32, sel_px.height() as u32);
@@ -2606,7 +2840,7 @@ impl eframe::App for Overlay {
         // With Ctrl held over a spot where a click would start a new region, outline the
         // window a click would select. Only before an area is chosen: afterwards Ctrl is
         // mostly pressed for shortcuts (Ctrl+C, Ctrl+S), and the outline would flash.
-        if mods.ctrl && self.selection.is_none() && self.action.is_none() && response.hovered() {
+        if mods.ctrl && self.selection.is_none() && self.action.is_none() && self.rotation.is_none() && response.hovered() {
             if let Some(p) = hover.map(to_px) {
                 if let Action::Region(Drag::Create { .. }) = self.pick_action(p, tol) {
                     if let Some(window) = self.desktop.snap.window_at(p) {
@@ -2668,15 +2902,24 @@ impl eframe::App for Overlay {
                     let to_desktop = |q: Pos2| centre + (q - p) * density;
                     let from_desktop = |d: Pos2| p + (d - centre) / density;
                     painter.circle_filled(p, SPOTLIGHT_RADIUS, Color32::BLACK);
+                    let rotation = self.rotation;
                     for (m, texture) in self.desktop.monitors.iter().zip(&self.textures) {
+                        let uv = |q: Pos2| {
+                            let d = rotation.to_source(to_desktop(q));
+                            Pos2::new((d.x - m.min.x) / m.width(), (d.y - m.min.y) / m.height())
+                        };
+                        if !rotation.is_none() {
+                            // Turned, monitor edges are not straight on screen: the monitor
+                            // under the cursor fills the spotlight.
+                            if m.contains(rotation.to_source(px)) {
+                                painter.add(spotlight_mesh(texture.id(), p, SPOTLIGHT_RADIUS, uv));
+                            }
+                            continue;
+                        }
                         let area = Rect::from_min_max(from_desktop(m.min), from_desktop(m.max));
                         if !area.expand(SPOTLIGHT_RADIUS).contains(p) {
                             continue;
                         }
-                        let uv = |q: Pos2| {
-                            let d = to_desktop(q);
-                            Pos2::new((d.x - m.min.x) / m.width(), (d.y - m.min.y) / m.height())
-                        };
                         painter.with_clip_rect(area).add(spotlight_mesh(texture.id(), p, SPOTLIGHT_RADIUS, uv));
                     }
                     if mods.shift {
@@ -2706,6 +2949,10 @@ impl eframe::App for Overlay {
             "Drag to select an area · Ctrl+click a window · hold Ctrl to snap · Ctrl+A whole screen · Esc cancel"
         } else if self.selected.is_some() {
             "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect"
+        } else if matches!(self.action, Some(Action::Rotate { .. })) {
+            "Turning the capture · drawings stay put · Shift turns in 15° steps · right-click the handle to undo"
+        } else if self.annotations.is_empty() {
+            "Round handle turns the capture (right-click resets) · V select · R rect · E ellipse · L line · A arrow · T text · B blur · Ctrl+Z undo"
         } else {
             "V select · R rect · E ellipse · L line · A arrow · P pen · M marker · T text · B blur · Shift constrain/straight · Ctrl+Z undo"
         };
@@ -2741,7 +2988,7 @@ impl eframe::App for Overlay {
             }
         } else if copy || save {
             let result = if copy {
-                match self.clipboard_output() {
+                match self.output() {
                     Some(img) => Self::copy_to_clipboard(&img).map(|()| true),
                     None => Ok(false),
                 }
@@ -2851,6 +3098,171 @@ mod tests {
             snap: Snap::default(),
         };
         Overlay::with_desktop(desktop, None, &Settings::default())
+    }
+
+    #[test]
+    fn rotation_maps_both_ways() {
+        let pivot = Pos2::new(50.0, 30.0);
+        let r = Rotation::NONE.turned(0.7, pivot).turned(-0.2, Pos2::new(10.0, 80.0));
+        for p in [Pos2::ZERO, Pos2::new(13.0, -4.0), Pos2::new(200.0, 90.0)] {
+            assert!(r.to_source(r.to_desktop(p)).distance(p) < 1e-3, "{p:?}");
+        }
+        assert!((r.angle - 0.5).abs() < 1e-5);
+        // The pivot stays put.
+        let once = Rotation::NONE.turned(1.1, pivot);
+        assert!(once.to_desktop(pivot).distance(pivot) < 1e-3);
+        // Turned back to nothing, the capture is where it was taken.
+        assert!(once.turned(-1.1, Pos2::new(400.0, 7.0)).is_none());
+        assert_eq!(Rotation::NONE.turned(std::f32::consts::PI, pivot).degrees(), 180);
+        assert_eq!(Rotation::NONE.turned(-0.5f32.to_radians() - std::f32::consts::FRAC_PI_2, pivot).degrees(), -91);
+    }
+
+    #[test]
+    fn a_turned_capture_is_cropped_straightened() {
+        let shot = RgbaImage::from_fn(40, 40, |x, y| image::Rgba([(x * 6) as u8, (y * 6) as u8, ((x * y) % 251) as u8, 255]));
+        let mut overlay = plain_overlay(40, 40, shot.clone());
+        let sel = rect(10.0, 10.0, 30.0, 30.0);
+        overlay.selection = Some(sel);
+        // A quarter turn clockwise around the region's centre, as by the handle.
+        overlay.rotation = Rotation::NONE.turned(std::f32::consts::FRAC_PI_2, sel.center());
+        let want = image::imageops::rotate90(&*image::imageops::crop_imm(&shot, 10, 10, 20, 20));
+        assert_eq!(overlay.cropped().unwrap(), want);
+        // The eyedropper sees the same.
+        let [r, g, b, _] = want.get_pixel(3, 5).0;
+        assert_eq!(overlay.pixel_at(Pos2::new(13.5, 15.5)), Some(Color32::from_rgb(r, g, b)));
+        // Turned so that some of the region comes from off the capture: transparent.
+        overlay.selection = Some(rect(0.0, 0.0, 40.0, 40.0));
+        overlay.rotation = Rotation::NONE.turned(0.6, Pos2::new(20.0, 20.0));
+        let img = overlay.cropped().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0[3], 0);
+        assert_eq!(img.get_pixel(20, 20).0[3], 255);
+    }
+
+    #[test]
+    fn the_handle_turns_the_capture_before_anything_is_drawn() {
+        let mut overlay = plain_overlay(400, 300, RgbaImage::new(400, 300));
+        let sel = rect(100.0, 100.0, 300.0, 200.0);
+        overlay.selection = Some(sel);
+        let knob = overlay.rotate_handle(sel, GRAB_TOLERANCE).unwrap();
+        assert_eq!(knob, Pos2::new(200.0, 100.0 - ROTATE_HANDLE_GAP));
+        let action = overlay.pick_action(knob, GRAB_TOLERANCE);
+        assert!(matches!(action, Action::Rotate { .. }));
+
+        // Dragged round to nearly a quarter turn clockwise: stays there, no snapping.
+        overlay.begin_action(action);
+        let bounds = overlay.bounds();
+        let centre = sel.center();
+        let nearly = 88f32.to_radians() - std::f32::consts::FRAC_PI_2;
+        overlay.apply_action(centre + vec2(nearly.cos(), nearly.sin()) * 80.0, Modifiers::NONE, bounds);
+        assert_eq!(overlay.rotation.degrees(), 88);
+        assert!((overlay.rotation.angle - 88f32.to_radians()).abs() < 1e-4);
+        // Shift: 15-degree steps. 37 degrees becomes 30.
+        let a = 37f32.to_radians() - std::f32::consts::FRAC_PI_2;
+        overlay.apply_action(centre + vec2(a.cos(), a.sin()) * 80.0, Modifiers::SHIFT, bounds);
+        assert_eq!(overlay.rotation.degrees(), 30);
+        // A small turn stays small.
+        let a = 1f32.to_radians() - std::f32::consts::FRAC_PI_2;
+        overlay.apply_action(centre + vec2(a.cos(), a.sin()) * 80.0, Modifiers::NONE, bounds);
+        assert_eq!(overlay.rotation.degrees(), 1);
+        // Back where it started (Shift makes that easy): no turn at all.
+        overlay.apply_action(centre + vec2(0.0, -80.0), Modifiers::SHIFT, bounds);
+        assert!(overlay.rotation.is_none());
+        overlay.end_action();
+
+        // With a region at the very top, the handle goes below it.
+        assert_eq!(overlay.rotate_handle(rect(100.0, 0.0, 300.0, 50.0), GRAB_TOLERANCE), Some(Pos2::new(200.0, 50.0 + ROTATE_HANDLE_GAP)));
+
+        // With things drawn, the handle stays, for small corrections; turning leaves
+        // the drawings where they are.
+        let mark = Annotation::stroked(ShapeKind::Rect, sel.min + vec2(20.0, 20.0), sel.center(), Color32::RED, 2.0, Dash::Solid);
+        overlay.annotations.push(mark.clone());
+        let action = overlay.pick_action(knob, GRAB_TOLERANCE);
+        assert!(matches!(action, Action::Rotate { .. }));
+        overlay.begin_action(action);
+        let a = 4f32.to_radians() - std::f32::consts::FRAC_PI_2;
+        overlay.apply_action(centre + vec2(a.cos(), a.sin()) * 80.0, Modifiers::NONE, bounds);
+        overlay.end_action();
+        assert_eq!(overlay.rotation.degrees(), 4);
+        assert_eq!(overlay.annotations, vec![mark]);
+    }
+
+    /// With the reading panel open, moving the region or turning the capture reads it
+    /// again; a click that changes nothing does not.
+    #[test]
+    fn moving_or_turning_reads_again() {
+        let mut overlay = plain_overlay(400, 300, RgbaImage::new(400, 300));
+        let sel = rect(100.0, 100.0, 300.0, 200.0);
+        overlay.selection = Some(sel);
+        let reading = || Reading {
+            kind: read::Kind::Qr,
+            origin: Pos2::new(100.0, 100.0),
+            pending: None,
+            outcome: Some(Err("No QR code found in the region.".to_owned())),
+            picked: HashSet::new(),
+            text: String::new(),
+        };
+        overlay.reading = Some(reading());
+        let bounds = overlay.bounds();
+
+        overlay.begin_action(overlay.pick_action(sel.center(), GRAB_TOLERANCE));
+        overlay.end_action();
+        assert!(!overlay.reread, "a click is not a move");
+
+        overlay.begin_action(overlay.pick_action(sel.center(), GRAB_TOLERANCE));
+        overlay.apply_action(sel.center() + vec2(20.0, 5.0), Modifiers::NONE, bounds);
+        overlay.end_action();
+        assert!(std::mem::take(&mut overlay.reread));
+
+        let knob = overlay.rotate_handle(overlay.selection.unwrap(), GRAB_TOLERANCE).unwrap();
+        overlay.begin_action(overlay.pick_action(knob, GRAB_TOLERANCE));
+        overlay.apply_action(knob + vec2(15.0, 0.0), Modifiers::NONE, bounds);
+        overlay.end_action();
+        assert!(std::mem::take(&mut overlay.reread));
+
+        // Without the panel open, nothing is read.
+        overlay.reading = None;
+        overlay.begin_action(overlay.pick_action(knob, GRAB_TOLERANCE));
+        overlay.apply_action(knob + vec2(-15.0, 0.0), Modifiers::NONE, bounds);
+        overlay.end_action();
+        assert!(!overlay.reread);
+    }
+
+    #[test]
+    fn right_click_on_the_handle_resets_the_turn() {
+        let mut overlay = plain_overlay(400, 300, RgbaImage::new(400, 300));
+        overlay.selection = Some(rect(100.0, 100.0, 300.0, 200.0));
+        overlay.rotation = Rotation::NONE.turned(0.3, Pos2::new(200.0, 150.0));
+        overlay.reset_rotation();
+        assert!(overlay.rotation.is_none() && !overlay.reread);
+        // With the reading panel open, the region is read again.
+        overlay.rotation = Rotation::NONE.turned(0.3, Pos2::new(200.0, 150.0));
+        overlay.reading = Some(Reading {
+            kind: read::Kind::Text,
+            origin: Pos2::ZERO,
+            pending: None,
+            outcome: None,
+            picked: HashSet::new(),
+            text: String::new(),
+        });
+        overlay.reset_rotation();
+        assert!(overlay.rotation.is_none() && overlay.reread);
+    }
+
+    /// A blur region blurs what is under it after a turn, not what was there before.
+    #[test]
+    fn blur_follows_the_turned_capture() {
+        // Left half black, right half white.
+        let shot = RgbaImage::from_fn(100, 100, |x, _| image::Rgba(if x < 50 { [0, 0, 0, 255] } else { [255; 4] }));
+        let mut overlay = plain_overlay(100, 100, shot);
+        overlay.selection = Some(rect(0.0, 0.0, 100.0, 100.0));
+        let mut blur = Annotation::stroked(ShapeKind::Blur, Pos2::new(10.0, 40.0), Pos2::new(30.0, 60.0), Color32::BLACK, 4.0, Dash::Solid);
+        blur.effect = Effect::Pixelate;
+        overlay.annotations.push(blur.clone());
+        assert_eq!(overlay.blurred(&blur).unwrap().0.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        // Half a turn: the white half is now on the left, under the blur.
+        overlay.rotation = Rotation::NONE.turned(std::f32::consts::PI, Pos2::new(50.0, 50.0));
+        assert_eq!(overlay.blurred(&blur).unwrap().0.get_pixel(5, 5).0, [255; 4]);
+        assert_eq!(overlay.output().unwrap().get_pixel(20, 50).0, [255; 4]);
     }
 
     #[test]
@@ -2991,20 +3403,31 @@ mod tests {
         // Switched off for this capture: the plain image again.
         overlay.border_on = false;
         assert_eq!(overlay.output().unwrap().dimensions(), (40, 20));
-        assert_eq!(overlay.clipboard_output(), overlay.output());
 
-        // With a shadow the file keeps its transparent margin; the clipboard gets white.
+        // With a shadow the image keeps its transparent margin (the clipboard adds a
+        // copy on white for programs without transparency; see `clipboard`).
         overlay.shadow = true;
         assert_eq!(overlay.output().unwrap().get_pixel(0, 0).0[3], 0);
-        assert_eq!(overlay.clipboard_output().unwrap().get_pixel(0, 0).0, [255, 255, 255, 255]);
+
+        // A see-through border stays see-through.
+        overlay.shadow = false;
+        overlay.border_on = true;
+        overlay.border.color = Color32::from_rgba_unmultiplied(255, 0, 0, 128);
+        let [r, _, b, a] = overlay.output().unwrap().get_pixel(0, 0).0;
+        assert!((120..=136).contains(&a) && r > 200 && b == 0, "{:?}", [r, b, a]);
     }
 
     #[test]
     fn picking_lines_and_words() {
-        let word = |text: &str, x: f32, y: f32| read::Word { text: text.into(), rect: rect(x, y, x + 40.0, y + 12.0) };
+        let quad = |x: f32, y: f32, w: f32| read::Quad::from_rect(rect(x, y, x + w, y + 12.0));
+        let word = |text: &str, x: f32, y: f32| read::Word { text: text.into(), quad: quad(x, y, 40.0) };
         let lines = vec![
-            read::Line { text: "alpha beta".into(), words: vec![word("alpha", 0.0, 0.0), word("beta", 50.0, 0.0)] },
-            read::Line { text: "gamma".into(), words: vec![word("gamma", 0.0, 30.0)] },
+            read::Line {
+                text: "alpha beta".into(),
+                words: vec![word("alpha", 0.0, 0.0), word("beta", 50.0, 0.0)],
+                quad: quad(0.0, 0.0, 90.0),
+            },
+            read::Line { text: "gamma".into(), words: vec![word("gamma", 0.0, 30.0)], quad: quad(0.0, 30.0, 40.0) },
         ];
         let mut reading = Reading {
             kind: read::Kind::Text,

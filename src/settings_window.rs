@@ -338,16 +338,32 @@ impl SettingsApp {
     }
 }
 
-/// A colour button that edits a `#RRGGBB` setting.
-fn color_setting(ui: &mut egui::Ui, hex: &mut String, fallback: Color32) -> egui::Response {
+/// A colour button that edits a `#RRGGBB` setting, or `#RRGGBBAA` with `alpha`.
+fn color_setting(ui: &mut egui::Ui, hex: &mut String, fallback: Color32, alpha: bool) -> egui::Response {
     let mut color = parse_hex(hex).unwrap_or(fallback);
-    // Settings store `#RRGGBB`, so no alpha slider here.
-    let response = crate::picker::swatch_button(ui, &mut color, false);
-    let new = to_hex(color);
+    let response = crate::picker::swatch_button(ui, &mut color, alpha);
+    let new = if alpha { crate::settings::to_hex_alpha(color) } else { to_hex(color) };
     if *hex != new {
         *hex = new;
     }
     response
+}
+
+/// Darkshot's source and releases, from Cargo.toml.
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Hand this one fixed address to Windows, which opens it in the default browser.
+/// Darkshot itself still connects to nothing, and nothing it reads (a QR code, say) is
+/// ever opened: this is the only address it opens, and only when clicked.
+fn open_repository() {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, url) = (wide("open"), wide(REPOSITORY));
+    // SAFETY: both strings are null-terminated and outlive the call.
+    unsafe {
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), url.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+    }
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -384,6 +400,15 @@ impl eframe::App for SettingsApp {
                 if ui.small_button("Restore all defaults").clicked() {
                     self.settings = Settings::default();
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let link = ui
+                        .link(REPOSITORY.trim_start_matches("https://"))
+                        .on_hover_text("Opens Darkshot's page on GitHub in your browser");
+                    if link.clicked() {
+                        open_repository();
+                    }
+                    ui.label(RichText::new(concat!("Darkshot ", env!("CARGO_PKG_VERSION"))).color(weak));
+                });
             });
             if let Some((text, error)) = &self.message {
                 let color = if *error { ERROR_RED } else { weak };
@@ -449,12 +474,12 @@ impl SettingsApp {
                 ui.label("Swatches");
                 ui.horizontal(|ui| {
                     for (hex, fallback) in self.settings.swatches.iter_mut().zip(DEFAULT_SWATCHES) {
-                        color_setting(ui, hex, fallback);
+                        color_setting(ui, hex, fallback, false);
                     }
                 });
                 ui.end_row();
                 ui.label("Highlighter");
-                color_setting(ui, &mut self.settings.marker_color, DEFAULT_MARKER_COLOR);
+                color_setting(ui, &mut self.settings.marker_color, DEFAULT_MARKER_COLOR, false);
                 ui.end_row();
             });
             if ui.small_button("Reset colours").clicked() {
@@ -533,7 +558,7 @@ impl SettingsApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut frame.border, "Border");
                 ui.add_enabled_ui(frame.border, |ui| {
-                    color_setting(ui, &mut frame.border_color, settings::DEFAULT_BORDER_COLOR);
+                    color_setting(ui, &mut frame.border_color, settings::DEFAULT_BORDER_COLOR, true);
                     ui.add(
                         egui::DragValue::new(&mut frame.border_width)
                             .range(1..=settings::MAX_BORDER_WIDTH)
