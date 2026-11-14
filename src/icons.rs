@@ -17,6 +17,8 @@ pub enum Icon {
     Text,
     Blur,
     Step,
+    /// A smiling face, for emoji stamps.
+    Emoji,
     Eyedropper,
     /// An arrow with a head at both ends.
     DoubleHead,
@@ -332,6 +334,19 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
                 egui::FontId::proportional(11.0 * unit),
                 background,
             );
+        }
+        Icon::Emoji => {
+            // A smiling face: outline, two eyes and a smile.
+            painter.circle_stroke(p(10.0, 10.0), 7.5 * unit, stroke);
+            painter.circle_filled(p(7.4, 8.0), 1.2 * unit, color);
+            painter.circle_filled(p(12.6, 8.0), 1.2 * unit, color);
+            let smile: Vec<Pos2> = (0..=10)
+                .map(|i| {
+                    let a = (25.0 + 13.0 * i as f32).to_radians();
+                    p(10.0 + 4.2 * a.cos(), 10.0 + 4.2 * a.sin())
+                })
+                .collect();
+            painter.add(Shape::line(smile, stroke));
         }
         Icon::Eyedropper => {
             // A pipette: bulb at the top right, tube running down to the tip.

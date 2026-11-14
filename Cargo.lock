@@ -888,6 +888,7 @@ dependencies = [
  "eframe",
  "embed-resource",
  "global-hotkey",
+ "harfrust",
  "image",
  "qrcode",
  "raw-window-handle",

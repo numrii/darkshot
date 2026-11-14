@@ -31,6 +31,9 @@ pub enum ShapeKind {
     /// A numbered circle for step-by-step instructions, centred on `a`; `width` is the
     /// diameter and `text` the number.
     Step,
+    /// An emoji stamp centred on `a`; `width` is its height in pixels and `text` the
+    /// emoji (which may be a sequence, such as a thumbs-up with a skin tone).
+    Emoji,
 }
 
 /// How text stands out from what is behind it.
@@ -247,6 +250,8 @@ impl Annotation {
     pub fn path_bounds(&self) -> Rect {
         if self.kind == ShapeKind::Step {
             Rect::from_center_size(self.a, Vec2::splat(self.width))
+        } else if self.kind == ShapeKind::Emoji {
+            crate::emoji::bounds(&self.text, self.width, self.a)
         } else if self.kind == ShapeKind::Text {
             self.text_rect().expand2(self.text_padding())
         } else if self.is_freehand() {
@@ -260,7 +265,7 @@ impl Annotation {
     pub fn is_degenerate(&self) -> bool {
         if self.kind == ShapeKind::Step {
             false
-        } else if self.kind == ShapeKind::Text {
+        } else if matches!(self.kind, ShapeKind::Text | ShapeKind::Emoji) {
             self.text.trim().is_empty()
         } else if self.is_freehand() {
             let r = self.path_bounds();
@@ -275,8 +280,8 @@ impl Annotation {
     /// The full, undashed path of the shape (for lines: end to end, ignoring heads).
     fn outline(&self) -> Polyline {
         match self.kind {
-            ShapeKind::Rect | ShapeKind::Blur | ShapeKind::Text | ShapeKind::Step => {
-                let r = if matches!(self.kind, ShapeKind::Text | ShapeKind::Step) {
+            ShapeKind::Rect | ShapeKind::Blur | ShapeKind::Text | ShapeKind::Step | ShapeKind::Emoji => {
+                let r = if matches!(self.kind, ShapeKind::Text | ShapeKind::Step | ShapeKind::Emoji) {
                     self.path_bounds()
                 } else {
                     self.rect()
@@ -308,7 +313,7 @@ impl Annotation {
     }
 
     pub fn geometry(&self) -> Geometry {
-        if matches!(self.kind, ShapeKind::Text | ShapeKind::Blur | ShapeKind::Step) {
+        if matches!(self.kind, ShapeKind::Text | ShapeKind::Blur | ShapeKind::Step | ShapeKind::Emoji) {
             // Drawn from rasterised layers, not from strokes.
             return Geometry::default();
         }
@@ -347,7 +352,7 @@ impl Annotation {
     pub fn hit(&self, p: Pos2, tol: f32) -> bool {
         // Text and blur regions are solid: anywhere inside them counts.
         match self.kind {
-            ShapeKind::Text => return self.path_bounds().expand(tol).contains(p),
+            ShapeKind::Text | ShapeKind::Emoji => return self.path_bounds().expand(tol).contains(p),
             ShapeKind::Blur => return self.rect().expand(tol).contains(p),
             ShapeKind::Step => return p.distance(self.a) <= self.width / 2.0 + tol,
             _ => {}
@@ -414,6 +419,7 @@ impl Annotation {
         match self.kind {
             ShapeKind::Text => return self.rasterize_text(pixmap, origin),
             ShapeKind::Step => return self.rasterize_step(pixmap, origin),
+            ShapeKind::Emoji => return crate::emoji::rasterize(&self.text, self.width, self.a, pixmap, origin),
             // Blur regions need the capture's pixels; the overlay applies them.
             ShapeKind::Blur => return,
             _ => {}

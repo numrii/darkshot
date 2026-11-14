@@ -1,13 +1,13 @@
 //! The settings window (`darkshot --settings`), opened from the tray menu.
 
-use eframe::egui::{self, Color32, RichText, Sense, Vec2};
+use eframe::egui::{self, vec2, Color32, Key, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::{
     self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, Settings, ThemeSetting, DEFAULT_HOTKEY,
     DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
 };
-use crate::tools::TOOLS;
+use crate::tools::{ToolInfo, TOOLS};
 use crate::AnyResult;
 
 use recorder::Recorder;
@@ -153,6 +153,8 @@ struct SettingsApp {
     saved: Settings,
     /// While recording a shortcut: what catches it.
     recorder: Option<Recorder>,
+    /// While choosing a tool's key: that tool.
+    tool_recording: Option<&'static ToolInfo>,
     message: Option<(String, bool)>,
     /// Whether Darkshot starts with Windows. Kept in the registry, not the settings
     /// file, and changed as soon as the box is ticked.
@@ -174,6 +176,7 @@ impl SettingsApp {
             saved: settings.clone(),
             settings,
             recorder: None,
+            tool_recording: None,
             message: None,
             #[cfg(feature = "autostart")]
             autostart: crate::autostart::status(),
@@ -187,6 +190,7 @@ impl SettingsApp {
     /// Start or stop recording a shortcut.
     fn toggle_recording(&mut self) {
         self.message = None;
+        self.tool_recording = None;
         if self.recorder.take().is_none() {
             self.recorder = Recorder::start();
             if self.recorder.is_none() {
@@ -213,6 +217,41 @@ impl SettingsApp {
             }
             Some(text) => self.message = Some((format!("{text} can't be used as a shortcut."), true)),
             None => self.message = Some(("That key can't be used as a shortcut.".to_owned(), true)),
+        }
+    }
+
+    /// Pick up the key pressed for the tool whose key is being chosen, if any. Only
+    /// keys pressed while this window has focus are seen.
+    fn poll_tool_key(&mut self, ctx: &egui::Context) {
+        let Some(tool) = self.tool_recording else { return };
+        let pressed = ctx.input_mut(|input| {
+            let found = input.events.iter().find_map(|event| match event {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                _ => None,
+            });
+            if found.is_some() {
+                input.events.clear();
+            }
+            found
+        });
+        let Some((key, modifiers)) = pressed else { return };
+        self.tool_recording = None;
+        self.message = None;
+        if key == Key::Escape {
+            return; // cancelled
+        }
+        let problem = if modifiers.ctrl || modifiers.alt || modifiers.command {
+            Some("A tool's key is a single key, without Ctrl or Alt.".to_owned())
+        } else if !settings::tool_key_allowed(key) {
+            Some(format!("{} can't pick a tool: the capture uses it.", key.name()))
+        } else {
+            self.settings.tool_with_key(key, tool.id).map(|other| {
+                format!("{} already picks {}. Give that tool another key first.", key.name(), other.name)
+            })
+        };
+        match problem {
+            Some(text) => self.message = Some((text, true)),
+            None => self.settings.set_tool_key(tool, Some(key)),
         }
     }
 
@@ -302,13 +341,16 @@ impl SettingsApp {
         }
     }
 
-    /// The "Enabled tools" list: a box per tool, with its icon and key.
+    /// The tools list: a box per tool, with its icon and the key that picks it.
     fn tools_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
-        section(ui, "Enabled tools");
+        section(ui, "Tools");
         ui.label(
-            RichText::new("Untick the tools you don't use. They leave the toolbar, and their keys do nothing.")
-                .color(weak)
-                .small(),
+            RichText::new(
+                "Untick the tools you don't use: they leave the toolbar, and their keys do nothing. \
+                 Click a key to give the tool another.",
+            )
+            .color(weak)
+            .small(),
         );
         ui.add_space(6.0);
         let (ink, paper) = (ui.visuals().text_color(), ui.visuals().panel_fill);
@@ -323,10 +365,28 @@ impl SettingsApp {
                     on = !on;
                     changed = true;
                 }
-                ui.label(RichText::new(info.key.name()).color(weak).small());
                 if changed {
                     self.settings.set_tool_enabled(info.id, on);
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let recording = self.tool_recording.is_some_and(|t| t.id == info.id);
+                    let key = self.settings.tool_key(info);
+                    let custom = key != info.key;
+                    let text = if recording { "Press a key…".to_owned() } else { key.name().to_owned() };
+                    let (field, clear) = key_field(ui, &text, recording, custom);
+                    let tip = format!("The key that picks {}. Click, then press a key. Esc cancels.", info.name);
+                    if field.on_hover_text(tip).clicked() {
+                        self.message = None;
+                        self.recorder = None;
+                        self.tool_recording = if recording { None } else { Some(info) };
+                    }
+                    let tip = format!("Back to {}", info.key.name());
+                    if clear.is_some_and(|clear| clear.on_hover_text(tip).clicked()) {
+                        self.settings.set_tool_key(info, None);
+                        self.tool_recording = None;
+                        self.message = None;
+                    }
+                });
             });
         }
         if !self.settings.disabled_tools.is_empty() {
@@ -336,6 +396,46 @@ impl SettingsApp {
             }
         }
     }
+}
+
+/// A field showing a tool's key, clicked to choose another. With `custom`, an × at its
+/// right end puts the tool's own key back; its response is the second one returned.
+fn key_field(ui: &mut egui::Ui, text: &str, recording: bool, custom: bool) -> (egui::Response, Option<egui::Response>) {
+    let (rect, field) = ui.allocate_exact_size(vec2(104.0, 22.0), Sense::click());
+    let clear_rect = Rect::from_center_size(rect.right_center() - vec2(11.0, 0.0), Vec2::splat(16.0));
+    let clear = custom.then(|| ui.interact(clear_rect, field.id.with("clear"), Sense::click()));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let border = if recording {
+            visuals.selection.stroke
+        } else if field.hovered() {
+            visuals.widgets.hovered.bg_stroke
+        } else {
+            visuals.widgets.inactive.bg_stroke
+        };
+        ui.painter().rect(rect, 3.0, visuals.extreme_bg_color, border, egui::StrokeKind::Inside);
+        let color = if recording { visuals.weak_text_color() } else { visuals.text_color() };
+        let font = egui::FontId::proportional(13.0);
+        let text = if custom && !recording { RichText::new(text).strong() } else { RichText::new(text) };
+        let galley = egui::WidgetText::from(text.color(color)).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            rect.width() - 30.0,
+            font,
+        );
+        ui.painter().galley(rect.left_center() + vec2(8.0, -galley.size().y / 2.0), galley, color);
+        if let Some(clear) = &clear {
+            let ink = if clear.hovered() { visuals.strong_text_color() } else { visuals.weak_text_color() };
+            if clear.hovered() {
+                ui.painter().rect_filled(clear_rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+            }
+            let (c, r) = (clear_rect.center(), 3.5);
+            let stroke = Stroke::new(1.4, ink);
+            ui.painter().line_segment([c + vec2(-r, -r), c + vec2(r, r)], stroke);
+            ui.painter().line_segment([c + vec2(-r, r), c + vec2(r, -r)], stroke);
+        }
+    }
+    (field, clear)
 }
 
 /// A colour button that edits a `#RRGGBB` setting, or `#RRGGBBAA` with `alpha`.
@@ -380,6 +480,7 @@ impl eframe::App for SettingsApp {
             ctx.set_theme(theme);
         }
         self.poll_recorder(&ctx);
+        self.poll_tool_key(&ctx);
         let weak = ui.visuals().weak_text_color();
 
         // Save and Cancel stay at the bottom; the options above scroll if the window is
@@ -399,6 +500,7 @@ impl eframe::App for SettingsApp {
                 }
                 if ui.small_button("Restore all defaults").clicked() {
                     self.settings = Settings::default();
+                    self.tool_recording = None;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let link = ui

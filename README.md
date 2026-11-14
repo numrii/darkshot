@@ -70,12 +70,16 @@ are in its own pixels. Photos are turned the right way up from their camera data
 | T | Text |
 | B | Blur: pixelate, Gaussian or solid redaction |
 | N | Numbered steps |
+| J | Emoji stamp: a faded preview follows the pointer, the wheel sizes it, a click places it |
 | I | Eyedropper (Shift magnifies to single pixels) |
 | O | Copy text: read the text in the region (OCR) |
 | Q | Read the QR codes in the region |
 
-The mouse wheel changes thickness, font size, blur strength or step size. Ctrl+Z
+The mouse wheel changes thickness, font size, blur strength, step size or stamp size. Ctrl+Z
 undoes, Ctrl+Y or Ctrl+Shift+Z redoes, and Delete removes the selected annotation.
+With any tool, hold Ctrl and drag a drawing to move it, as with the Select tool;
+Ctrl-dragging empty space moves the region. Each tool remembers its own size, so a
+large text size does not carry over to the next arrow.
 
 To straighten something photographed at an angle, such as a receipt, drag the round
 handle above the region before annotating: the capture turns under the region, which
@@ -110,8 +114,9 @@ Settings has the capture shortcut, the default colours each capture starts with,
 light, dark or system theme, the save format and quality, the default folder and the
 file name. Two options are off until you turn them on: including the mouse cursor in
 the capture, and asking before Esc or Close discards a capture that has annotations.
-You can also choose the border and shadow each capture starts with (see below). Under Enabled tools you can untick the tools you don't use; they leave the
-toolbar and their keys do nothing. The file name is a
+You can also choose the border and shadow each capture starts with (see below). Under Tools you can untick the tools you don't use; they leave the
+toolbar and their keys do nothing. Click a tool's key to give it another; the × in the
+field puts its own key back. The file name is a
 template that can use `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`,
 `{minute}`, `{second}` and `{counter}` (the next number not yet used in the save
 folder); hover the `?` beside the field for examples.

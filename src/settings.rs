@@ -4,10 +4,11 @@
 //! without it, saving settings fails with an error. Missing or unreadable values fall back
 //! to their defaults, so an old or hand-edited file never stops Darkshot starting.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use eframe::egui::Color32;
+use eframe::egui::{Color32, Key};
 use serde::{Deserialize, Serialize};
 
 use crate::save::Format;
@@ -27,6 +28,9 @@ pub struct Settings {
     /// Tools left out of the toolbar, by their id in [`crate::tools::TOOLS`]. Listing
     /// the ones turned off, not on, keeps tools added later switched on.
     pub disabled_tools: Vec<String>,
+    /// Keys chosen for tools, by tool id, as egui key names (`K`, `F2`, `1`). Tools not
+    /// listed use their own key.
+    pub tool_keys: BTreeMap<String, String>,
     /// The highlighter's starting colour.
     pub marker_color: String,
     /// Light or dark windows and toolbars, or follow Windows.
@@ -146,6 +150,7 @@ impl Default for Settings {
             hotkey: DEFAULT_HOTKEY.into(),
             swatches: DEFAULT_SWATCHES.map(to_hex),
             disabled_tools: Vec::new(),
+            tool_keys: BTreeMap::new(),
             marker_color: to_hex(DEFAULT_MARKER_COLOR),
             theme: ThemeSetting::System,
             include_cursor: false,
@@ -187,6 +192,9 @@ impl Settings {
         if !shortcut_valid(&settings.hotkey) {
             settings.hotkey = DEFAULT_HOTKEY.into();
         }
+        settings.tool_keys.retain(|id, key| {
+            crate::tools::TOOLS.iter().any(|t| t.id == id) && Key::from_name(key).is_some_and(tool_key_allowed)
+        });
         settings.save.jpeg_quality = settings.save.jpeg_quality.clamp(1, 100);
         settings.frame.border_width = settings.frame.border_width.clamp(1, MAX_BORDER_WIDTH);
         let (prefix, suffix) = (settings.save.prefix.take(), settings.save.suffix.take());
@@ -229,6 +237,24 @@ impl Settings {
         if !enabled {
             self.disabled_tools.push(id.to_owned());
         }
+    }
+
+    /// The key that picks `tool` in the capture toolbar.
+    pub fn tool_key(&self, tool: &crate::tools::ToolInfo) -> Key {
+        self.tool_keys.get(tool.id).and_then(|name| Key::from_name(name)).unwrap_or(tool.key)
+    }
+
+    /// Give `tool` its own key, or `None` for its usual one.
+    pub fn set_tool_key(&mut self, tool: &crate::tools::ToolInfo, key: Option<Key>) {
+        match key.filter(|&k| k != tool.key) {
+            Some(key) => self.tool_keys.insert(tool.id.to_owned(), key.name().to_owned()),
+            None => self.tool_keys.remove(tool.id),
+        };
+    }
+
+    /// The tool, other than `except`, whose key is `key`, if any.
+    pub fn tool_with_key(&self, key: Key, except: &str) -> Option<&'static crate::tools::ToolInfo> {
+        crate::tools::TOOLS.iter().find(|t| t.id != except && self.tool_key(t) == key)
     }
 
     pub fn marker(&self) -> Color32 {
@@ -291,6 +317,35 @@ pub fn parse_hotkey(text: &str) -> Option<global_hotkey::hotkey::HotKey> {
         })
         .collect();
     global_hotkey::hotkey::HotKey::from_str(&normalized.join("+")).ok()
+}
+
+/// Whether `key` can pick a tool. Keys the capture already uses (Esc, Enter, Delete,
+/// Backspace, the arrows, Tab and Space) cannot, nor modifier-only or media keys.
+pub fn tool_key_allowed(key: Key) -> bool {
+    let name = key.name();
+    let alphanumeric = name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric();
+    let function = name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=24).contains(&n));
+    alphanumeric
+        || function
+        || matches!(
+            key,
+            Key::Minus
+                | Key::Equals
+                | Key::Comma
+                | Key::Period
+                | Key::Slash
+                | Key::Backslash
+                | Key::Backtick
+                | Key::Semicolon
+                | Key::Quote
+                | Key::OpenBracket
+                | Key::CloseBracket
+                | Key::Insert
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+        )
 }
 
 /// Whether `text` can be used as the capture shortcut: registrable as a hotkey.
@@ -512,6 +567,27 @@ mod tests {
             dash: crate::annotate::Dash::DashDot,
         };
         assert_eq!(f.border(), border);
+
+        // Tool keys: chosen ones are kept; unknown tools and unusable keys are dropped.
+        let tools = &crate::tools::TOOLS;
+        let k = Settings::from_toml("[tool_keys]
+rect = \"K\"
+pen = \"Escape\"
+nope = \"X\"
+arrow = \"Banana\"");
+        assert_eq!(k.tool_keys.len(), 1);
+        assert_eq!(k.tool_key(&tools[1]), Key::K);
+        assert_eq!(k.tool_key(&tools[5]), Key::P);
+        assert_eq!(k.tool_with_key(Key::K, "pen").map(|t| t.id), Some("rect"));
+        assert!(k.tool_with_key(Key::R, "pen").is_none());
+        let mut k = k;
+        k.set_tool_key(&tools[1], Some(Key::R)); // its own key: back to the default
+        assert!(k.tool_keys.is_empty());
+        k.set_tool_key(&tools[1], Some(Key::F2));
+        assert_eq!(Settings::from_toml(&toml::to_string_pretty(&k).unwrap()).tool_key(&tools[1]), Key::F2);
+        k.set_tool_key(&tools[1], None);
+        assert!(k.tool_keys.is_empty());
+        assert!(tool_key_allowed(Key::Num1) && !tool_key_allowed(Key::ArrowUp) && !tool_key_allowed(Key::Space));
 
         // A file that is not TOML at all gives the defaults.
         assert_eq!(Settings::from_toml("not = [valid"), Settings::default());

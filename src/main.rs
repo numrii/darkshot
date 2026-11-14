@@ -10,6 +10,7 @@ mod clipboard;
 mod cursor;
 mod daemon;
 mod effects;
+mod emoji;
 mod hdr;
 mod icons;
 mod overlay;

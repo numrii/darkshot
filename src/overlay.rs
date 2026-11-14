@@ -652,7 +652,7 @@ fn handle_at(rect: Rect, p: Pos2, tol: f32) -> Option<(i8, i8)> {
     best.map(|(h, _)| h)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Tool {
     /// Adjust the capture region and select, move or resize existing annotations.
     Select,
@@ -674,6 +674,7 @@ fn tool_for(icon: Icon) -> Option<Tool> {
         Icon::Text => Tool::Shape(ShapeKind::Text),
         Icon::Blur => Tool::Shape(ShapeKind::Blur),
         Icon::Step => Tool::Shape(ShapeKind::Step),
+        Icon::Emoji => Tool::Shape(ShapeKind::Emoji),
         _ => return None,
     })
 }
@@ -710,6 +711,8 @@ const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
 #[cfg(test)]
 const MARKER_COLOR: Color32 = crate::settings::DEFAULT_MARKER_COLOR;
 const MARKER_WIDTH: f32 = 16.0;
+/// Default stroke width for the other drawing tools.
+const DEFAULT_WIDTH: f32 = 4.0;
 /// Width of the toolbar's context options: room for the largest set, the arrow's
 /// (stroke style, arrowhead, both-ends toggle), each followed by the toolbar's 2 px
 /// item spacing.
@@ -719,9 +722,11 @@ const TEXT_SIZE: f32 = 24.0;
 const BLUR_STRENGTH: f32 = 12.0;
 /// Default step marker diameter, in pixels.
 const STEP_SIZE: f32 = 28.0;
+/// Default emoji stamp height, in pixels.
+const EMOJI_SIZE: f32 = 48.0;
 
-/// Tools that remember their own colour and size, separately from the rest (which
-/// share one). The highlighter starts yellow and wide, text at a readable size.
+/// Tools that remember their own colour, separately from the rest (which share one).
+/// The highlighter starts yellow. (Every tool remembers its own size: see `widths`.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum StyleSlot {
     Shared,
@@ -748,6 +753,7 @@ fn width_range(kind: Option<ShapeKind>) -> std::ops::RangeInclusive<f32> {
         Some(ShapeKind::Text) => 8.0..=120.0,
         Some(ShapeKind::Blur) => 4.0..=60.0,
         Some(ShapeKind::Step) => 16.0..=80.0,
+        Some(ShapeKind::Emoji) => 16.0..=256.0,
         _ => MIN_WIDTH..=MAX_WIDTH,
     }
 }
@@ -906,7 +912,8 @@ struct Overlay {
 
     tool: Tool,
     /// The tools in the toolbar, in order: those the settings leave switched on.
-    tools: Vec<&'static ToolInfo>,
+    /// The tools switched on in the settings, with the key that picks each.
+    tools: Vec<(&'static ToolInfo, Key)>,
     /// The toolbar's colour swatches, from the settings.
     swatches: [Color32; 4],
     /// Style for new annotations; mirrors the selected one, if any.
@@ -917,9 +924,21 @@ struct Overlay {
     double_head: bool,
     text_style: TextStyle,
     effect: Effect,
+    /// The emoji the stamp tool places.
+    emoji: String,
+    /// What is typed (or put by Windows' emoji panel) into the emoji picker's field.
+    emoji_field: String,
+    /// The emoji shown in the toolbar and picker, drawn once per emoji and size.
+    emoji_icons: HashMap<(String, u32), egui::TextureHandle>,
+    /// The stamp shown under the pointer before it is placed, for its emoji and size,
+    /// and the area it covers relative to the pointer.
+    emoji_preview: Option<((String, u32), egui::TextureHandle, Rect)>,
     /// Colour and size remembered per style slot, swapped in and out with `color` and
     /// `width` when switching tools.
-    styles: HashMap<StyleSlot, (Color32, f32)>,
+    styles: HashMap<StyleSlot, Color32>,
+    /// The size each tool was last used at, so a text's 24 px does not carry over to
+    /// the arrow drawn after it.
+    widths: HashMap<Tool, f32>,
     editing: Option<TextEdit>,
     /// The eyedropper is active: the next click picks a colour from the capture.
     picking_color: bool,
@@ -1083,7 +1102,12 @@ impl Overlay {
             action: None,
             pending_undo: None,
             tool: Tool::Select,
-            tools: TOOLS.iter().filter(|t| settings.tool_enabled(t.id)).collect(),
+            tools: TOOLS
+                .iter()
+                // Emoji stamps need Windows' emoji font.
+                .filter(|t| settings.tool_enabled(t.id) && (t.icon != Icon::Emoji || crate::emoji::available()))
+                .map(|t| (t, settings.tool_key(t)))
+                .collect(),
             color: swatches[0],
             width: 4.0,
             dash: Dash::Solid,
@@ -1091,12 +1115,23 @@ impl Overlay {
             double_head: false,
             text_style: TextStyle::Plain,
             effect: Effect::Pixelate,
+            emoji: crate::emoji::DEFAULT.to_owned(),
+            emoji_field: String::new(),
+            emoji_icons: HashMap::new(),
+            emoji_preview: None,
             styles: HashMap::from([
-                (StyleSlot::Marker, (settings.marker(), MARKER_WIDTH)),
-                (StyleSlot::Text, (swatches[0], TEXT_SIZE)),
+                (StyleSlot::Marker, settings.marker()),
+                (StyleSlot::Text, swatches[0]),
                 // Black: the colour of a redaction (pixelate and blur ignore it).
-                (StyleSlot::Blur, (Color32::BLACK, BLUR_STRENGTH)),
-                (StyleSlot::Step, (swatches[0], STEP_SIZE)),
+                (StyleSlot::Blur, Color32::BLACK),
+                (StyleSlot::Step, swatches[0]),
+            ]),
+            widths: HashMap::from([
+                (Tool::Shape(ShapeKind::Marker), MARKER_WIDTH),
+                (Tool::Shape(ShapeKind::Text), TEXT_SIZE),
+                (Tool::Shape(ShapeKind::Blur), BLUR_STRENGTH),
+                (Tool::Shape(ShapeKind::Step), STEP_SIZE),
+                (Tool::Shape(ShapeKind::Emoji), EMOJI_SIZE),
             ]),
             editing: None,
             picking_color: false,
@@ -1205,7 +1240,9 @@ impl Overlay {
             return Action::Region(Drag::Create { anchor: p });
         };
 
-        if let Some(edit) = &self.editing {
+        // Ctrl: whatever the tool, grab and move things as the Select tool does.
+        let grab = self.tool == Tool::Select || self.mods.ctrl;
+        if let Some(edit) = self.editing.as_ref().filter(|_| !grab) {
             if self.annotations[edit.index].hit(p, tol) {
                 return Action::Caret { at: p };
             }
@@ -1247,7 +1284,7 @@ impl Overlay {
         };
         match self.tool {
             // Topmost annotation under the pointer, else the region itself.
-            Tool::Select => match self.annotations.iter().rposition(|a| a.hit(p, tol)) {
+            _ if grab => match self.annotations.iter().rposition(|a| a.hit(p, tol)) {
                 Some(index) => move_shape(index),
                 None => Action::Region(Drag::Move { start: p, orig: sel }),
             },
@@ -1261,17 +1298,36 @@ impl Overlay {
             }
             // While drawing, only the selected annotation can be grabbed, so new
             // shapes can start on top of existing ones.
-            Tool::Shape(_) => match self.selected {
+            Tool::Shape(_) | Tool::Select => match self.selected {
                 Some(index) if self.annotations[index].hit(p, tol) => move_shape(index),
                 _ => Action::NewShape { anchor: p },
             },
         }
     }
 
-    fn begin_action(&mut self, action: Action) {
+    fn begin_action(&mut self, mut action: Action) {
         self.drag_moved = false;
         if !matches!(action, Action::Caret { .. }) {
+            // An empty text being typed into is dropped when editing ends: an
+            // annotation after it moves down one place.
+            let (edited, count) = (self.editing.as_ref().map(|e| e.index), self.annotations.len());
             self.finish_editing();
+            if let Some(edited) = edited.filter(|_| self.annotations.len() < count) {
+                match &mut action {
+                    Action::MoveShape { index, .. }
+                    | Action::ResizeBox { index, .. }
+                    | Action::MoveEnd { index, .. } => {
+                        if *index == edited {
+                            self.action = None;
+                            return;
+                        }
+                        if *index > edited {
+                            *index -= 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         match action {
             Action::Caret { at } => {
@@ -1307,8 +1363,20 @@ impl Overlay {
                     if let Some(step) = self.annotations.last_mut() {
                         step.text = next.to_string();
                     }
+                } else if kind == ShapeKind::Emoji {
+                    if let Some(stamp) = self.annotations.last_mut() {
+                        stamp.text = self.emoji.clone();
+                    }
                 }
                 self.selected = Some(self.annotations.len() - 1);
+            }
+            // Moved with Ctrl while drawing: a shape of another kind is moved without
+            // being selected, so its colour and size do not become the tool's.
+            Action::MoveShape { index, .. }
+                if matches!(self.tool, Tool::Shape(kind) if kind != self.annotations[index].kind) =>
+            {
+                self.selected = None;
+                self.pending_undo = Some(self.annotations.clone());
             }
             Action::MoveShape { index, .. }
             | Action::ResizeBox { index, .. }
@@ -1365,7 +1433,7 @@ impl Overlay {
             }
             Action::NewShape { anchor } => {
                 let Some(shape) = self.annotations.last_mut() else { return };
-                if shape.kind == ShapeKind::Step {
+                if matches!(shape.kind, ShapeKind::Step | ShapeKind::Emoji) {
                     (shape.a, shape.b) = (p, p);
                 } else if shape.is_box() {
                     shape.set_rect(Drag::Create { anchor }.apply(p, mods, bounds));
@@ -1454,10 +1522,11 @@ impl Overlay {
                     self.history.forget_last();
                     self.selected = None;
                 }
-                // Steps are placed one after another, often in different colours: leave
-                // a placed step unselected so picking a colour for the next one does not
-                // recolour it.
-                if self.annotations.last().is_some_and(|a| a.kind == ShapeKind::Step) {
+                // Steps and stamps are placed one after another, often in different
+                // colours or emoji: leave a placed one unselected so picking a colour or
+                // emoji for the next does not change it. (A stamp is sized before it is
+                // placed, from the preview under the pointer.)
+                if self.annotations.last().is_some_and(|a| matches!(a.kind, ShapeKind::Step | ShapeKind::Emoji)) {
                     self.selected = None;
                 }
             }
@@ -1493,9 +1562,9 @@ impl Overlay {
 
     // --- Editing commands --------------------------------------------------------------
 
-    /// Switch tools. The highlighter, text and blur tools each keep their own colour and
-    /// size (the highlighter starts yellow and wide), swapped in when switching to them
-    /// and out when leaving.
+    /// Switch tools. Every tool keeps its own size; the highlighter, text, blur and step
+    /// tools also keep their own colour (the highlighter starts yellow), while the
+    /// other tools share one.
     fn set_tool(&mut self, tool: Tool) {
         if tool == self.tool {
             return;
@@ -1506,10 +1575,18 @@ impl Overlay {
         self.selected = None;
         let (old, new) = (style_slot(self.tool), style_slot(tool));
         if old != new {
-            self.styles.insert(old, (self.color, self.width));
-            if let Some(&(color, width)) = self.styles.get(&new) {
-                (self.color, self.width) = (color, width);
+            self.styles.insert(old, self.color);
+            if let Some(&color) = self.styles.get(&new) {
+                self.color = color;
             }
+        }
+        // The Select tool's size is that of whatever it last selected: not a size of
+        // its own to remember.
+        if self.tool != Tool::Select {
+            self.widths.insert(self.tool, self.width);
+        }
+        if tool != Tool::Select {
+            self.width = self.widths.get(&tool).copied().unwrap_or(DEFAULT_WIDTH);
         }
         self.tool = tool;
     }
@@ -1517,7 +1594,12 @@ impl Overlay {
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
         let shape = self.annotations[index].clone();
-        self.color = shape.color;
+        if shape.kind == ShapeKind::Emoji {
+            // A stamp has no colour of its own to show.
+            self.emoji = shape.text.clone();
+        } else {
+            self.color = shape.color;
+        }
         self.width = shape.width;
         self.dash = shape.dash;
         self.head = shape.head;
@@ -1540,6 +1622,10 @@ impl Overlay {
             }
             ShapeKind::Text => shape.text_style = self.text_style,
             ShapeKind::Blur => shape.effect = self.effect,
+            ShapeKind::Emoji => {
+                shape.color = self.annotations[index].color;
+                shape.text = self.emoji.clone();
+            }
             _ => {}
         }
         if shape != self.annotations[index] {
@@ -1645,9 +1731,11 @@ impl Overlay {
                 let (row, start, len) = layout.line_of(edit.cursor);
                 let count = shape.text.chars().count();
                 match key {
+                    // As in chat apps: Enter finishes, Shift+Enter starts a new line.
+                    // Esc finishes too.
                     Key::Escape => return true,
-                    Key::Enter if modifiers.command => return true,
-                    Key::Enter => insert(shape, edit, "\n"),
+                    Key::Enter if modifiers.shift => insert(shape, edit, "\n"),
+                    Key::Enter => return true,
                     Key::Backspace if edit.cursor > 0 => {
                         let at = byte_at(&shape.text, edit.cursor - 1);
                         shape.text.remove(at);
@@ -2109,6 +2197,7 @@ impl Overlay {
             }
             // Step markers have no options beyond colour and size.
             ShapeKind::Step => {}
+            ShapeKind::Emoji => self.emoji_picker(ui),
             ShapeKind::Blur => {
                 icons::picker(ui, &mut self.effect, true, &Effect::ALL, icons::effect_preview)
                     .on_hover_text("Effect");
@@ -2133,6 +2222,136 @@ impl Overlay {
         }
     }
 
+    /// "V select · R rect · …" for those of the tools `ids` that are switched on, with
+    /// their keys.
+    fn key_hints(&self, ids: &[&str]) -> String {
+        let hint = |id: &str| {
+            let (info, key) = self.tools.iter().find(|(t, _)| t.id == id)?;
+            let short = match id {
+                "rect" => "rect",
+                "highlighter" => "marker",
+                "emoji" => "emoji",
+                _ => info.name.split_whitespace().next()?,
+            };
+            Some(format!("{} {}", key.name(), short.to_lowercase()))
+        };
+        ids.iter().filter_map(|id| hint(id)).collect::<Vec<_>>().join(" · ")
+    }
+
+    /// Draw `emoji` as large as fits in `area`, whole and centred, from a texture made
+    /// once per emoji and size.
+    fn paint_emoji(&mut self, ui: &egui::Ui, emoji: &str, area: Rect) {
+        let px = (area.height() * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+        let key = (emoji.to_owned(), px);
+        if !self.emoji_icons.contains_key(&key) {
+            let Some(texture) = emoji_texture(ui.ctx(), emoji, px) else { return };
+            self.emoji_icons.insert(key.clone(), texture);
+        }
+        if let Some(texture) = self.emoji_icons.get(&key) {
+            // Some emoji are wider than tall (or the reverse): fit the longer side.
+            let [w, h] = texture.size().map(|n| n as f32);
+            let scale = (area.width() / w).min(area.height() / h);
+            let shown = Rect::from_center_size(area.center(), vec2(w, h) * scale);
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            ui.painter().image(texture.id(), shown, uv, Color32::WHITE);
+        }
+    }
+
+    /// The emoji stamp's picker: the current emoji on a button that opens a grid of
+    /// favourites, and a field that takes any emoji, typed or put there by Windows'
+    /// emoji panel (Win+.).
+    fn emoji_picker(&mut self, ui: &mut egui::Ui) {
+        const COLUMNS: usize = 8;
+        const CELL: f32 = 30.0;
+        let popup_id = ui.auto_id_with("emoji-picker");
+        let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+        let (rect, response) = ui.allocate_exact_size(vec2(icons::PICKER_WIDTH, icons::BUTTON), Sense::click());
+        let visuals = ui.style().interact_selectable(&response, open);
+        if open || response.hovered() {
+            ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
+        }
+        let current = self.emoji.clone();
+        let icon = Rect::from_center_size(rect.left_center() + vec2(16.0, 0.0), Vec2::splat(20.0));
+        self.paint_emoji(ui, &current, icon);
+        let c = Pos2::new(rect.right() - 7.0, rect.center().y + 1.0);
+        let caret = vec![c + vec2(-3.0, -1.5), c + vec2(3.0, -1.5), c + vec2(0.0, 1.8)];
+        ui.painter().add(egui::Shape::convex_polygon(caret, visuals.fg_stroke.color, Stroke::NONE));
+        let response = response.on_hover_text("Emoji");
+        let just_opened = response.clicked() && !open;
+
+        let mut chosen = None;
+        let mut close = false;
+        egui::Popup::menu(&response)
+            .id(popup_id)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                let mut list: Vec<&str> = crate::emoji::FAVOURITES.to_vec();
+                if !list.contains(&current.as_str()) {
+                    list.insert(0, &current);
+                }
+                egui::Grid::new("emoji-grid").spacing(vec2(2.0, 2.0)).show(ui, |ui| {
+                    for (i, &emoji) in list.iter().enumerate() {
+                        let (cell, cell_response) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
+                        let selected = emoji == current;
+                        let visuals = ui.style().interact_selectable(&cell_response, selected);
+                        if selected || cell_response.hovered() {
+                            ui.painter().rect_filled(cell, 4.0, visuals.bg_fill);
+                        }
+                        self.paint_emoji(ui, emoji, cell.shrink(4.0));
+                        if cell_response.clicked() {
+                            chosen = Some(emoji.to_owned());
+                            close = true;
+                        }
+                        if (i + 1) % COLUMNS == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                let width = COLUMNS as f32 * (CELL + 2.0) - 2.0;
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.emoji_field)
+                        .hint_text("Any emoji: press Win+.")
+                        .desired_width(width),
+                );
+                if just_opened {
+                    field.request_focus();
+                }
+                // Each emoji picked in Windows' panel replaces the stamp; the panel and
+                // this picker stay open for another go.
+                let typed = self.emoji_field.trim();
+                if field.changed() && crate::emoji::is_emoji(typed) {
+                    chosen = Some(typed.to_owned());
+                    self.emoji_field.clear();
+                }
+            });
+        if close {
+            egui::Popup::close_id(ui.ctx(), popup_id);
+        }
+        if let Some(emoji) = chosen {
+            self.choose_emoji(emoji);
+        }
+    }
+
+    /// The next stamp, drawn as it would be placed with its centre at the origin: the
+    /// image and the desktop-pixel area it covers.
+    fn emoji_preview_layer(&self) -> Option<(egui::ColorImage, Rect)> {
+        let stamp = Annotation {
+            text: self.emoji.clone(),
+            ..Annotation::stroked(ShapeKind::Emoji, Pos2::ZERO, Pos2::ZERO, self.color, self.width, Dash::Solid)
+        };
+        stamp.layer(Rect::EVERYTHING)
+    }
+
+    /// Make `emoji` the stamp. With the stamp tool, it is for the next stamp; with the
+    /// Select tool, it replaces the selected stamp's.
+    fn choose_emoji(&mut self, emoji: String) {
+        if self.tool == Tool::Shape(ShapeKind::Emoji) {
+            self.selected = None;
+        }
+        self.emoji = emoji;
+    }
+
     fn toolbar(&mut self, ctx: &egui::Context, pos: Pos2, pivot: Align2, within: Rect) -> ToolbarOutput {
         let mut out = ToolbarOutput::default();
         let shown = egui::Area::new(egui::Id::unique("darkshot-toolbar"))
@@ -2144,10 +2363,10 @@ impl Overlay {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        for info in self.tools.clone() {
+                        for (info, key) in self.tools.clone() {
                             let Some(tool) = tool_for(info.icon) else { continue };
                             let button = icons::button(ui, info.icon, self.tool == tool, true);
-                            if button.on_hover_text(info.tip).clicked() {
+                            if button.on_hover_text(info.tip(key)).clicked() {
                                 self.set_tool(tool);
                             }
                         }
@@ -2165,9 +2384,9 @@ impl Overlay {
                                 self.color = swatch;
                             }
                         }
-                        if let Some(info) = self.tools.iter().find(|t| t.icon == Icon::Eyedropper) {
+                        if let Some(&(info, key)) = self.tools.iter().find(|(t, _)| t.icon == Icon::Eyedropper) {
                             let dropper = icons::button(ui, Icon::Eyedropper, self.picking_color, true);
-                            if dropper.on_hover_text(info.tip).clicked() {
+                            if dropper.on_hover_text(info.tip(key)).clicked() {
                                 self.picking_color = !self.picking_color;
                             }
                         }
@@ -2179,7 +2398,7 @@ impl Overlay {
                             _ if redact => "Not used by Redact",
                             Some(ShapeKind::Text) => "Font size (mouse wheel)",
                             Some(ShapeKind::Blur) => "Strength (mouse wheel)",
-                            Some(ShapeKind::Step) => "Size (mouse wheel)",
+                            Some(ShapeKind::Step | ShapeKind::Emoji) => "Size (mouse wheel)",
                             _ => "Thickness (mouse wheel)",
                         };
                         // Fixed width, so the toolbar does not shift when the value
@@ -2221,13 +2440,13 @@ impl Overlay {
                         // The readers, if switched on in the settings.
                         let readers = [(Icon::ReadText, read::Kind::Text), (Icon::ReadQr, read::Kind::Qr)];
                         let shown: Vec<_> =
-                            readers.into_iter().filter_map(|(icon, kind)| Some((self.tools.iter().find(|t| t.icon == icon)?, kind))).collect();
+                            readers.into_iter().filter_map(|(icon, kind)| Some((*self.tools.iter().find(|(t, _)| t.icon == icon)?, kind))).collect();
                         if !shown.is_empty() {
                             ui.separator();
                         }
-                        for (info, kind) in shown {
+                        for ((info, key), kind) in shown {
                             let open = self.reading.as_ref().is_some_and(|r| r.kind == kind);
-                            if icons::button(ui, info.icon, open, true).on_hover_text(info.tip).clicked() {
+                            if icons::button(ui, info.icon, open, true).on_hover_text(info.tip(key)).clicked() {
                                 out.read = Some(kind);
                             }
                         }
@@ -2357,6 +2576,36 @@ pub(crate) fn setup_text(ctx: &egui::Context) {
         style.visuals.text_options.subpixel_binning = false;
         style.visuals.text_options.font_hinting = true;
     });
+}
+
+/// `emoji` drawn about `px` pixels tall, cropped to the pixels it actually covers.
+/// Emoji differ in width and some reach beyond their box, so the toolbar and picker
+/// fit this whole image into their cells rather than drawing a fixed square.
+fn emoji_texture(ctx: &egui::Context, emoji: &str, px: u32) -> Option<egui::TextureHandle> {
+    // Room on every side for whatever spills out of the emoji's box.
+    let canvas = px * 2;
+    let mut pixmap = tiny_skia::Pixmap::new(canvas, canvas)?;
+    let centre = Pos2::new(canvas as f32 / 2.0, canvas as f32 / 2.0);
+    crate::emoji::rasterize(emoji, px as f32, centre, &mut pixmap.as_mut(), Pos2::ZERO);
+    let (mut x0, mut y0, mut x1, mut y1) = (canvas, canvas, 0, 0);
+    for (i, p) in pixmap.pixels().iter().enumerate() {
+        if p.alpha() > 0 {
+            let (x, y) = (i as u32 % canvas, i as u32 / canvas);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None; // nothing drawn
+    }
+    let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let data = pixmap.data();
+    let mut cropped = Vec::with_capacity(w * h * 4);
+    for y in y0..y1 {
+        let row = (y * canvas + x0) as usize * 4;
+        cropped.extend_from_slice(&data[row..row + w * 4]);
+    }
+    let image = egui::ColorImage::from_rgba_premultiplied([w, h], &cropped);
+    Some(ctx.load_texture("emoji", image, egui::TextureOptions::LINEAR))
 }
 
 /// Identifies how an annotation looks, for the layer caches.
@@ -2686,7 +2935,7 @@ impl eframe::App for Overlay {
             let ctrl = i.modifiers.command;
             let plain = !ctrl && !i.modifiers.alt;
             // Keys of tools switched off in the settings do nothing.
-            let pressed = enabled.iter().find(|t| plain && i.key_pressed(t.key)).map(|t| t.icon);
+            let pressed = enabled.iter().find(|(_, key)| plain && i.key_pressed(*key)).map(|(t, _)| t.icon);
             let wheel: f32 = i
                 .events
                 .iter()
@@ -2808,7 +3057,8 @@ impl eframe::App for Overlay {
             if let (Some(kind), Some(_)) = (keys.read, self.selection) {
                 self.start_reading(&ctx, kind);
             }
-            if keys.cancel {
+            // Esc with a picker open closes just the picker.
+            if keys.cancel && !egui::Popup::is_any_open(&ctx) {
                 // Esc first lets go of the selected annotation, then closes.
                 if self.selected.take().is_none() {
                     close = true;
@@ -2923,8 +3173,10 @@ impl eframe::App for Overlay {
             // Freehand strokes and text are shown from rasterised layers, exactly as
             // they will be saved. The stroke being drawn changes every frame, so it is
             // painted directly.
-            let layered = annotation.is_freehand() || matches!(annotation.kind, ShapeKind::Text | ShapeKind::Step);
-            if layered && !(drawing && i == last) {
+            let layered = annotation.is_freehand() || matches!(annotation.kind, ShapeKind::Text | ShapeKind::Step | ShapeKind::Emoji);
+            // A stamp has nothing to paint directly: it is drawn from its layer even
+            // while being placed.
+            if layered && !(drawing && i == last && annotation.kind != ShapeKind::Emoji) {
                 let key = layer_key(annotation);
                 if !self.layers.contains_key(&key) {
                     if let Some((image, area)) = annotation.layer(bounds) {
@@ -2941,6 +3193,27 @@ impl eframe::App for Overlay {
             annotation.paint(&painter, to_pt, scale);
         }
         self.layers.retain(|key, _| used.contains(key));
+
+        // The stamp tool shows the stamp under the pointer, at its size, before it is
+        // placed: the wheel resizes it there. Faded, so it is clearly not placed yet.
+        let stamp_at = hover.filter(|_| {
+            self.tool == Tool::Shape(ShapeKind::Emoji)
+                && self.action.is_none()
+                && response.hovered()
+                && !egui::Popup::is_any_open(&ctx)
+        });
+        if let Some(p) = stamp_at.map(to_px).filter(|&p| matches!(self.pick_action(p, tol), Action::NewShape { .. })) {
+            let key = (self.emoji.clone(), self.width.to_bits());
+            if self.emoji_preview.as_ref().is_none_or(|(k, _, _)| *k != key) {
+                self.emoji_preview = self.emoji_preview_layer().map(|(image, area)| {
+                    (key, ctx.load_texture("stamp-preview", image, egui::TextureOptions::LINEAR), area)
+                });
+            }
+            if let Some((_, texture, area)) = &self.emoji_preview {
+                let shown = rect_to_pt(area.translate(p.to_vec2()));
+                painter.image(texture.id(), shown, uv, Color32::WHITE.gamma_multiply(0.7));
+            }
+        }
 
         let dim = Color32::from_black_alpha(130);
         match self.selection {
@@ -3103,27 +3376,31 @@ impl eframe::App for Overlay {
 
         let reading_lines = self.reading.as_ref().is_some_and(|r| !r.lines().is_empty());
         let hint = if self.confirm_open {
-            "Enter discard · Esc keep editing"
+            "Enter discard · Esc keep editing".to_owned()
         } else if reading_lines {
-            "Click a line to pick it · Shift+click a word · Ctrl+Enter copy · Esc close"
+            "Click a line to pick it · Shift+click a word · Ctrl+Enter copy · Esc close".to_owned()
         } else if self.picking_color {
-            "Click to pick a colour · hold Shift to magnify · Esc cancel"
+            "Click to pick a colour · hold Shift to magnify · Esc cancel".to_owned()
         } else if self.editing.is_some() {
-            "Type · Enter new line · arrows move · Esc or click outside to finish"
+            "Type · Enter finish · Shift+Enter new line · arrows move · Ctrl+drag moves the text".to_owned()
         } else if self.selection.is_none() {
-            "Drag to select an area · Ctrl+click a window · hold Ctrl to snap · Ctrl+A whole screen · Esc cancel"
+            "Drag to select an area · Ctrl+click a window · hold Ctrl to snap · Ctrl+A whole screen · Esc cancel".to_owned()
+        } else if self.tool == Tool::Shape(ShapeKind::Emoji) && self.selected.is_none() {
+            "Click to place the stamp · mouse wheel resizes it · Ctrl+drag moves a drawing · Ctrl+Z undo".to_owned()
         } else if self.selected.is_some() {
-            "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect"
+            "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect".to_owned()
         } else if matches!(self.action, Some(Action::Rotate { .. })) {
-            "Turning the capture · drawings stay put · Shift turns in 15° steps · right-click the handle to undo"
+            "Turning the capture · drawings stay put · Shift turns in 15° steps · right-click the handle to undo".to_owned()
         } else if self.annotations.is_empty() {
-            "Round handle turns the capture (right-click resets) · V select · R rect · E ellipse · L line · A arrow · T text · B blur · Ctrl+Z undo"
+            let keys = self.key_hints(&["select", "rect", "ellipse", "line", "arrow", "text", "blur", "emoji"]);
+            format!("Round handle turns the capture (right-click resets) · {keys} · Ctrl+Z undo")
         } else {
-            "V select · R rect · E ellipse · L line · A arrow · P pen · M marker · T text · B blur · Shift constrain/straight · Ctrl+Z undo"
+            let keys = self.key_hints(&["select", "rect", "ellipse", "line", "arrow", "pen", "highlighter", "text", "blur"]);
+            format!("{keys} · Ctrl+drag moves a drawing · Shift constrain/straight · Ctrl+Z undo")
         };
         let monitor = self.desktop.screens[self.current_monitor];
         let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);
-        label(&painter, bottom, Align2::CENTER_BOTTOM, hint.to_owned(), Color32::WHITE);
+        label(&painter, bottom, Align2::CENTER_BOTTOM, hint, Color32::WHITE);
         if let Some(err) = &self.error {
             let pos = bottom + vec2(0.0, -30.0);
             label(&painter, pos, Align2::CENTER_BOTTOM, err.clone(), Color32::LIGHT_RED);
@@ -3251,7 +3528,30 @@ mod tests {
         overlay.set_tool(marker);
         assert_eq!((overlay.color, overlay.width), (SWATCHES[1], 24.0));
         overlay.set_tool(Tool::Select);
-        assert_eq!((overlay.color, overlay.width), (SWATCHES[0], 6.0));
+        assert_eq!(overlay.color, SWATCHES[0]);
+        // Each tool keeps its own size, even tools that share a colour.
+        overlay.set_tool(rect_tool);
+        assert_eq!(overlay.width, 4.0);
+        overlay.set_tool(Tool::Shape(ShapeKind::Pen));
+        assert_eq!(overlay.width, 6.0);
+    }
+
+    #[test]
+    fn size_does_not_carry_over_from_text_or_a_selected_shape() {
+        let mut overlay = plain_overlay(200, 200, RgbaImage::new(200, 200));
+        let arrow = Tool::Shape(ShapeKind::Arrow);
+        overlay.set_tool(arrow);
+        overlay.width = 3.0;
+        overlay.set_tool(Tool::Shape(ShapeKind::Text));
+        assert_eq!(overlay.width, TEXT_SIZE);
+        overlay.width = 40.0;
+        overlay.set_tool(arrow);
+        assert_eq!(overlay.width, 3.0);
+        // Selecting a big text with the Select tool does not change the arrow's size.
+        overlay.set_tool(Tool::Select);
+        overlay.width = 40.0;
+        overlay.set_tool(arrow);
+        assert_eq!(overlay.width, 3.0);
     }
 
     fn plain_overlay(w: u32, h: u32, shot: RgbaImage) -> Overlay {
@@ -3494,12 +3794,69 @@ mod tests {
             Snap::default(),
         );
         let overlay = Overlay::with_desktop(desktop, None, &settings);
-        let ids: Vec<&str> = overlay.tools.iter().map(|t| t.id).collect();
+        let ids: Vec<&str> = overlay.tools.iter().map(|(t, _)| t.id).collect();
         assert_eq!(ids.len(), TOOLS.len() - 2);
         assert!(!ids.contains(&"blur") && !ids.contains(&"eyedropper") && ids.contains(&"pen"));
         // Every tool but the eyedropper and the readers is one you draw or select with.
         let actions = [Icon::Eyedropper, Icon::ReadText, Icon::ReadQr];
         assert!(TOOLS.iter().all(|t| tool_for(t.icon).is_some() == !actions.contains(&t.icon)));
+    }
+
+    #[test]
+    fn custom_tool_keys_and_emoji_stamps() {
+        let mut settings = Settings::default();
+        settings.set_tool_key(&TOOLS[1], Some(Key::K));
+        let desktop = Desktop::new(
+            vec![RgbaImage::new(10, 10)],
+            RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            vec![rect(0.0, 0.0, 10.0, 10.0)],
+            0,
+            Snap::default(),
+        );
+        let overlay = Overlay::with_desktop(desktop, None, &settings);
+        let key_of = |id: &str| overlay.tools.iter().find(|(t, _)| t.id == id).map(|(_, k)| *k);
+        assert_eq!((key_of("rect"), key_of("pen")), (Some(Key::K), Some(Key::P)));
+        assert_eq!(overlay.key_hints(&["select", "rect", "highlighter"]), "V select · K rect · M marker");
+
+        if !crate::emoji::available() {
+            return;
+        }
+        let mut overlay = plain_overlay(200, 200, RgbaImage::new(200, 200));
+        overlay.selection = Some(rect(0.0, 0.0, 200.0, 200.0));
+        overlay.set_tool(Tool::Shape(ShapeKind::Emoji));
+        assert_eq!(overlay.width, EMOJI_SIZE);
+        overlay.emoji = "🔥".into();
+        overlay.begin_action(Action::NewShape { anchor: Pos2::new(50.0, 50.0) });
+        overlay.apply_action(Pos2::new(80.0, 70.0), Modifiers::NONE, overlay.bounds());
+        overlay.end_action();
+        // A click places the stamp where the pointer was let go, and leaves it
+        // unselected, so the next emoji or size is for the next stamp.
+        let stamp = &overlay.annotations[0];
+        assert_eq!((stamp.text.as_str(), stamp.a), ("🔥", Pos2::new(80.0, 70.0)));
+        assert_eq!(overlay.selected, None);
+        overlay.width = 90.0;
+        overlay.choose_emoji("❌".into());
+        overlay.restyle_selected();
+        assert_eq!((overlay.annotations[0].text.as_str(), overlay.annotations[0].width), ("🔥", EMOJI_SIZE));
+        // The preview is the stamp as it would be placed: same emoji, size and look.
+        let (_, area) = overlay.emoji_preview_layer().unwrap();
+        let placed = Annotation { text: "❌".into(), width: 90.0, ..overlay.annotations[0].clone() };
+        let (_, placed_area) = placed.layer(Rect::EVERYTHING).unwrap();
+        assert_eq!(area.translate(Pos2::new(80.0, 70.0).to_vec2()), placed_area);
+        // With the Select tool, it changes the selected stamp.
+        overlay.set_tool(Tool::Select);
+        overlay.select(0);
+        overlay.choose_emoji("👍🏽".into());
+        overlay.restyle_selected();
+        assert_eq!(overlay.annotations[0].text, "👍🏽");
+        // Picker icons are cropped to what the emoji draws, so none is cut off.
+        let ctx = egui::Context::default();
+        for emoji in crate::emoji::FAVOURITES {
+            let texture = emoji_texture(&ctx, emoji, 40).unwrap();
+            let [w, h] = texture.size();
+            assert!(w > 10 && h > 10 && w <= 80 && h <= 80, "{emoji}: {w}x{h}");
+        }
+        assert!(crate::emoji::is_emoji("👍🏽") && !crate::emoji::is_emoji("ab") && !crate::emoji::is_emoji(""));
     }
 
     fn key(key: Key) -> egui::Event {
@@ -3522,7 +3879,7 @@ mod tests {
         overlay.start_text(Pos2::new(50.0, 50.0));
         for event in [
             egui::Event::Text("Hello".into()),
-            key(Key::Enter),
+            egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT },
             egui::Event::Text("wrld".into()),
             key(Key::ArrowLeft),
             key(Key::ArrowLeft),
@@ -3537,7 +3894,7 @@ mod tests {
             assert!(!overlay.text_event(&event));
         }
         assert_eq!(overlay.annotations[0].text, "Hello!\nby\nworld");
-        assert!(overlay.text_event(&key(Key::Escape)));
+        assert!(overlay.text_event(&key(Key::Enter)), "Enter finishes");
         overlay.finish_editing();
 
         // The whole edit is one undo step.
@@ -3774,5 +4131,35 @@ mod tests {
         assert_eq!(out.get_pixel(1, 0).0, [0, 0, 0, 0]); // above the right monitor: no screen there
         assert_eq!(out.get_pixel(1, 1).0, [0, 0, 255, 255]); // right monitor
         assert_eq!(out.get_pixel(2, 2).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn ctrl_drag_moves_a_shape_with_any_tool() {
+        let mut overlay = plain_overlay(200, 200, RgbaImage::new(200, 200));
+        overlay.selection = Some(rect(0.0, 0.0, 200.0, 200.0));
+        overlay.set_tool(Tool::Shape(ShapeKind::Rect));
+        overlay.width = 9.0;
+        overlay.begin_action(Action::NewShape { anchor: Pos2::new(20.0, 20.0) });
+        overlay.apply_action(Pos2::new(60.0, 60.0), Modifiers::NONE, overlay.bounds());
+        overlay.end_action();
+        overlay.set_tool(Tool::Shape(ShapeKind::Arrow));
+        let arrow_width = overlay.width;
+        let edge = Pos2::new(20.0, 40.0);
+
+        // Without Ctrl the arrow tool draws a new arrow there.
+        assert!(matches!(overlay.pick_action(edge, GRAB_TOLERANCE), Action::NewShape { .. }));
+
+        overlay.mods = Modifiers::CTRL;
+        overlay.begin_action(overlay.pick_action(edge, GRAB_TOLERANCE));
+        overlay.apply_action(edge + vec2(10.0, 5.0), Modifiers::CTRL, overlay.bounds());
+        overlay.end_action();
+        assert_eq!(overlay.annotations.len(), 1);
+        assert_eq!(overlay.annotations[0].rect(), rect(30.0, 25.0, 70.0, 65.0));
+        // The rectangle's style did not become the arrow's.
+        assert_eq!(overlay.width, arrow_width);
+        assert_eq!(overlay.selected, None);
+        // Undo puts it back.
+        overlay.undo();
+        assert_eq!(overlay.annotations[0].rect(), rect(20.0, 20.0, 60.0, 60.0));
     }
 }
