@@ -61,9 +61,18 @@ register.
 | B | Blur: pixelate, Gaussian or solid redaction |
 | N | Numbered steps |
 | I | Eyedropper (Shift magnifies to single pixels) |
+| O | Copy text: read the text in the region (OCR) |
+| Q | Read the QR codes in the region |
 
 The mouse wheel changes thickness, font size, blur strength or step size. Ctrl+Z
 undoes, Ctrl+Y or Ctrl+Shift+Z redoes, and Delete removes the selected annotation.
+
+Copy text (O) and Read QR code (Q) show what they find in a panel, where you can edit
+it before copying. Each line of text, or each QR code, is outlined on the capture: click
+lines to copy only those, or Shift+click single words. Both work offline. Text
+recognition is the one built into Windows, in the languages you have installed;
+anything you blurred or redacted is hidden from it too. A link in a QR code is copied
+as text and never opened.
 
 The Decoration button in the toolbar adds a border, a drop shadow or both around the
 image when it is copied or saved. The border has its own colour, thickness and line

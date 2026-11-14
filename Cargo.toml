@@ -32,15 +32,19 @@ global-hotkey = "0.10.0"
 # The default set compiles in a dozen more decoders and an AVIF encoder.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico"] }
 raw-window-handle = "0.6"
+# Finds and decodes QR codes in the capture, offline. Without its default "img" feature
+# it reads plain greyscale pixels and pulls in no image decoders of its own.
+rqrr = { version = "0.11.0", default-features = false }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
 toml = "1.2.1"
 tray-icon = "0.26.1"
 ttf-parser = "0.25.1"
-# COM interfaces (DXGI desktop duplication, for monitors showing HDR), which windows-sys
-# does not have. Already in the build through other crates.
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Devices_Display", "Win32_Graphics_Gdi", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11"] }
+# COM and WinRT interfaces, which windows-sys does not have: DXGI desktop duplication
+# (for monitors showing HDR) and Windows' own offline text recognition (OCR). Already in
+# the build through other crates.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Devices_Display", "Win32_Graphics_Gdi", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Foundation_Collections"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Registry"] }
 winit = "0.30"
 xcap = "0.9.10"
@@ -60,6 +64,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+# Makes QR codes for the tests to read.
+qrcode = { version = "0.14.1", default-features = false }
 
 [build-dependencies]
 embed-resource = "3.0.12"

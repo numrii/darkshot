@@ -23,6 +23,8 @@ pub enum Icon {
     Undo,
     Redo,
     Decoration,
+    ReadText,
+    ReadQr,
     Copy,
     Save,
     Close,
@@ -364,6 +366,26 @@ pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, ba
             painter.rect_stroke(back, 1.5, stroke, StrokeKind::Middle);
             painter.rect_filled(front, 1.5, background);
             painter.rect_stroke(front, 1.5, stroke, StrokeKind::Middle);
+        }
+        Icon::ReadText => {
+            // Lines of text inside the corners of a scan frame.
+            for (x0, y0, dx, dy) in [(2.5, 2.5, 1.0, 1.0), (17.5, 2.5, -1.0, 1.0), (2.5, 17.5, 1.0, -1.0), (17.5, 17.5, -1.0, -1.0)] {
+                line(&[(x0, y0 + 4.0 * dy), (x0, y0), (x0 + 4.0 * dx, y0)]);
+            }
+            line(&[(6.0, 7.5), (14.0, 7.5)]);
+            line(&[(6.0, 10.5), (14.0, 10.5)]);
+            line(&[(6.0, 13.5), (11.0, 13.5)]);
+        }
+        Icon::ReadQr => {
+            // Three finder squares and a few modules.
+            for (x, y) in [(2.5, 2.5), (11.5, 2.5), (2.5, 11.5)] {
+                let r = Rect::from_min_max(p(x, y), p(x + 6.0, y + 6.0));
+                painter.rect_stroke(r, 0.5, stroke, StrokeKind::Middle);
+                painter.rect_filled(Rect::from_center_size(r.center(), Vec2::splat(2.0 * unit)), 0.0, color);
+            }
+            for (x, y) in [(12.0, 12.0), (15.5, 12.0), (12.0, 15.5), (15.5, 15.5), (13.75, 13.75)] {
+                painter.rect_filled(Rect::from_min_size(p(x, y), Vec2::splat(2.0 * unit)), 0.0, color);
+            }
         }
         Icon::Decoration => {
             // A framed picture and the shadow it casts.

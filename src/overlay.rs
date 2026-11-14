@@ -34,6 +34,7 @@ use crate::annotate::{
     MIN_WIDTH,
 };
 use crate::effects;
+use crate::read;
 use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::Settings;
 use crate::snap::{self, Snap};
@@ -664,6 +665,8 @@ struct Overlay {
     shadow: bool,
     /// The decoration panel (border and shadow) is open.
     decor_open: bool,
+    /// The panel showing text or QR codes read from the region, while it is open.
+    reading: Option<Reading>,
     /// Ask before closing without copying or saving when there are annotations.
     confirm_discard: bool,
     /// That question is on screen.
@@ -684,12 +687,93 @@ struct Overlay {
     error: Option<String>,
 }
 
+/// Text or QR codes read from the region, shown in a panel for copying.
+struct Reading {
+    kind: read::Kind,
+    /// Where the image that was read sits on the desktop: its top-left pixel.
+    origin: Pos2,
+    /// While reading runs in the background: where its outcome arrives.
+    pending: Option<std::sync::mpsc::Receiver<read::Outcome>>,
+    /// The lines found, or why there are none.
+    outcome: Option<read::Outcome>,
+    /// The words picked by clicking, as (line, word). None picked means all of them.
+    picked: HashSet<(usize, usize)>,
+    /// The text to copy: the picked words, or everything. Editable in the panel, and
+    /// written afresh when the picks change.
+    text: String,
+}
+
+impl Reading {
+    /// The lines found, if reading is done and found some.
+    fn lines(&self) -> &[read::Line] {
+        match &self.outcome {
+            Some(Ok(lines)) => lines,
+            _ => &[],
+        }
+    }
+
+    /// The line, and the word in it, at desktop pixel `p`.
+    fn hit(&self, p: Pos2) -> Option<(usize, usize)> {
+        let p = (p - self.origin).to_pos2();
+        self.lines().iter().enumerate().find_map(|(i, line)| {
+            // A little slack round each word, so the gaps between them count too.
+            let slack = (line.rect().height() * 0.25).max(2.0);
+            let j = line.words.iter().position(|w| w.rect.expand2(eframe::egui::vec2(slack * 1.6, slack)).contains(p))?;
+            Some((i, j))
+        })
+    }
+
+    /// Click on a line: pick all of it, or let all of it go if it was all picked.
+    /// With `word_only`, pick or let go of just the word.
+    fn toggle(&mut self, (line, word): (usize, usize), word_only: bool) {
+        let count = self.lines()[line].words.len();
+        if word_only {
+            if !self.picked.remove(&(line, word)) {
+                self.picked.insert((line, word));
+            }
+        } else if (0..count).all(|j| self.picked.contains(&(line, j))) {
+            for j in 0..count {
+                self.picked.remove(&(line, j));
+            }
+        } else {
+            self.picked.extend((0..count).map(|j| (line, j)));
+        }
+        self.text = self.picked_text();
+    }
+
+    /// The text of the picked words: whole lines as read, partly picked lines as their
+    /// picked words, one line under another. Everything if nothing is picked.
+    fn picked_text(&self) -> String {
+        let lines = self.lines();
+        if self.picked.is_empty() {
+            return read::joined(lines);
+        }
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let words: Vec<&str> =
+                (0..line.words.len()).filter(|&j| self.picked.contains(&(i, j))).map(|j| line.words[j].text.as_str()).collect();
+            if words.len() == line.words.len() {
+                out.push(line.text.clone());
+            } else if !words.is_empty() {
+                out.push(words.join(" "));
+            }
+        }
+        out.join("\n")
+    }
+}
+
+/// Whether reading has finished and found something.
+fn found_any(reading: &Reading) -> bool {
+    !reading.lines().is_empty()
+}
+
 /// What the toolbar asked for this frame.
 #[derive(Default)]
 struct ToolbarOutput {
     /// Where the toolbar was drawn, in points.
     rect: Option<Rect>,
     decor: bool,
+    read: Option<read::Kind>,
     copy: bool,
     save: bool,
     close: bool,
@@ -736,6 +820,7 @@ impl Overlay {
             border_unset: !settings.frame.border,
             shadow: settings.frame.shadow,
             decor_open: false,
+            reading: None,
             confirm_discard: settings.confirm_discard,
             confirm_open: false,
             annotations: Vec::new(),
@@ -1363,6 +1448,16 @@ impl Overlay {
     /// here and on screen.
     fn output(&self) -> Option<RgbaImage> {
         let origin = self.selection?.intersect(self.bounds()).min.round();
+        let mut img = self.redacted()?;
+        annotate::render_onto(&mut img, origin, &self.annotations);
+        Some(effects::frame(img, &self.frame()))
+    }
+
+    /// The selection with blur regions and redactions applied, and nothing else: what
+    /// text and QR codes are read from. What the user hid stays hidden from reading too;
+    /// their own arrows and text are left out, as they would only get in the way.
+    fn redacted(&self) -> Option<RgbaImage> {
+        let origin = self.selection?.intersect(self.bounds()).min.round();
         let mut img = self.cropped()?;
         for shape in self.blur_order().into_iter().map(|i| &self.annotations[i]) {
             if let Some((blurred, area)) = self.blurred(shape) {
@@ -1370,8 +1465,148 @@ impl Overlay {
                 image::imageops::replace(&mut img, &blurred, offset.x as i64, offset.y as i64);
             }
         }
-        annotate::render_onto(&mut img, origin, &self.annotations);
-        Some(effects::frame(img, &self.frame()))
+        Some(img)
+    }
+
+    /// Start reading the region's text or QR codes in the background, and open the
+    /// panel that shows what is found.
+    fn start_reading(&mut self, ctx: &egui::Context, kind: read::Kind) {
+        self.finish_editing();
+        self.save_open = false;
+        self.decor_open = false;
+        self.picking_color = false;
+        let Some(img) = self.redacted() else { return };
+        let Some(origin) = self.selection.map(|s| s.intersect(self.bounds()).min.round()) else { return };
+        let (send, receive) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(read::read(kind, &img));
+            ctx.request_repaint();
+        });
+        self.reading =
+            Some(Reading { kind, origin, pending: Some(receive), outcome: None, picked: HashSet::new(), text: String::new() });
+    }
+
+    /// The reading panel, next to the toolbar: what was read, editable, and a button to
+    /// copy it. Returns the text to copy when the user asks for it.
+    fn reading_panel(&mut self, ctx: &egui::Context, toolbar: Rect, below: bool, within: Rect) -> Option<String> {
+        let reading = self.reading.as_mut()?;
+        if let Some(outcome) = reading.pending.as_ref().and_then(|r| r.try_recv().ok()) {
+            reading.outcome = Some(outcome);
+            reading.pending = None;
+            reading.text = reading.picked_text();
+        }
+        let (pos, pivot) = if below {
+            (toolbar.right_bottom() + vec2(0.0, 6.0), Align2::RIGHT_TOP)
+        } else {
+            (toolbar.right_top() - vec2(0.0, 6.0), Align2::RIGHT_BOTTOM)
+        };
+        let mut copy = None;
+        let mut close = false;
+        egui::Area::new(egui::Id::unique("darkshot-reading-panel"))
+            .order(egui::Order::Foreground)
+            .pivot(pivot)
+            .fixed_pos(pos)
+            .constrain_to(within)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(380.0);
+                    let title = match reading.kind {
+                        read::Kind::Text => "Text in the region",
+                        read::Kind::Qr => "QR code",
+                    };
+                    ui.label(egui::RichText::new(title).strong());
+                    ui.add_space(4.0);
+                    let weak = ui.visuals().weak_text_color();
+                    match &reading.outcome {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Reading…");
+                            });
+                        }
+                        Some(Err(why)) => {
+                            ui.label(why.as_str());
+                        }
+                        Some(Ok(lines)) => {
+                            let several = lines.len() > 1 || lines.iter().any(|l| l.words.len() > 1);
+                            let hint = match (reading.kind, reading.picked.is_empty()) {
+                                (_, false) => "Showing what you picked. Click it again to let it go.",
+                                (read::Kind::Text, true) if several => {
+                                    "Click lines in the region to copy only those; Shift+click picks single words."
+                                }
+                                (read::Kind::Qr, true) if several => "Click a code in the region to copy only that one.",
+                                _ => "",
+                            };
+                            if !hint.is_empty() {
+                                ui.label(egui::RichText::new(hint).color(weak).small());
+                            }
+                            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                                ui.add(egui::TextEdit::multiline(&mut reading.text).desired_width(f32::INFINITY).desired_rows(3));
+                            });
+                            if reading.kind == read::Kind::Qr && reading.text.contains("://") {
+                                ui.label(egui::RichText::new("Links are copied as text, never opened.").color(weak).small());
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let found = matches!(reading.outcome, Some(Ok(_)));
+                        let button = ui.add_enabled(found, egui::Button::new("Copy text"));
+                        if button.on_hover_text("Copy and close (Ctrl+Enter)").clicked() {
+                            copy = Some(reading.text.clone());
+                        }
+                        if found && !reading.picked.is_empty() && ui.button("Pick none").clicked() {
+                            reading.picked.clear();
+                            reading.text = reading.picked_text();
+                        }
+                        if ui.button("Close").on_hover_text("Esc").clicked() {
+                            close = true;
+                        }
+                    });
+                    if found_any(reading) && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter)) {
+                        copy = Some(reading.text.clone());
+                    }
+                });
+            });
+        if close {
+            self.reading = None;
+        }
+        copy
+    }
+
+    /// Outline what was read, on the capture: every line (or QR code) faintly, the
+    /// picked words filled.
+    fn paint_reading(&self, painter: &egui::Painter, to_pt: impl Fn(Pos2) -> Pos2, hover: Option<(usize, usize)>, word_only: bool) {
+        let Some(reading) = &self.reading else { return };
+        let area = |r: Rect| {
+            let r = r.translate(reading.origin.to_vec2()).expand(2.0);
+            Rect::from_min_max(to_pt(r.min), to_pt(r.max))
+        };
+        for (i, line) in reading.lines().iter().enumerate() {
+            let hovered_line = hover.is_some_and(|(h, _)| h == i) && !word_only;
+            let outline = if hovered_line { ACCENT } else { ACCENT.gamma_multiply(0.55) };
+            painter.rect_stroke(area(line.rect()), 2.0, Stroke::new(1.0, outline), StrokeKind::Outside);
+            for (j, word) in line.words.iter().enumerate() {
+                if reading.picked.contains(&(i, j)) {
+                    painter.rect_filled(area(word.rect), 2.0, ACCENT.gamma_multiply(0.35));
+                } else if word_only && hover == Some((i, j)) {
+                    painter.rect_stroke(area(word.rect), 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Outside);
+                }
+            }
+        }
+    }
+
+    fn copy_text_to_clipboard(text: &str) -> AnyResult<()> {
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("DARKSHOT_COPY_TO") {
+            std::fs::write(path, text)?;
+            return Ok(());
+        }
+        // Like images: kept out of clipboard history and cloud sync.
+        use arboard::SetExtWindows;
+        arboard::Clipboard::new()?.set().exclude_from_history().exclude_from_cloud().text(text)?;
+        Ok(())
     }
 
     /// The border and shadow this capture gets.
@@ -1444,6 +1679,7 @@ impl Overlay {
             self.confirm_open = true;
             self.save_open = false;
             self.decor_open = false;
+            self.reading = None;
             self.picking_color = false;
             return false;
         }
@@ -1635,6 +1871,20 @@ impl Overlay {
                         let redo = icons::button(ui, Icon::Redo, false, self.history.can_redo());
                         if redo.on_hover_text("Redo (Ctrl+Y)").clicked() {
                             self.redo();
+                        }
+
+                        // The readers, if switched on in the settings.
+                        let readers = [(Icon::ReadText, read::Kind::Text), (Icon::ReadQr, read::Kind::Qr)];
+                        let shown: Vec<_> =
+                            readers.into_iter().filter_map(|(icon, kind)| Some((self.tools.iter().find(|t| t.icon == icon)?, kind))).collect();
+                        if !shown.is_empty() {
+                            ui.separator();
+                        }
+                        for (info, kind) in shown {
+                            let open = self.reading.as_ref().is_some_and(|r| r.kind == kind);
+                            if icons::button(ui, info.icon, open, true).on_hover_text(info.tip).clicked() {
+                                out.read = Some(kind);
+                            }
                         }
 
                         ui.separator();
@@ -1973,9 +2223,14 @@ impl eframe::App for Overlay {
         // While the discard question is up, the capture underneath is left alone: only
         // the question (and the toolbar's Copy and Save) respond.
         let asking = self.confirm_open;
+        // With text or QR codes read, a click on one picks it.
+        let read_hit = |overlay: &Self, p: Pos2| overlay.reading.as_ref().and_then(|r| r.hit(to_px(p)));
         if response.drag_started() && !asking {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
-                if self.picking_color {
+                if let (Some(hit), Some(reading)) = (read_hit(self, origin), self.reading.as_mut()) {
+                    reading.toggle(hit, mods.shift);
+                    self.ignore_drag = true;
+                } else if self.picking_color {
                     if let Some(color) = self.pixel_at(to_px(origin)) {
                         self.color = color;
                     }
@@ -2006,7 +2261,10 @@ impl eframe::App for Overlay {
             let p = hover.filter(|_| response.hovered())?;
             Some(self.pick_action(to_px(p), tol))
         });
-        if let Some(action) = preview {
+        let read_hover = hover.filter(|_| response.hovered() && self.action.is_none()).and_then(|p| read_hit(self, p));
+        if read_hover.is_some() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        } else if let Some(action) = preview {
             ctx.set_cursor_icon(match action {
                 Action::Region(Drag::Resize { hx, hy, .. })
                 | Action::ResizeBox { drag: Drag::Resize { hx, hy, .. }, .. } => resize_cursor(hx, hy),
@@ -2031,6 +2289,7 @@ impl eframe::App for Overlay {
             delete: bool,
             tool: Option<Tool>,
             eyedropper: bool,
+            read: Option<read::Kind>,
             wheel: f32,
         }
         let typing = ctx.egui_wants_keyboard_input();
@@ -2068,6 +2327,11 @@ impl eframe::App for Overlay {
                 delete: i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
                 tool: pressed.and_then(tool_for),
                 eyedropper: pressed == Some(Icon::Eyedropper),
+                read: match pressed {
+                    Some(Icon::ReadText) => Some(read::Kind::Text),
+                    Some(Icon::ReadQr) => Some(read::Kind::Qr),
+                    _ => None,
+                },
                 wheel,
             }
         });
@@ -2112,6 +2376,10 @@ impl eframe::App for Overlay {
         if self.picking_color && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.picking_color = false;
             esc_used = true;
+        } else if self.reading.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            // Even while the text is being edited.
+            self.reading = None;
+            esc_used = true;
         } else if self.decor_open && !typing && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.decor_open = false;
             esc_used = true;
@@ -2126,6 +2394,7 @@ impl eframe::App for Overlay {
         } else if keys.save && !typing {
             self.save_open = true;
             self.decor_open = false;
+            self.reading = None;
         }
 
         let mut close = false;
@@ -2151,6 +2420,9 @@ impl eframe::App for Overlay {
             }
             if keys.eyedropper {
                 self.picking_color = !self.picking_color;
+            }
+            if let (Some(kind), Some(_)) = (keys.read, self.selection) {
+                self.start_reading(&ctx, kind);
             }
             if keys.cancel {
                 // Esc first lets go of the selected annotation, then closes.
@@ -2178,6 +2450,7 @@ impl eframe::App for Overlay {
         // --- Toolbar -------------------------------------------------------------------
         let creating_region = matches!(self.action, Some(Action::Region(Drag::Create { .. })));
         let mut toolbar = ToolbarOutput::default();
+        let mut copy_text = None;
         if let (Some(sel_px), false) = (self.selection, creating_region) {
             let sel = rect_to_pt(sel_px);
             // Below the region's bottom-right corner, or tucked inside when the region
@@ -2201,10 +2474,23 @@ impl eframe::App for Overlay {
             if toolbar.save {
                 self.save_open = !self.save_open;
                 self.decor_open = false;
+                self.reading = None;
             }
             if toolbar.decor {
                 self.decor_open = !self.decor_open;
                 self.save_open = false;
+                self.reading = None;
+            }
+            if let Some(kind) = toolbar.read {
+                // The same button again closes the panel; the other one reads anew.
+                if self.reading.as_ref().is_some_and(|r| r.kind == kind) {
+                    self.reading = None;
+                } else {
+                    self.start_reading(&ctx, kind);
+                }
+            }
+            if let (true, Some(rect)) = (self.reading.is_some(), toolbar.rect) {
+                copy_text = self.reading_panel(&ctx, rect, pivot == Align2::RIGHT_TOP, monitor);
             }
             if let (true, Some(rect)) = (self.save_open, toolbar.rect) {
                 save_requested |= self.save_panel(&ctx, rect, pivot == Align2::RIGHT_TOP, monitor);
@@ -2215,6 +2501,7 @@ impl eframe::App for Overlay {
         } else {
             self.save_open = false;
             self.decor_open = false;
+            self.reading = None;
         }
         self.restyle_selected();
 
@@ -2334,6 +2621,8 @@ impl eframe::App for Overlay {
             }
         }
 
+        self.paint_reading(&painter, to_pt, read_hover, mods.shift);
+
         // Handles of the selected annotation, in an accent colour to tell them apart
         // from the region's.
         if let Some(shape) = self.selected.map(|i| &self.annotations[i]) {
@@ -2404,8 +2693,11 @@ impl eframe::App for Overlay {
             }
         }
 
+        let reading_lines = self.reading.as_ref().is_some_and(|r| !r.lines().is_empty());
         let hint = if self.confirm_open {
             "Enter discard · Esc keep editing"
+        } else if reading_lines {
+            "Click a line to pick it · Shift+click a word · Ctrl+Enter copy · Esc close"
         } else if self.picking_color {
             "Click to pick a colour · hold Shift to magnify · Esc cancel"
         } else if self.editing.is_some() {
@@ -2426,7 +2718,7 @@ impl eframe::App for Overlay {
         }
 
         // --- Actions -------------------------------------------------------------------
-        let enter_copies = keys.enter && !was_editing && !self.save_open;
+        let enter_copies = keys.enter && !was_editing && !self.save_open && self.reading.is_none();
         let copy = toolbar.copy || (keys.copy || enter_copies) && !typing;
         let save = save_requested && self.save_open;
         if copy || save {
@@ -2442,6 +2734,11 @@ impl eframe::App for Overlay {
         }
         if discard || (close || toolbar.close) && self.request_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if let Some(text) = copy_text {
+            match Self::copy_text_to_clipboard(&text) {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => self.error = Some(format!("Failed: {e}")),
+            }
         } else if copy || save {
             let result = if copy {
                 match self.clipboard_output() {
@@ -2572,8 +2869,9 @@ mod tests {
         let ids: Vec<&str> = overlay.tools.iter().map(|t| t.id).collect();
         assert_eq!(ids.len(), TOOLS.len() - 2);
         assert!(!ids.contains(&"blur") && !ids.contains(&"eyedropper") && ids.contains(&"pen"));
-        // Every tool but the eyedropper is one you draw or select with.
-        assert!(TOOLS.iter().all(|t| tool_for(t.icon).is_some() == (t.icon != Icon::Eyedropper)));
+        // Every tool but the eyedropper and the readers is one you draw or select with.
+        let actions = [Icon::Eyedropper, Icon::ReadText, Icon::ReadQr];
+        assert!(TOOLS.iter().all(|t| tool_for(t.icon).is_some() == !actions.contains(&t.icon)));
     }
 
     fn key(key: Key) -> egui::Event {
@@ -2699,6 +2997,40 @@ mod tests {
         overlay.shadow = true;
         assert_eq!(overlay.output().unwrap().get_pixel(0, 0).0[3], 0);
         assert_eq!(overlay.clipboard_output().unwrap().get_pixel(0, 0).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn picking_lines_and_words() {
+        let word = |text: &str, x: f32, y: f32| read::Word { text: text.into(), rect: rect(x, y, x + 40.0, y + 12.0) };
+        let lines = vec![
+            read::Line { text: "alpha beta".into(), words: vec![word("alpha", 0.0, 0.0), word("beta", 50.0, 0.0)] },
+            read::Line { text: "gamma".into(), words: vec![word("gamma", 0.0, 30.0)] },
+        ];
+        let mut reading = Reading {
+            kind: read::Kind::Text,
+            origin: Pos2::new(100.0, 200.0),
+            pending: None,
+            outcome: Some(Ok(lines)),
+            picked: HashSet::new(),
+            text: String::new(),
+        };
+        assert_eq!(reading.picked_text(), "alpha beta\ngamma");
+        // Hits are in desktop pixels, offset by where the region was.
+        assert_eq!(reading.hit(Pos2::new(160.0, 205.0)), Some((0, 1)));
+        assert_eq!(reading.hit(Pos2::new(105.0, 235.0)), Some((1, 0)));
+        assert_eq!(reading.hit(Pos2::new(105.0, 260.0)), None);
+
+        reading.toggle((1, 0), false);
+        assert_eq!(reading.text, "gamma");
+        reading.toggle((0, 1), true);
+        assert_eq!(reading.text, "beta\ngamma");
+        // A click on a partly picked line picks all of it; again lets it go.
+        reading.toggle((0, 0), false);
+        assert_eq!(reading.text, "alpha beta\ngamma");
+        reading.toggle((0, 0), false);
+        assert_eq!(reading.text, "gamma");
+        reading.toggle((1, 0), false);
+        assert_eq!(reading.text, "alpha beta\ngamma"); // nothing picked: everything
     }
 
     #[test]

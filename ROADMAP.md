@@ -18,16 +18,19 @@ capture contains or how long it is kept.
   selection and annotations to the tray process, which keeps them in memory only
   (never on disk), drops them after a set time or on the next capture, and can reopen
   them from the tray menu or a shortcut. Gone when Darkshot quits.
-- OCR to clipboard: recognise the text in the selection with Windows' built-in offline
-  OCR (`Windows.Media.Ocr`) and copy it as text.
-- QR codes: decode a QR code in the selection locally and copy its contents as text.
-  Links are copied, never opened.
 
 Considered and left out: scrolling capture (it would mean sending scroll input to other
-apps, which Darkshot avoids), GIF and video recording, and uploads of any kind.
+apps, which Darkshot avoids), GIF and video recording, uploads of any kind, and checking
+for or downloading updates (that needs network code, which Darkshot has none of).
 
 ## Done
 
+- Copy text (O) and Read QR code (Q): read the region's text with Windows' built-in
+  offline OCR (`Windows.Media.Ocr`), or decode its QR codes locally (`rqrr`). Results
+  show in an editable panel; each line or code is outlined on the capture and can be
+  clicked to copy only it (Shift+click for single words). Blurs and redactions apply
+  before reading. Text goes to the clipboard kept out of history and cloud sync; links
+  are never opened. Both can be switched off under Enabled tools.
 - Include the mouse cursor (a setting, off by default): the cursor is drawn into the
   capture where it was when the capture was asked for.
 - Ask before discarding (a setting, off by default): Esc or Close asks first when a

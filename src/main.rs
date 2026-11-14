@@ -13,6 +13,7 @@ mod hdr;
 mod icons;
 mod overlay;
 mod picker;
+mod read;
 mod save;
 mod settings;
 mod settings_window;

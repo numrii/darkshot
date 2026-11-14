@@ -1,5 +1,6 @@
-//! The annotation tools, in toolbar order: one list for the capture toolbar, its
-//! keyboard shortcuts and the "Enabled tools" setting.
+//! The annotation tools, in toolbar order, then the eyedropper and the readers (text and
+//! QR codes): one list for the capture toolbar, its keyboard shortcuts and the "Enabled
+//! tools" setting.
 
 use eframe::egui::Key;
 
@@ -16,7 +17,7 @@ pub struct ToolInfo {
     pub tip: &'static str,
 }
 
-pub const TOOLS: [ToolInfo; 11] = [
+pub const TOOLS: [ToolInfo; 13] = [
     ToolInfo { id: "select", name: "Select and move", icon: Icon::Select, key: Key::V, tip: "Select, move and resize (V)" },
     ToolInfo { id: "rect", name: "Rectangle", icon: Icon::Rect, key: Key::R, tip: "Rectangle (R)" },
     ToolInfo { id: "ellipse", name: "Ellipse", icon: Icon::Ellipse, key: Key::E, tip: "Ellipse (E)" },
@@ -46,6 +47,14 @@ pub const TOOLS: [ToolInfo; 11] = [
         key: Key::I,
         tip: "Pick a colour from the screen (I)",
     },
+    ToolInfo {
+        id: "read-text",
+        name: "Copy text (OCR)",
+        icon: Icon::ReadText,
+        key: Key::O,
+        tip: "Read the text in the region (O)",
+    },
+    ToolInfo { id: "read-qr", name: "Read QR code", icon: Icon::ReadQr, key: Key::Q, tip: "Read a QR code in the region (Q)" },
 ];
 
 #[cfg(test)]
