@@ -11,7 +11,7 @@ description = "Privacy-first screenshot and annotation tool: clipboard or file, 
 # (`--features personal`) adds the rest. Neither hooks the keyboard or sends key presses:
 # the capture shortcut is always an ordinary registered hotkey.
 [features]
-personal = ["free-shortcut", "appdata-fallback", "trace", "autostart"]
+personal = ["free-shortcut", "appdata-fallback", "trace", "autostart", "open-with"]
 # A setting that frees a Win+ shortcut Windows keeps for itself (Win+Shift+S), through
 # the current user's DisabledHotkeys registry value, so it can be registered.
 free-shortcut = []
@@ -21,6 +21,9 @@ appdata-fallback = []
 trace = []
 # A "Start with Windows" setting, stored in the current user's Run registry key.
 autostart = []
+# A setting that offers Darkshot under Explorer's "Open with" for PNG and JPEG files,
+# stored under the current user's HKCU\Software\Classes registry key.
+open-with = []
 
 [dependencies]
 arboard = "3.7.0"

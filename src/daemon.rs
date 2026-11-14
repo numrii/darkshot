@@ -25,16 +25,35 @@ const MENU_CAPTURE: &str = "capture";
 const MENU_SETTINGS: &str = "settings";
 const MENU_OPEN: &str = "open";
 const MENU_CLIPBOARD: &str = "clipboard";
+const MENU_REOPEN: &str = "reopen";
 const MENU_QUIT: &str = "quit";
 
 /// Thread messages to the main thread, which owns the hotkey and the tray.
 const WM_OPEN_SETTINGS: u32 = WM_APP + 1;
 const WM_SETTINGS_CLOSED: u32 = WM_APP + 2;
-/// Let go of the capture shortcut, if one is registered.
-fn release(hotkeys: &GlobalHotKeyManager, active: &mut Option<HotKey>) {
-    if let Some(hotkey) = active.take() {
+/// What a registered shortcut does.
+#[derive(Clone, Copy, PartialEq)]
+enum Shortcut {
+    Capture,
+    Clipboard,
+    Reopen,
+}
+
+/// The registered shortcuts, by hotkey id.
+type Active = Arc<Mutex<Vec<(HotKey, Shortcut)>>>;
+
+/// Let go of every registered shortcut.
+fn release(hotkeys: &GlobalHotKeyManager, active: &Active) {
+    for (hotkey, _) in active.lock().unwrap().drain(..) {
         let _ = hotkeys.unregister(hotkey);
     }
+}
+
+/// The menu entries whose text shows a shortcut.
+struct Items {
+    capture: MenuItem,
+    clipboard: MenuItem,
+    reopen: MenuItem,
 }
 
 pub fn run() -> AnyResult<()> {
@@ -46,21 +65,34 @@ pub fn run() -> AnyResult<()> {
     let main_thread = unsafe { GetCurrentThreadId() };
 
     let hotkeys = GlobalHotKeyManager::new()?;
+    let active: Active = Arc::default();
     {
-        let overlay = overlay.clone();
+        let (overlay, active) = (overlay.clone(), active.clone());
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
-            if e.state == HotKeyState::Pressed {
-                start_capture(&overlay);
+            if e.state != HotKeyState::Pressed {
+                return;
+            }
+            let which = active.lock().unwrap().iter().find(|(h, _)| h.id() == e.id).map(|(_, s)| *s);
+            match which {
+                Some(Shortcut::Capture) => start_capture(&overlay),
+                Some(Shortcut::Clipboard) => start_overlay(&overlay, "--clipboard"),
+                Some(Shortcut::Reopen) => reopen(&overlay),
+                None => {}
             }
         }));
     }
 
     // Tray icon: left click captures, right click opens the menu.
-    let capture_item = MenuItem::with_id(MENU_CAPTURE, "Capture", true, None);
+    let items = Items {
+        capture: MenuItem::with_id(MENU_CAPTURE, "Capture", true, None),
+        clipboard: MenuItem::with_id(MENU_CLIPBOARD, "Edit clipboard image", true, None),
+        reopen: MenuItem::with_id(MENU_REOPEN, "Reopen last capture", false, None),
+    };
     let menu = Menu::with_items(&[
-        &capture_item,
+        &items.capture,
+        &items.reopen,
         &MenuItem::with_id(MENU_OPEN, "Open image…", true, None),
-        &MenuItem::with_id(MENU_CLIPBOARD, "Edit clipboard image", true, None),
+        &items.clipboard,
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(MENU_SETTINGS, "Settings…", true, None),
         &PredefinedMenuItem::separator(),
@@ -95,6 +127,8 @@ pub fn run() -> AnyResult<()> {
                 start_overlay(&overlay, "--open");
             } else if e.id == MENU_CLIPBOARD {
                 start_overlay(&overlay, "--clipboard");
+            } else if e.id == MENU_REOPEN {
+                reopen(&overlay);
             } else if e.id == MENU_SETTINGS {
                 post(WM_OPEN_SETTINGS);
             } else if e.id == MENU_QUIT {
@@ -103,8 +137,7 @@ pub fn run() -> AnyResult<()> {
         }));
     }
 
-    let mut active = None;
-    apply_hotkey(&hotkeys, &mut active, &capture_item, &tray);
+    apply_hotkey(&hotkeys, &active, &items, &tray);
     let mut settings_open = false;
 
     // The tray icon and the hotkey both deliver their events through this thread's
@@ -117,16 +150,16 @@ pub fn run() -> AnyResult<()> {
                     if !settings_open {
                         // Let go of the shortcut while the settings are open, so pressing
                         // the current combination to record it does not start a capture.
-                        release(&hotkeys, &mut active);
+                        release(&hotkeys, &active);
                         settings_open = open_settings(main_thread);
                         if !settings_open {
-                            apply_hotkey(&hotkeys, &mut active, &capture_item, &tray);
+                            apply_hotkey(&hotkeys, &active, &items, &tray);
                         }
                     }
                 }
                 WM_SETTINGS_CLOSED if msg.hwnd.is_null() => {
                     settings_open = false;
-                    apply_hotkey(&hotkeys, &mut active, &capture_item, &tray);
+                    apply_hotkey(&hotkeys, &active, &items, &tray);
                 }
                 _ => {
                     TranslateMessage(&msg);
@@ -138,11 +171,42 @@ pub fn run() -> AnyResult<()> {
     Ok(())
 }
 
-/// Read the shortcut from the settings and register it, replacing whatever was
-/// registered before. Updates the menu and tooltip, and explains if it is not available.
-fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &mut Option<HotKey>, capture_item: &MenuItem, tray: &TrayIcon) {
+/// Read the shortcuts from the settings and register them, replacing whatever was
+/// registered before. Updates the menu and tooltip, and explains if one is not available.
+fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, tray: &TrayIcon) {
     release(hotkeys, active);
     let settings = Settings::load();
+    items.reopen.set_enabled(settings.keep_minutes > 0);
+    for (text, which, item, name) in [
+        (&settings.clipboard_hotkey, Shortcut::Clipboard, &items.clipboard, "Edit clipboard image"),
+        (&settings.reopen_hotkey, Shortcut::Reopen, &items.reopen, "Reopen last capture"),
+    ] {
+        let label = text.trim();
+        item.set_text(name);
+        if label.is_empty() || which == Shortcut::Reopen && settings.keep_minutes == 0 {
+            continue;
+        }
+        match parse_hotkey(label).ok_or_else(|| "not a valid key combination".to_owned()).and_then(|h| {
+            hotkeys.register(h).map(|()| h).map_err(|e| e.to_string())
+        }) {
+            Ok(hotkey) => {
+                active.lock().unwrap().push((hotkey, which));
+                item.set_text(format!("{name}\t{label}"));
+            }
+            Err(e) => {
+                eprintln!("could not register {label}: {e}");
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("Darkshot")
+                    .set_description(format!(
+                        "The {name} shortcut {label} could not be registered. Windows or another \
+                         application may already use it. You can choose another under Settings."
+                    ))
+                    .show();
+            }
+        }
+    }
+    let capture_item = &items.capture;
     let label = settings.hotkey.trim().to_owned();
     let result = match parse_hotkey(&label) {
         Some(hotkey) => hotkeys.register(hotkey).map(|()| hotkey).map_err(|e| e.to_string()),
@@ -150,7 +214,7 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &mut Option<HotKey>, capt
     };
     match result {
         Ok(shortcut) => {
-            *active = Some(shortcut);
+            active.lock().unwrap().push((shortcut, Shortcut::Capture));
             capture_item.set_text(format!("Capture\t{label}"));
             let _ = tray.set_tooltip(Some(format!("Darkshot: press {label} to capture")));
         }
@@ -200,13 +264,37 @@ fn start_capture(overlay: &Mutex<Option<Child>>) {
     start_overlay(overlay, "--capture");
 }
 
+/// Bring back the last capture, if an overlay is keeping one (Reopen last capture).
+fn reopen(overlay: &Mutex<Option<Child>>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+    let mut slot = overlay.lock().unwrap();
+    let Some(child) = slot.as_mut() else { return };
+    if !matches!(child.try_wait(), Ok(None)) {
+        return;
+    }
+    if let (Some(kept), Some(again)) = (crate::keep::kept(), crate::keep::reopen()) {
+        if kept.is_set() {
+            unsafe { AllowSetForegroundWindow(child.id()) };
+            again.set();
+        }
+    }
+}
+
 /// Launch the overlay as a child process with `mode` (`--capture`, `--open` or
-/// `--clipboard`), unless one is already on screen.
+/// `--clipboard`), unless one is already on screen. One that is hidden, keeping the
+/// last capture, is ended first: the new capture replaces it.
 fn start_overlay(overlay: &Mutex<Option<Child>>, mode: &str) {
     let mut slot = overlay.lock().unwrap();
     if let Some(child) = slot.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
-            return;
+            match crate::keep::kept().filter(|k| k.is_set()) {
+                Some(kept) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    kept.reset();
+                }
+                None => return,
+            }
         }
     }
     let spawned = std::env::current_exe()
@@ -214,7 +302,10 @@ fn start_overlay(overlay: &Mutex<Option<Child>>, mode: &str) {
             // Pass our own flags (such as `--trace`) on to the overlay.
             Command::new(exe)
                 .arg(mode)
-                .args(std::env::args().skip(1).filter(|a| a.starts_with("--") && !["--capture", "--open", "--clipboard"].contains(&a.as_str())))
+                .arg("--tray")
+                .args(std::env::args().skip(1).filter(|a| {
+                    a.starts_with("--") && !["--capture", "--open", "--clipboard", "--tray"].contains(&a.as_str())
+                }))
                 .spawn()
         });
     match spawned {

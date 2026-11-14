@@ -11,26 +11,58 @@ capture contains or how long it is kept.
 - Try HDR capture on a real HDR display: colours and brightness should match the screen,
   not look washed out. Not yet possible here.
 
-- A hotkey strip that fits: with many tools enabled and a tool with many modifiers
-  (Select), the strip can grow wider than the monitor and run off both sides. When it
-  would pass 95% of the monitor's width, wrap long descriptions onto another line
-  (growing the strip downwards) rather than letting it widen, and if it still
-  doesn't fit, break it into a second row of entries.
-
-- Editing an existing image, later additions: a shortcut for Edit clipboard image;
-  zoom and pan for large images; "Open with" in Explorer (needs the registry, so only
-  the personal build would offer it).
-- Reopen last capture (opt-in): when the overlay closes, it hands its capture,
-  selection and annotations to the tray process, which keeps them in memory only
-  (never on disk), drops them after a set time or on the next capture, and can reopen
-  them from the tray menu or a shortcut. Gone when Darkshot quits.
-
 Considered and left out: scrolling capture (it would mean sending scroll input to other
 apps, which Darkshot avoids), GIF and video recording, uploads of any kind, and checking
 for or downloading updates (that needs network code, which Darkshot has none of).
 
+If GIF recording is reconsidered, this is what it would take (looked into in November
+2026; roughly two weeks for recording and saving, three to four with trimming and
+annotations):
+
+- Encoding (the small part): the `image` crate's `gif` feature (pure Rust `gif` and
+  `color_quant`; not gifski or imagequant, which are GPL). Small files come from one
+  palette shared by all frames, then for each frame: pixels identical to what is
+  already shown (or within a tolerance) become transparent, the frame is cropped to
+  what changed and drawn over the previous one, and identical frames only lengthen the
+  previous frame's delay. Compare against the shown image rather than the previous
+  source frame, so tolerances do not add up into drift, and avoid random dithering,
+  whose noise changes every frame and defeats the transparency.
+- Capture: keep a DXGI desktop duplication open (as `hdr` already does for one HDR
+  frame), reading 8-bit frames at a fixed rate and cropping to the region. One monitor
+  only; `xcap`'s whole-monitor capture is too slow per frame.
+- Recording flow (the largest part and the main risk): select the region on the frozen
+  overlay, then the overlay closes and a click-through border window, kept out of the
+  recording with `WDA_EXCLUDEFROMCAPTURE`, shows the region with a stop button and a
+  timer; the shortcut or the tray also stops it. The capture process lives on while
+  recording, with a length limit.
+- Memory, not disk: raw frames are large (30 s of 800×600 at 15 fps is about 860 MB),
+  and a temp file would break "only the clipboard or a file you choose", so frames are
+  kept in memory as changed areas and encoded after stopping, which also allows the
+  shared palette and trimming.
+- Save only: most apps take a pasted GIF only as a file, which would need one on disk.
+  Optional extras are trimming and drawing static annotations onto every frame. The
+  restrictive build might leave recording out.
+
 ## Done
 
+- Version 1.3.0:
+  - The hotkey strip wraps onto more rows instead of running off the screen past 95%
+    of its width; groups stay together on one row when they fit on one.
+  - Compact tool help shows everything but the keys and modifiers, which the strip
+    already shows.
+  - An opened image that fits gets a window a little larger than itself instead of
+    covering the screen. Opened images zoom (Ctrl+wheel, around the pointer) and pan
+    (middle-drag or Space+drag); Ctrl+0 fits them again.
+  - A shortcut for Edit clipboard image, set in Settings.
+  - Open with in Explorer for PNG and JPEG (personal build): registered for the
+    current user only, never as the default app.
+  - Reopen last capture (opt-in): an overlay started from the tray hides when done
+    and keeps everything in its own memory, never on disk, for 1-60 minutes. The tray
+    menu or a shortcut brings it back; the next capture or the time ends it.
+- Version 1.2.0: emoji stamps, keys chosen per tool, Ctrl+drag moves a drawing with any
+  tool, sizes remembered per tool, Enter finishes a text (Shift+Enter for a new line),
+  and help on screen: the hotkey strip, the tool box beside the region, the F1 sheet
+  and the Tool help setting.
 - Edit an existing image: a PNG or JPEG (dragged onto the exe, `darkshot.exe
   picture.png`, or Open image… in the tray menu) or the clipboard image (Edit clipboard
   image) opens in the overlay with the whole image selected. No window snapping; Save

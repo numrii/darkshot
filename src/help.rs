@@ -19,7 +19,7 @@ pub enum HelpLevel {
     /// What the tool does, its clicks and drags, keys and modifiers, toolbar options.
     #[default]
     Full,
-    /// Only the keys and modifiers.
+    /// Everything but the keys and modifiers, which the strip already shows.
     Compact,
     /// No tool box; the strip at the bottom stays.
     Off,
@@ -265,7 +265,7 @@ pub fn tool_box(ctx: &egui::Context, help: &ToolHelp, key: Option<&str>, level: 
                         ui.label(RichText::new("F1 help").small().color(weak));
                     });
                 });
-                if level == HelpLevel::Full {
+                {
                     ui.add(egui::Label::new(RichText::new(help.does).color(weak)).wrap());
                     ui.add_space(2.0);
                     egui::Grid::new("help-acts").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -275,17 +275,20 @@ pub fn tool_box(ctx: &egui::Context, help: &ToolHelp, key: Option<&str>, level: 
                             ui.end_row();
                         }
                     });
+                }
+                // Compact leaves the keys and modifiers to the strip at the bottom.
+                if level == HelpLevel::Full {
                     ui.add_space(4.0);
                     ui.label(RichText::new("Keys and modifiers").small().color(weak));
+                    egui::Grid::new("help-mods").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                        for &(keys, does) in help.mods {
+                            ui.horizontal(|ui| keycaps(ui, keys));
+                            ui.add(egui::Label::new(does).wrap());
+                            ui.end_row();
+                        }
+                    });
                 }
-                egui::Grid::new("help-mods").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
-                    for &(keys, does) in help.mods {
-                        ui.horizontal(|ui| keycaps(ui, keys));
-                        ui.add(egui::Label::new(does).wrap());
-                        ui.end_row();
-                    }
-                });
-                if let (HelpLevel::Full, Some(opts)) = (level, help.opts) {
+                if let Some(opts) = help.opts {
                     ui.add_space(4.0);
                     ui.label(RichText::new("In the toolbar").small().color(weak));
                     ui.add(egui::Label::new(opts).wrap());
@@ -321,23 +324,78 @@ const WORD_FONT: f32 = 12.0;
 const CAP_HEIGHT: f32 = 17.0;
 const ROW_GAP: f32 = 4.0;
 const WHAT_HEIGHT: f32 = 16.0;
-/// The strip's full height, in points.
-pub const STRIP_HEIGHT: f32 = CAP_HEIGHT + ROW_GAP + WHAT_HEIGHT + 14.0;
+/// One row of entries: keys over what they do.
+const ROW_HEIGHT: f32 = CAP_HEIGHT + ROW_GAP + WHAT_HEIGHT;
+/// Space between rows when the strip wraps.
+const ROW_SPACING: f32 = 10.0;
+const PAD: Vec2 = vec2(14.0, 7.0);
+/// The strip's full height with one row, in points.
+pub const STRIP_HEIGHT: f32 = ROW_HEIGHT + 2.0 * PAD.y;
+/// Between groups: gap, line, gap.
+const SEPARATOR: f32 = 37.0;
 
-/// Draw the strip, its bottom edge centred on `bottom`. Groups are set apart by a thin
-/// line. Returns the strip's rectangle.
-pub fn strip(painter: &egui::Painter, bottom: Pos2, groups: &[Vec<Entry>]) -> Rect {
+/// One laid-out entry.
+struct Column {
+    caps: Vec<(std::sync::Arc<egui::Galley>, f32)>,
+    word: Option<std::sync::Arc<egui::Galley>>,
+    icon: Option<Icon>,
+    active: bool,
+    width: f32,
+}
+
+/// Entries from one group that share a row, and the gap between them.
+struct Piece<'a> {
+    columns: Vec<&'a Column>,
+    gap: f32,
+}
+
+impl Piece<'_> {
+    fn width(&self) -> f32 {
+        self.columns.iter().map(|c| c.width).sum::<f32>() + self.gap * self.columns.len().saturating_sub(1) as f32
+    }
+}
+
+fn row_width(row: &[Piece]) -> f32 {
+    row.iter().map(Piece::width).sum::<f32>() + SEPARATOR * row.len().saturating_sub(1) as f32
+}
+
+/// Put the groups' entries into rows no wider than `limit`. A group stays on one row
+/// when it fits on one; a group too long for a row by itself carries on onto the next.
+fn flow<'a>(groups: &'a [Vec<Column>], gaps: &[f32], limit: f32) -> Vec<Vec<Piece<'a>>> {
+    let mut rows: Vec<Vec<Piece>> = vec![Vec::new()];
+    for (group, &gap) in groups.iter().zip(gaps) {
+        let whole = Piece { columns: group.iter().collect(), gap };
+        let row = rows.last().unwrap();
+        let sep = if row.is_empty() { 0.0 } else { SEPARATOR };
+        if row_width(row) + sep + whole.width() <= limit {
+            rows.last_mut().unwrap().push(whole);
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(Vec::new());
+        }
+        let mut piece = Piece { columns: Vec::new(), gap };
+        for c in group {
+            piece.columns.push(c);
+            if piece.columns.len() > 1 && piece.width() > limit {
+                piece.columns.pop();
+                let full = std::mem::replace(&mut piece, Piece { columns: vec![c], gap });
+                rows.last_mut().unwrap().push(full);
+                rows.push(Vec::new());
+            }
+        }
+        rows.last_mut().unwrap().push(piece);
+    }
+    rows
+}
+
+/// Draw the strip centred on `anchor`: its top edge there if `from_top`, else its
+/// bottom edge. Groups are set apart by a thin line. Entries wrap onto more rows when
+/// the strip would be wider than `max_width`. Returns the strip's rectangle.
+pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f32, groups: &[Vec<Entry>]) -> Rect {
     let white = Color32::WHITE;
     let cap_font = FontId::monospace(STRIP_FONT);
     let word_font = FontId::proportional(WORD_FONT);
-    // Lay out every column first, to know the width.
-    struct Column {
-        caps: Vec<(std::sync::Arc<egui::Galley>, f32)>,
-        word: Option<std::sync::Arc<egui::Galley>>,
-        icon: Option<Icon>,
-        active: bool,
-        width: f32,
-    }
     let columns: Vec<Vec<Column>> = groups
         .iter()
         .map(|group| {
@@ -367,55 +425,55 @@ pub fn strip(painter: &egui::Painter, bottom: Pos2, groups: &[Vec<Entry>]) -> Re
                 .collect()
         })
         .collect();
-    let inner_gap = |group: &[Column]| if group.iter().all(|c| c.icon.is_some()) { 12.0 } else { 18.0 };
-    let group_width = |group: &[Column]| {
-        group.iter().map(|c| c.width).sum::<f32>() + inner_gap(group) * group.len().saturating_sub(1) as f32
-    };
-    let separator = 37.0; // gap, line, gap
-    let width = columns.iter().map(|g| group_width(g)).sum::<f32>() + separator * columns.len().saturating_sub(1) as f32;
-    let height = CAP_HEIGHT + ROW_GAP + WHAT_HEIGHT;
-    let pad = vec2(14.0, 7.0);
-    let rect = Rect::from_min_size(bottom - vec2(width / 2.0 + pad.x, height + 2.0 * pad.y), vec2(width, height) + 2.0 * pad);
+    let gaps: Vec<f32> =
+        columns.iter().map(|g| if g.iter().all(|c| c.icon.is_some()) { 12.0 } else { 18.0 }).collect();
+    let rows = flow(&columns, &gaps, (max_width - 2.0 * PAD.x).max(120.0));
+    let width = rows.iter().map(|r| row_width(r)).fold(0.0, f32::max);
+    let height = rows.len() as f32 * ROW_HEIGHT + rows.len().saturating_sub(1) as f32 * ROW_SPACING;
+    let size = vec2(width, height) + 2.0 * PAD;
+    let min = if from_top { anchor - vec2(size.x / 2.0, 0.0) } else { anchor - vec2(size.x / 2.0, size.y) };
+    let rect = Rect::from_min_size(min, size);
     painter.rect_filled(rect, 6.0, Color32::from_black_alpha(200));
 
     let cap_fill = Color32::from_white_alpha(26);
     let cap_line = Stroke::new(1.0, Color32::from_white_alpha(51));
-    let mut x = rect.left() + pad.x;
-    let top = rect.top() + pad.y;
-    for (i, group) in columns.iter().enumerate() {
-        if i > 0 {
-            let lx = x + separator / 2.0;
-            painter.line_segment([Pos2::new(lx, top), Pos2::new(lx, top + height)], Stroke::new(1.0, Color32::from_white_alpha(51)));
-            x += separator;
-        }
-        let gap = inner_gap(group);
-        for (j, c) in group.iter().enumerate() {
-            if j > 0 {
-                x += gap;
+    for (r, row) in rows.iter().enumerate() {
+        let top = rect.top() + PAD.y + r as f32 * (ROW_HEIGHT + ROW_SPACING);
+        let mut x = rect.left() + PAD.x + (width - row_width(row)) / 2.0;
+        for (i, piece) in row.iter().enumerate() {
+            if i > 0 {
+                let lx = x + SEPARATOR / 2.0;
+                painter.line_segment([Pos2::new(lx, top), Pos2::new(lx, top + ROW_HEIGHT)], cap_line);
+                x += SEPARATOR;
             }
-            if c.active {
-                let lit = Rect::from_min_size(Pos2::new(x, top), vec2(c.width, height)).expand2(vec2(4.0, 3.0));
-                painter.rect_filled(lit, 4.0, Color32::from_rgba_unmultiplied(80, 150, 255, 90));
-                painter.rect_stroke(lit, 4.0, Stroke::new(1.0, Color32::from_rgb(110, 170, 255)), StrokeKind::Inside);
+            for (j, c) in piece.columns.iter().enumerate() {
+                if j > 0 {
+                    x += piece.gap;
+                }
+                if c.active {
+                    let lit = Rect::from_min_size(Pos2::new(x, top), vec2(c.width, ROW_HEIGHT)).expand2(vec2(4.0, 3.0));
+                    painter.rect_filled(lit, 4.0, Color32::from_rgba_unmultiplied(80, 150, 255, 90));
+                    painter.rect_stroke(lit, 4.0, Stroke::new(1.0, Color32::from_rgb(110, 170, 255)), StrokeKind::Inside);
+                }
+                let caps_width = c.caps.iter().map(|(_, w)| w).sum::<f32>() + 3.0 * (c.caps.len().saturating_sub(1)) as f32;
+                let mut cx = x + (c.width - caps_width) / 2.0;
+                for (g, w) in &c.caps {
+                    let cap = Rect::from_min_size(Pos2::new(cx, top), vec2(*w, CAP_HEIGHT));
+                    painter.rect_filled(cap, 3.0, cap_fill);
+                    painter.rect_stroke(cap, 3.0, cap_line, StrokeKind::Inside);
+                    painter.galley(cap.center() - g.size() / 2.0, g.clone(), white);
+                    cx += w + 3.0;
+                }
+                let what = Rect::from_min_size(Pos2::new(x, top + CAP_HEIGHT + ROW_GAP), vec2(c.width, WHAT_HEIGHT));
+                if let Some(g) = &c.word {
+                    painter.galley(what.center() - g.size() / 2.0, g.clone(), white);
+                }
+                if let Some(icon) = c.icon {
+                    let area = Rect::from_center_size(what.center(), Vec2::splat(WHAT_HEIGHT));
+                    icons::paint(painter, area, icon, Color32::from_gray(225), Color32::BLACK);
+                }
+                x += c.width;
             }
-            let caps_width = c.caps.iter().map(|(_, w)| w).sum::<f32>() + 3.0 * (c.caps.len().saturating_sub(1)) as f32;
-            let mut cx = x + (c.width - caps_width) / 2.0;
-            for (g, w) in &c.caps {
-                let cap = Rect::from_min_size(Pos2::new(cx, top), vec2(*w, CAP_HEIGHT));
-                painter.rect_filled(cap, 3.0, cap_fill);
-                painter.rect_stroke(cap, 3.0, cap_line, StrokeKind::Inside);
-                painter.galley(cap.center() - g.size() / 2.0, g.clone(), white);
-                cx += w + 3.0;
-            }
-            let what = Rect::from_min_size(Pos2::new(x, top + CAP_HEIGHT + ROW_GAP), vec2(c.width, WHAT_HEIGHT));
-            if let Some(g) = &c.word {
-                painter.galley(what.center() - g.size() / 2.0, g.clone(), white);
-            }
-            if let Some(icon) = c.icon {
-                let area = Rect::from_center_size(what.center(), Vec2::splat(WHAT_HEIGHT));
-                icons::paint(painter, area, icon, Color32::from_gray(225), Color32::BLACK);
-            }
-            x += c.width;
         }
     }
     rect
@@ -565,5 +623,30 @@ mod tests {
         let sel = rect(50.0, 100.0, 1250.0, 620.0);
         let (at, docked) = place_box(SIZE, sel, MONITOR, &[handle], FLOOR, None);
         assert!(docked || !Rect::from_min_size(at, SIZE).intersects(handle));
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    #[test]
+    fn strip_wraps_into_rows_past_its_width() {
+        let groups = vec![
+            (0..12).map(|_| Entry::new(&["Ctrl", "drag"], "Move element")).collect::<Vec<_>>(),
+            vec![Entry::new(&["Esc"], "close")],
+        ];
+        let ctx = egui::Context::default();
+        let _ = ctx.run_pass(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let wide = strip(&painter, Pos2::new(500.0, 10.0), true, 10_000.0, &groups);
+            assert!((wide.height() - STRIP_HEIGHT).abs() < 0.5, "one row: {wide:?}");
+            let narrow = strip(&painter, Pos2::new(500.0, 10.0), true, 600.0, &groups);
+            assert!(narrow.width() <= 600.5, "{narrow:?}");
+            assert!(narrow.height() > 2.0 * ROW_HEIGHT, "wrapped: {narrow:?}");
+            assert_eq!(narrow.top(), 10.0);
+            let below = strip(&painter, Pos2::new(500.0, 900.0), false, 600.0, &groups);
+            assert_eq!(below.bottom(), 900.0);
+        });
     }
 }

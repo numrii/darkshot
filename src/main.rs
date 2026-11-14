@@ -14,6 +14,9 @@ mod emoji;
 mod help;
 mod hdr;
 mod icons;
+mod keep;
+#[cfg(feature = "open-with")]
+mod openwith;
 mod overlay;
 mod picker;
 mod read;

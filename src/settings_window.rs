@@ -148,11 +148,35 @@ pub fn run() -> AnyResult<()> {
     Ok(())
 }
 
+/// A shortcut set in this window.
+#[derive(Clone, Copy, PartialEq)]
+enum Which {
+    Capture,
+    Clipboard,
+    Reopen,
+}
+
+impl Which {
+    fn name(self) -> &'static str {
+        match self {
+            Which::Capture => "capture",
+            Which::Clipboard => "Edit clipboard image",
+            Which::Reopen => "Reopen last capture",
+        }
+    }
+}
+
 struct SettingsApp {
     settings: Settings,
     saved: Settings,
     /// While recording a shortcut: what catches it.
     recorder: Option<Recorder>,
+    /// The shortcut being recorded.
+    recording_for: Which,
+    /// Whether Explorer offers Darkshot under Open with. Kept in the registry, not the
+    /// settings file, and changed as soon as the box is ticked.
+    #[cfg(feature = "open-with")]
+    open_with: bool,
     /// While choosing a tool's key: that tool.
     tool_recording: Option<&'static ToolInfo>,
     message: Option<(String, bool)>,
@@ -176,6 +200,9 @@ impl SettingsApp {
             saved: settings.clone(),
             settings,
             recorder: None,
+            recording_for: Which::Capture,
+            #[cfg(feature = "open-with")]
+            open_with: crate::openwith::is_on(),
             tool_recording: None,
             message: None,
             #[cfg(feature = "autostart")]
@@ -187,11 +214,22 @@ impl SettingsApp {
         }
     }
 
-    /// Start or stop recording a shortcut.
-    fn toggle_recording(&mut self) {
+    /// The shortcut setting for `which`.
+    fn shortcut_mut(&mut self, which: Which) -> &mut String {
+        match which {
+            Which::Capture => &mut self.settings.hotkey,
+            Which::Clipboard => &mut self.settings.clipboard_hotkey,
+            Which::Reopen => &mut self.settings.reopen_hotkey,
+        }
+    }
+
+    /// Start or stop recording the shortcut for `which`.
+    fn toggle_recording(&mut self, which: Which) {
         self.message = None;
         self.tool_recording = None;
-        if self.recorder.take().is_none() {
+        let was = self.recorder.take().is_some() && self.recording_for == which;
+        self.recording_for = which;
+        if !was {
             self.recorder = Recorder::start();
             if self.recorder.is_none() {
                 self.message = Some(("Could not listen to the keyboard.".to_owned(), true));
@@ -212,8 +250,20 @@ impl SettingsApp {
         }
         match shortcut_text(vk, mods) {
             Some(text) if shortcut_valid(&text) => {
-                self.settings.hotkey = text;
-                self.message = None;
+                let which = self.recording_for;
+                let taken = [Which::Capture, Which::Clipboard, Which::Reopen]
+                    .into_iter()
+                    .filter(|w| *w != which)
+                    .find(|w| self.shortcut_mut(*w).eq_ignore_ascii_case(&text));
+                match taken {
+                    Some(other) => {
+                        self.message = Some((format!("{text} is already the {} shortcut.", other.name()), true));
+                    }
+                    None => {
+                        *self.shortcut_mut(which) = text;
+                        self.message = None;
+                    }
+                }
             }
             Some(text) => self.message = Some((format!("{text} can't be used as a shortcut."), true)),
             None => self.message = Some(("That key can't be used as a shortcut.".to_owned(), true)),
@@ -538,11 +588,11 @@ impl SettingsApp {
         {
             section(ui, "Capture shortcut");
             ui.horizontal(|ui| {
-                let recording = self.recorder.is_some();
+                let recording = self.recorder.is_some() && self.recording_for == Which::Capture;
                 let text = if recording { "Press keys…".to_owned() } else { self.settings.hotkey.clone() };
                 let button = ui.add_sized([160.0, 26.0], egui::Button::new(text).selected(recording));
                 if button.on_hover_text("Click, then press the combination. Esc cancels.").clicked() {
-                    self.toggle_recording();
+                    self.toggle_recording(Which::Capture);
                 }
                 if ui.button("Reset").on_hover_text(DEFAULT_HOTKEY).clicked() {
                     self.settings.hotkey = DEFAULT_HOTKEY.into();
@@ -559,12 +609,51 @@ impl SettingsApp {
             ui.label(RichText::new(hint).color(weak).small());
             #[cfg(feature = "free-shortcut")]
             self.free_shortcut_setting(ui, weak);
+            ui.add_space(6.0);
+            egui::Grid::new("other-shortcuts").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                for which in [Which::Clipboard, Which::Reopen] {
+                    ui.label(which.name());
+                    ui.horizontal(|ui| {
+                        let recording = self.recorder.is_some() && self.recording_for == which;
+                        let current = self.shortcut_mut(which).clone();
+                        let text = if recording {
+                            "Press keys…".to_owned()
+                        } else if current.is_empty() {
+                            "None".to_owned()
+                        } else {
+                            current.clone()
+                        };
+                        let button = ui.add_sized([140.0, 22.0], egui::Button::new(text).selected(recording));
+                        if button.on_hover_text("Click, then press the combination. Esc cancels.").clicked() {
+                            self.toggle_recording(which);
+                        }
+                        if !current.is_empty() && ui.small_button("Clear").clicked() {
+                            self.shortcut_mut(which).clear();
+                            self.recorder = None;
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
 
             section(ui, "Capturing");
             ui.checkbox(&mut self.settings.include_cursor, "Include the mouse cursor")
                 .on_hover_text("The cursor is drawn into the capture where it was when you pressed the shortcut.");
             ui.checkbox(&mut self.settings.confirm_discard, "Ask before discarding annotations")
                 .on_hover_text("Esc and Close ask first when a capture with annotations has not been copied or saved.");
+            ui.horizontal(|ui| {
+                let mut keep = self.settings.keep_minutes > 0;
+                let tip = "After you copy, save or close, the capture, selection and drawings are kept in memory \
+                           (never on disk) for this long. Reopen them from the tray menu or with the Reopen last \
+                           capture shortcut. The next capture replaces them, and they are gone when Darkshot quits.";
+                if ui.checkbox(&mut keep, "Keep the last capture to reopen for").on_hover_text(tip).changed() {
+                    self.settings.keep_minutes = if keep { 5 } else { 0 };
+                }
+                if keep {
+                    ui.add(egui::DragValue::new(&mut self.settings.keep_minutes).range(1..=settings::MAX_KEEP_MINUTES));
+                    ui.label("minutes");
+                }
+            });
 
             section(ui, "Default colours");
             ui.label(
@@ -606,7 +695,7 @@ impl SettingsApp {
                 ui.add_space(8.0);
                 for (value, name, tip) in [
                     (HelpLevel::Full, "Full", "A box beside the selection explains the current tool: what it does, its keys and its options."),
-                    (HelpLevel::Compact, "Compact", "The box beside the selection lists only the current tool's keys and modifiers."),
+                    (HelpLevel::Compact, "Compact", "The box beside the selection explains the current tool and its options, leaving its keys and modifiers to the strip."),
                     (HelpLevel::Off, "Disabled", "No box beside the selection. The keys still show at the bottom of the screen, and F1 lists them all."),
                 ] {
                     ui.selectable_value(&mut self.settings.help_level, value, name).on_hover_text(tip);
@@ -615,6 +704,18 @@ impl SettingsApp {
 
             #[cfg(feature = "autostart")]
             self.startup_setting(ui);
+            #[cfg(feature = "open-with")]
+            {
+                let toggle = ui
+                    .checkbox(&mut self.open_with, "Offer Darkshot under Open with for PNG and JPEG files")
+                    .on_hover_text("Explorer lists Darkshot when you right-click a picture and choose Open with. It does not become the default app.");
+                if toggle.changed() {
+                    if let Err(e) = crate::openwith::set(self.open_with) {
+                        self.message = Some((format!("Could not change Open with: {e}"), true));
+                    }
+                    self.open_with = crate::openwith::is_on();
+                }
+            }
 
             section(ui, "Saving");
             let save = &mut self.settings.save;

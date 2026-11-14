@@ -23,6 +23,13 @@ pub const FREE_SHORTCUT_AVAILABLE: bool = cfg!(feature = "free-shortcut");
 pub struct Settings {
     /// The capture shortcut, such as `Ctrl+F9` or `PrintScreen`.
     pub hotkey: String,
+    /// A shortcut for Edit clipboard image; empty for none.
+    pub clipboard_hotkey: String,
+    /// A shortcut for Reopen last capture; empty for none.
+    pub reopen_hotkey: String,
+    /// Reopen last capture: minutes the last capture is kept, in memory only, after
+    /// the overlay closes. 0 is off.
+    pub keep_minutes: u32,
     /// The four colour swatches in the toolbar, as `#RRGGBB`.
     pub swatches: [String; 4],
     /// Tools left out of the toolbar, by their id in [`crate::tools::TOOLS`]. Listing
@@ -137,6 +144,8 @@ impl From<Format> for FormatSetting {
 }
 
 pub const DEFAULT_HOTKEY: &str = "Win+Shift+S";
+/// The longest Reopen last capture keeps a capture, in minutes.
+pub const MAX_KEEP_MINUTES: u32 = 60;
 pub const DEFAULT_NAME: &str = "darkshot-{date}_{time}";
 pub const DEFAULT_SWATCHES: [Color32; 4] = [
     Color32::from_rgb(0xEF, 0x47, 0x6F),
@@ -150,6 +159,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: DEFAULT_HOTKEY.into(),
+            clipboard_hotkey: String::new(),
+            reopen_hotkey: String::new(),
+            keep_minutes: 0,
             swatches: DEFAULT_SWATCHES.map(to_hex),
             disabled_tools: Vec::new(),
             tool_keys: BTreeMap::new(),
@@ -195,6 +207,12 @@ impl Settings {
         if !shortcut_valid(&settings.hotkey) {
             settings.hotkey = DEFAULT_HOTKEY.into();
         }
+        for extra in [&mut settings.clipboard_hotkey, &mut settings.reopen_hotkey] {
+            if !extra.is_empty() && !shortcut_valid(extra) {
+                extra.clear();
+            }
+        }
+        settings.keep_minutes = settings.keep_minutes.min(MAX_KEEP_MINUTES);
         settings.tool_keys.retain(|id, key| {
             crate::tools::TOOLS.iter().any(|t| t.id == id) && Key::from_name(key).is_some_and(tool_key_allowed)
         });

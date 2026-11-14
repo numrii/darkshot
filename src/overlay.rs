@@ -161,7 +161,16 @@ pub fn run(source: Source) -> AnyResult<()> {
     let mut app = eframe::create_native(
         "Darkshot",
         options,
-        Box::new(move |cc| Ok(Box::new(Overlay::new(cc, desktop, &settings)))),
+        Box::new(move |cc| {
+            let mut overlay = Overlay::new(cc, desktop, &settings);
+            // Only an overlay the tray started can be reopened.
+            if std::env::args().any(|a| a == "--tray") && settings.keep_minutes > 0 {
+                if let (Some(kept), Some(reopen)) = (crate::keep::kept(), crate::keep::reopen()) {
+                    overlay.keep = Some((settings.keep_minutes, kept, reopen));
+                }
+            }
+            Ok(Box::new(overlay))
+        }),
         &event_loop,
     );
     event_loop.run_app(&mut app)?;
@@ -334,10 +343,24 @@ impl Desktop {
     /// `img` opened for editing on the monitor at `monitor` (screen pixels).
     fn open_on(img: RgbaImage, opened: Opened, monitor: RECT) -> Self {
         let screen = vec2((monitor.right - monitor.left) as f32, (monitor.bottom - monitor.top) as f32);
-        let (space, image) = place_image(vec2(img.width() as f32, img.height() as f32), screen);
+        let size = vec2(img.width() as f32, img.height() as f32);
+        // A window a little larger than the image when it fits, with room for the
+        // toolbar, the strip and the tool box; otherwise the whole monitor.
+        let dpi = unsafe { GetDpiForSystem() } as f32 / 96.0;
+        let want = (size + vec2(120.0, 220.0) * dpi).max(vec2(960.0, 640.0) * dpi).ceil();
+        let (bounds, space, image) = if want.x <= screen.x && want.y <= screen.y {
+            let left = monitor.left + ((screen.x - want.x) / 2.0) as i32;
+            let top = monitor.top + ((screen.y - want.y) / 2.0) as i32;
+            let bounds = RECT { left, top, right: left + want.x as i32, bottom: top + want.y as i32 };
+            let at = ((want - size) / 2.0).floor().to_pos2();
+            (bounds, want, Rect::from_min_size(at, size))
+        } else {
+            let (space, image) = place_image(size, screen);
+            (monitor, space, image)
+        };
         Self {
             shots: vec![img],
-            bounds: monitor,
+            bounds,
             monitors: vec![image],
             home: 0,
             // No windows to snap to: they are not in the picture.
@@ -973,6 +996,17 @@ struct Overlay {
     help_open: bool,
     /// The tool box's size last frame, to place it this frame.
     help_box_size: Vec2,
+    /// Where the hotkey strip was drawn last frame, for the tool box to keep clear of.
+    strip_rect: Option<Rect>,
+    /// How far an opened image is zoomed in from fitting the screen (1 = fit), and how
+    /// far it is panned, in points.
+    zoom: f32,
+    pan: Vec2,
+    /// Space or the middle button is held on an opened image: dragging pans.
+    panning: bool,
+    /// Started from the tray with Reopen last capture on: hide when done, keeping the
+    /// capture, for this many minutes.
+    keep: Option<(u32, crate::keep::Event, crate::keep::Event)>,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -1157,6 +1191,11 @@ impl Overlay {
             help_level: settings.help_level,
             help_open: false,
             help_box_size: vec2(help::BOX_WIDTH, 200.0),
+            strip_rect: None,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            panning: false,
+            keep: None,
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -1210,6 +1249,90 @@ impl Overlay {
             }
             !in_place
         }
+    }
+
+    /// Done: close, or with Reopen last capture, hide and keep everything until the
+    /// tray asks for it back or the time runs out.
+    fn leave(&mut self, ctx: &egui::Context) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, ShowWindowAsync, SW_HIDE, SW_SHOW};
+        let (Some((minutes, kept, reopen)), Some(hwnd)) = (self.keep, self.hwnd) else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        };
+        // Back as it was, without anything half done.
+        self.finish_editing();
+        self.action = None;
+        self.confirm_open = false;
+        self.help_open = false;
+        self.save_open = false;
+        self.decor_open = false;
+        self.reading = None;
+        self.picking_color = false;
+        self.panning = false;
+        self.error = None;
+        reopen.reset();
+        unsafe { ShowWindow(hwnd, SW_HIDE) };
+        kept.set();
+        let (hwnd, ctx) = (hwnd as usize, ctx.clone());
+        std::thread::spawn(move || {
+            if reopen.wait(minutes.saturating_mul(60_000)) {
+                kept.reset();
+                unsafe {
+                    ShowWindowAsync(hwnd as HWND, SW_SHOW);
+                    SetForegroundWindow(hwnd as HWND);
+                }
+                ctx.request_repaint();
+            } else {
+                std::process::exit(0); // still hidden: the time is up
+            }
+        });
+    }
+
+    /// Ctrl+wheel zooms an opened image around the pointer, Ctrl+0 fits it again, and
+    /// dragging with the middle button or with Space held pans it.
+    fn zoom_and_pan(&mut self, ctx: &egui::Context, screen: Rect, fit_scale: f32) {
+        let typing = ctx.egui_wants_keyboard_input() || self.editing.is_some();
+        let (ticks, pointer, middle, primary, space, delta, fit) = ctx.input(|i| {
+            let ticks: f32 = i
+                .events
+                .iter()
+                .map(|e| match e {
+                    egui::Event::MouseWheel { delta, modifiers, .. } if modifiers.command => delta.y.signum(),
+                    _ => 0.0,
+                })
+                .sum();
+            (
+                ticks,
+                i.pointer.hover_pos(),
+                i.pointer.middle_down(),
+                i.pointer.primary_down(),
+                i.key_down(Key::Space),
+                i.pointer.delta(),
+                i.modifiers.command && i.key_pressed(Key::Num0),
+            )
+        });
+        self.panning = middle || space && !typing;
+        if fit {
+            self.zoom = 1.0;
+            self.pan = Vec2::ZERO;
+        }
+        if ticks != 0.0 {
+            // Up to 16 points per image pixel.
+            let max = (16.0 * fit_scale).max(1.0);
+            let old = self.zoom;
+            let new = (old * 1.25f32.powf(ticks)).clamp(1.0, max);
+            // Keep the point under the pointer where it is.
+            let p = pointer.unwrap_or(screen.center()) - screen.min;
+            self.pan = p - (p - self.pan) * (new / old);
+            self.zoom = new;
+        }
+        if self.panning && (middle || primary) {
+            self.pan += delta;
+        }
+        if self.panning {
+            ctx.set_cursor_icon(if middle || primary { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        }
+        self.pan = self.pan.clamp(screen.size() * (1.0 - self.zoom), Vec2::ZERO);
     }
 
     fn bounds(&self) -> Rect {
@@ -2279,6 +2402,12 @@ impl Overlay {
             if self.desktop.opened.is_some() {
                 rest.push(E::new(&["Ctrl", "A"], "whole image"));
             }
+            if self.desktop.opened.is_some() {
+                rest.push(E::new(&["Ctrl", "wheel"], "zoom"));
+                if self.zoom > 1.0 {
+                    rest.extend([E::new(&["Space", "drag"], "pan"), E::new(&["Ctrl", "0"], "fit")]);
+                }
+            }
             rest.extend([E::new(&["F1"], "help"), E::new(&["Esc"], "close")]);
             // The current tool's own keys and modifiers, shortened to their first clause.
             let own: Vec<E> = TOOLS
@@ -2789,6 +2918,9 @@ impl eframe::App for Overlay {
         if viewport.width() <= 0.0 || self.desktop.screens.is_empty() {
             return;
         }
+        if self.desktop.opened.is_some() {
+            return; // one screen, which may be zoomed: popups may use all of it
+        }
         let scale = self.bounds().width() / viewport.width();
         let pointer = raw.events.iter().rev().find_map(|e| match e {
             egui::Event::PointerMoved(p) => Some(*p),
@@ -2825,12 +2957,22 @@ impl eframe::App for Overlay {
         let response = ui.allocate_rect(screen, Sense::drag());
         let painter = ui.painter_at(screen);
 
-        // Image pixels per egui point, and conversions between the two spaces.
-        let scale = self.bounds().width() / screen.width();
+        // Image pixels per egui point, and conversions between the two spaces. An opened
+        // image can be zoomed and panned; `pan` is in points.
+        let fit_scale = self.bounds().width() / screen.width();
+        if self.desktop.opened.is_some() {
+            self.zoom_and_pan(&ctx, screen, fit_scale);
+        }
+        let scale = fit_scale / self.zoom;
+        let pan = self.pan;
         let bounds = self.bounds();
-        let to_px = |p: Pos2| ((p - screen.min) * scale).to_pos2();
-        let to_pt = |p: Pos2| screen.min + p.to_vec2() / scale;
+        let to_px = |p: Pos2| ((p - screen.min - pan) * scale).to_pos2();
+        let to_pt = |p: Pos2| screen.min + pan + p.to_vec2() / scale;
         let rect_to_pt = |r: Rect| Rect::from_min_max(to_pt(r.min), to_pt(r.max));
+        if self.desktop.opened.is_some() {
+            // The toolbar, popups and the strip stay in the part of the image on screen.
+            self.desktop.screens[0] = Rect::from_min_max(to_px(screen.min), to_px(screen.max));
+        }
         let tol = GRAB_TOLERANCE * scale;
 
         // Frozen screenshot as the backdrop, one textured quad per monitor.
@@ -2909,7 +3051,7 @@ impl eframe::App for Overlay {
             overlay.selection.filter(|s| s.contains(p)).and_then(|_| overlay.reading.as_ref()?.hit(p))
         };
         // A click while the shortcut sheet is up only closes it.
-        if response.drag_started() && !asking && !self.help_open {
+        if response.drag_started() && !asking && !self.help_open && !self.panning {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
                 if let (Some(hit), Some(reading)) = (read_hit(self, origin), self.reading.as_mut()) {
                     reading.toggle(hit, mods.shift);
@@ -2992,6 +3134,7 @@ impl eframe::App for Overlay {
         }
         let typing = ctx.egui_wants_keyboard_input();
         let enabled = &self.tools;
+        let zoomable = self.desktop.opened.is_some();
         let keys = ctx.input(|i| {
             let step = if i.modifiers.shift { 10.0 } else { 1.0 };
             let axis = |neg: Key, pos: Key| {
@@ -3005,7 +3148,8 @@ impl eframe::App for Overlay {
                 .events
                 .iter()
                 .map(|e| match e {
-                    egui::Event::MouseWheel { delta, .. } => delta.y,
+                    // Ctrl+wheel zooms an opened image instead.
+                    egui::Event::MouseWheel { delta, modifiers, .. } if !(zoomable && modifiers.command) => delta.y,
                     _ => 0.0,
                 })
                 .sum();
@@ -3279,6 +3423,7 @@ impl eframe::App for Overlay {
                     }
                 }
                 avoid.push(strip_band);
+                avoid.extend(self.strip_rect);
                 let floor = monitor.bottom();
                 let (at, docked) = help::place_box(self.help_box_size, sel, monitor, &avoid, floor, hover);
                 self.help_box_size = help::tool_box(&ctx, &info, key, self.help_level, at, docked);
@@ -3483,7 +3628,10 @@ impl eframe::App for Overlay {
                     // Spotlight point to desktop pixel, and back. The centre of the pixel
                     // a click picks sits under the cursor (the cursor itself points at a
                     // pixel's corner), so the magnified pixel is centred on the crosshair.
-                    let centre = Pos2::new(px.x.floor() + 0.5, px.y.floor() + 0.5);
+                    // Unmagnified, the spotlight lines up with the capture around it
+                    // instead: shifted by half a pixel, nearest-pixel sampling would land
+                    // on pixel edges and draw some pixels twice and skip others.
+                    let centre = if mods.shift { Pos2::new(px.x.floor() + 0.5, px.y.floor() + 0.5) } else { px };
                     let to_desktop = |q: Pos2| centre + (q - p) * density;
                     let from_desktop = |d: Pos2| p + (d - centre) / density;
                     painter.circle_filled(p, SPOTLIGHT_RADIUS, Color32::BLACK);
@@ -3525,11 +3673,14 @@ impl eframe::App for Overlay {
         let monitor = self.desktop.screens[self.current_monitor];
         let at_top = strip_band.top() <= to_pt(monitor.min).y + 0.5;
         let bottom = if at_top {
-            Pos2::new(strip_band.center().x, strip_band.top() + STRIP_TOP + help::STRIP_HEIGHT)
+            Pos2::new(strip_band.center().x, strip_band.top() + STRIP_TOP)
         } else {
             Pos2::new(strip_band.center().x, strip_band.bottom() - STRIP_BOTTOM)
         };
-        let strip = help::strip(&painter, bottom, &self.strip_entries(reading_lines));
+        // At most 95% of the screen wide; longer, it wraps onto more rows.
+        let max_width = rect_to_pt(monitor).width() * 0.95;
+        let strip = help::strip(&painter, bottom, at_top, max_width, &self.strip_entries(reading_lines));
+        self.strip_rect = Some(strip);
         if let Some(err) = &self.error {
             let (pos, align) = if at_top {
                 (Pos2::new(bottom.x, strip.bottom() + 8.0), Align2::CENTER_TOP)
@@ -3569,10 +3720,10 @@ impl eframe::App for Overlay {
             }
         }
         if discard || (close || toolbar.close) && self.request_close() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.leave(&ctx);
         } else if let Some(text) = copy_text {
             match Self::copy_text_to_clipboard(&text) {
-                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Ok(()) => self.leave(&ctx),
                 Err(e) => self.error = Some(format!("Failed: {e}")),
             }
         } else if copy || save {
@@ -3585,7 +3736,7 @@ impl eframe::App for Overlay {
                 self.save_to_file(frame)
             };
             match result {
-                Ok(true) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Ok(true) => self.leave(&ctx),
                 Ok(false) => {} // save dialog cancelled: stay in the overlay
                 Err(e) => self.error = Some(format!("Failed: {e}")),
             }
@@ -4324,5 +4475,91 @@ mod tests {
         // Undo puts it back.
         overlay.undo();
         assert_eq!(overlay.annotations[0].rect(), rect(20.0, 20.0, 60.0, 60.0));
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    const MONITOR: RECT = RECT { left: 0, top: 0, right: 2560, bottom: 1440 };
+
+    #[test]
+    fn small_opened_images_get_a_window_of_their_own() {
+        let small = Desktop::open_on(RgbaImage::new(300, 300), Opened::default(), MONITOR);
+        let b = small.bounds;
+        let (w, h) = (b.right - b.left, b.bottom - b.top);
+        assert!(w < 2560 && h < 1440 && w >= 960 && h >= 640, "{w}x{h}");
+        assert!((b.left * 2 + w - 2560).abs() <= 1 && (b.top * 2 + h - 1440).abs() <= 1, "centred");
+        assert_eq!(small.monitors[0].size(), vec2(300.0, 300.0));
+        assert!(Rect::from_min_size(Pos2::ZERO, small.space).contains_rect(small.monitors[0]));
+        let big = Desktop::open_on(RgbaImage::new(4000, 3000), Opened::default(), MONITOR);
+        assert_eq!((big.bounds.left, big.bounds.top, big.bounds.right, big.bounds.bottom), (0, 0, 2560, 1440));
+    }
+
+    #[test]
+    fn ctrl_wheel_zooms_around_the_pointer_and_ctrl_0_fits() {
+        let monitor = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
+        let desktop = Desktop::open_on(RgbaImage::new(4000, 3000), Opened::default(), monitor);
+        let mut overlay = Overlay::with_desktop(desktop, None, &Settings::default());
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0));
+        let fit = overlay.bounds().width() / screen.width();
+        let to_px = |o: &Overlay, p: Pos2| ((p - screen.min - o.pan) * (fit / o.zoom)).to_pos2();
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        let ctx = egui::Context::default();
+        let p = Pos2::new(300.0, 200.0);
+        let before = to_px(&overlay, p);
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::ModifiersChanged(ctrl),
+                    egui::Event::PointerMoved(p),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: vec2(0.0, 1.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: ctrl,
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = ctx.run_pass(input, |ctx| overlay.zoom_and_pan(ctx, screen, fit));
+        }
+        assert!(overlay.zoom > 1.9, "zoomed: {}", overlay.zoom);
+        assert!(to_px(&overlay, p).distance(before) < 0.5, "the pixel under the pointer stays put");
+        // Panned no further than the image's edges.
+        assert!(overlay.pan.x <= 0.0 && overlay.pan.y <= 0.0);
+        assert!(overlay.pan.x >= screen.width() * (1.0 - overlay.zoom));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::ModifiersChanged(ctrl), egui::Event::Key { key: Key::Num0, physical_key: None, pressed: true, repeat: false, modifiers: ctrl }],
+            ..Default::default()
+        };
+        let _ = ctx.run_pass(input, |ctx| overlay.zoom_and_pan(ctx, screen, fit));
+        assert_eq!((overlay.zoom, overlay.pan), (1.0, Vec2::ZERO));
+    }
+
+    #[test]
+    fn extra_shortcuts_and_keep_minutes_are_checked() {
+        let s = Settings::from_toml("clipboard_hotkey = \"Banana+Q\"\nreopen_hotkey = \"Ctrl+F10\"\nkeep_minutes = 999\n");
+        assert_eq!(s.clipboard_hotkey, "");
+        assert_eq!(s.reopen_hotkey, "Ctrl+F10");
+        assert_eq!(s.keep_minutes, crate::settings::MAX_KEEP_MINUTES);
+        assert_eq!(Settings::default().keep_minutes, 0, "off by default");
+    }
+
+    #[test]
+    fn the_tray_and_the_overlay_share_the_kept_signal() {
+        let (a, b) = (crate::keep::kept().unwrap(), crate::keep::kept().unwrap());
+        let was = a.is_set();
+        a.set();
+        assert!(b.is_set());
+        b.reset();
+        assert!(!a.is_set());
+        if was {
+            a.set();
+        }
     }
 }

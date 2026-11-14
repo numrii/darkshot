@@ -30,7 +30,7 @@ with the [GitHub CLI](https://cli.github.com).
 
 Run `darkshot.exe` and it sits in the notification area. Press the capture shortcut
 (Win+Shift+S by default) or click the icon to capture; right-click the icon for
-Settings and Quit.
+Open image…, Edit clipboard image, Reopen last capture, Settings and Quit.
 
 Windows keeps Win+Shift+S for its own Snipping Tool, so Darkshot can register it only
 once it is freed in Windows. The personal build has a Settings checkbox for that (see
@@ -45,16 +45,27 @@ register.
   window and monitor edges.
 - Ctrl+A selects the whole monitor under the cursor.
 - Ctrl+C or Enter copies, Ctrl+S saves, Esc cancels.
+- Reopen last capture (off until you turn it on in Settings): after you copy, save or
+  close, the capture, region and drawings are kept for a few minutes, in memory only
+  and never on disk. Bring them back from the tray menu or with their own shortcut, to
+  copy again or fix something. The next capture replaces them, the time you set ends
+  them, and they are gone when Darkshot quits.
 
 ### Editing an existing image
 
 Open a PNG or JPEG in the same editor: drag it onto `darkshot.exe`, run
-`darkshot.exe picture.png`, or choose Open image… in the tray menu. Edit clipboard image
-in the tray menu opens whatever image is on the clipboard. The whole image starts
-selected; crop it by resizing the region, and Ctrl+A selects all of it again. Save
-suggests the original name with `-edited` added, in the same folder and format. A
-large image is shown scaled down to fit the screen, but annotations, copies and saves
-are in its own pixels. Photos are turned the right way up from their camera data.
+`darkshot.exe picture.png`, or choose Open image… in the tray menu. The personal build
+can also add Darkshot to Explorer's Open with menu for PNG and JPEG files. Edit
+clipboard image in the tray menu, or its own shortcut if you set one in Settings, opens
+whatever image is on the clipboard. The whole image starts selected; crop it by
+resizing the region, and Ctrl+A selects all of it again. Save suggests the original name
+with `-edited` added, in the same folder and format. Photos are turned the right way up
+from their camera data.
+
+An image that fits opens in a window a little larger than itself, in the middle of the
+screen; a larger one fills the screen, scaled down to fit. Ctrl+wheel zooms in around
+the pointer, dragging with the middle button or with Space held pans, and Ctrl+0 fits
+it again. Annotations, copies and saves are always in the image's own pixels.
 
 ### Annotating
 
@@ -82,14 +93,16 @@ Ctrl-dragging empty space moves the region. Each tool remembers its own size, so
 large text size does not carry over to the next arrow. While typing a text, Enter
 finishes it and Shift+Enter starts a new line.
 
-Help is on screen as you work. A strip at the top (or the bottom, when the selection
-covers the top) shows the keys that do something
-right now, with each tool's symbol under its key and the current tool's modifiers. Beside the selection, a box explains
-the current tool: what it does, what clicking and dragging do, its keys and modifiers,
-and its toolbar options. It moves when you move or redraw the selection, and sits
-inside it, see-through, when there is no room outside. Settings → Tool help chooses
-Full, Compact (only the keys and modifiers) or Disabled (just the strip). F1, or ?,
-shows every shortcut on one sheet; any key or click closes it.
+Help is on screen as you work. A strip at the top of the screen (or the bottom, when
+the region covers the top) shows the keys that do something right now: each tool's
+symbol under its key, with the current one lit, then the current tool's own keys and
+modifiers. When it would be wider than the screen it wraps onto another row. Beside the
+region, a box explains the current tool: what it does, what clicking and dragging do,
+its keys and modifiers, and its toolbar options. It moves when you move or redraw the
+region, and sits inside it, see-through, when there is no room outside. Settings → Tool
+help chooses Full, Compact (everything but the keys and modifiers, which the strip
+already shows) or Disabled (just the strip). F1, or ?, shows every shortcut on one
+sheet; any key or click closes it. None of this is ever in what you copy or save.
 
 To straighten something photographed at an angle, such as a receipt, drag the round
 handle above the region before annotating: the capture turns under the region, which
@@ -120,10 +133,12 @@ transparent shadow, and the rest (Paint, older programs) get it on white.
 
 ### Settings
 
-Settings has the capture shortcut, the default colours each capture starts with, a
-light, dark or system theme, the save format and quality, the default folder and the
-file name. Two options are off until you turn them on: including the mouse cursor in
-the capture, and asking before Esc or Close discards a capture that has annotations.
+Settings has the capture shortcut, optional shortcuts for Edit clipboard image and
+Reopen last capture, the default colours each capture starts with, a light, dark or
+system theme, how much tool help to show, the save format and quality, the default
+folder and the file name. Three options are off until you turn them on: including the
+mouse cursor in the capture, asking before Esc or Close discards a capture that has
+annotations, and keeping the last capture to reopen (for 1 to 60 minutes).
 You can also choose the border and shadow each capture starts with (see below). Under Tools you can untick the tools you don't use; they leave the
 toolbar and their keys do nothing. Click a tool's key to give it another; the × in the
 field puts its own key back. The file name is a
@@ -175,6 +190,10 @@ The same, plus a few conveniences for your own computer:
   shortcut, choose another one, such as Ctrl+Shift+S.
 - **Start with Windows**: a Settings checkbox that adds Darkshot to your account's
   startup list in the registry.
+- **Open with**: a Settings checkbox that lists Darkshot under Explorer's Open with for
+  PNG and JPEG files, through your account's file-type entries in the registry
+  (`HKEY_CURRENT_USER\Software\Classes`). It never makes Darkshot the default app, and
+  unticking removes the entries.
 - Settings fall back to `%APPDATA%\Darkshot` when the exe's folder is read-only.
 - An optional diagnostic log (`--trace`) for troubleshooting.
 
