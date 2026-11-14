@@ -39,6 +39,8 @@ pub struct Settings {
     pub include_cursor: bool,
     /// Ask before Esc or Close throws away a capture that has annotations.
     pub confirm_discard: bool,
+    /// How much the box beside the selection explains about the current tool.
+    pub help_level: crate::help::HelpLevel,
     pub save: SaveSettings,
     pub frame: FrameSettings,
 }
@@ -155,6 +157,7 @@ impl Default for Settings {
             theme: ThemeSetting::System,
             include_cursor: false,
             confirm_discard: false,
+            help_level: crate::help::HelpLevel::Full,
             save: SaveSettings::default(),
             frame: FrameSettings::default(),
         }
@@ -320,8 +323,12 @@ pub fn parse_hotkey(text: &str) -> Option<global_hotkey::hotkey::HotKey> {
 }
 
 /// Whether `key` can pick a tool. Keys the capture already uses (Esc, Enter, Delete,
-/// Backspace, the arrows, Tab and Space) cannot, nor modifier-only or media keys.
+/// Backspace, the arrows, Tab, Space, and F1 for help) cannot, nor modifier-only or
+/// media keys.
 pub fn tool_key_allowed(key: Key) -> bool {
+    if key == Key::F1 {
+        return false;
+    }
     let name = key.name();
     let alphanumeric = name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric();
     let function = name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=24).contains(&n));

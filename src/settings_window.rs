@@ -600,6 +600,18 @@ impl SettingsApp {
                     ui.selectable_value(&mut self.settings.theme, value, name);
                 }
             });
+            ui.horizontal(|ui| {
+                use crate::help::HelpLevel;
+                ui.label("Tool help");
+                ui.add_space(8.0);
+                for (value, name, tip) in [
+                    (HelpLevel::Full, "Full", "A box beside the selection explains the current tool: what it does, its keys and its options."),
+                    (HelpLevel::Compact, "Compact", "The box beside the selection lists only the current tool's keys and modifiers."),
+                    (HelpLevel::Off, "Disabled", "No box beside the selection. The keys still show at the bottom of the screen, and F1 lists them all."),
+                ] {
+                    ui.selectable_value(&mut self.settings.help_level, value, name).on_hover_text(tip);
+                }
+            });
 
             #[cfg(feature = "autostart")]
             self.startup_setting(ui);

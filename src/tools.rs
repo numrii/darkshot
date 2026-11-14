@@ -42,10 +42,10 @@ pub const TOOLS: [ToolInfo; 14] = [
     ToolInfo { id: "text", name: "Text", icon: Icon::Text, key: Key::T, tip: "Text ({key})" },
     ToolInfo {
         id: "blur",
-        name: "Blur and redact",
+        name: "Blur",
         icon: Icon::Blur,
         key: Key::B,
-        tip: "Hide: pixelate, Gaussian blur or redact ({key})",
+        tip: "Blur: pixelate, Gaussian blur or redact ({key})",
     },
     ToolInfo { id: "step", name: "Numbered steps", icon: Icon::Step, key: Key::N, tip: "Numbered step ({key})" },
     ToolInfo {

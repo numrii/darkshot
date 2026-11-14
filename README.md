@@ -79,7 +79,17 @@ The mouse wheel changes thickness, font size, blur strength, step size or stamp 
 undoes, Ctrl+Y or Ctrl+Shift+Z redoes, and Delete removes the selected annotation.
 With any tool, hold Ctrl and drag a drawing to move it, as with the Select tool;
 Ctrl-dragging empty space moves the region. Each tool remembers its own size, so a
-large text size does not carry over to the next arrow.
+large text size does not carry over to the next arrow. While typing a text, Enter
+finishes it and Shift+Enter starts a new line.
+
+Help is on screen as you work. A strip at the top (or the bottom, when the selection
+covers the top) shows the keys that do something
+right now, with each tool's symbol under its key and the current tool's modifiers. Beside the selection, a box explains
+the current tool: what it does, what clicking and dragging do, its keys and modifiers,
+and its toolbar options. It moves when you move or redraw the selection, and sits
+inside it, see-through, when there is no room outside. Settings → Tool help chooses
+Full, Compact (only the keys and modifiers) or Disabled (just the strip). F1, or ?,
+shows every shortcut on one sheet; any key or click closes it.
 
 To straighten something photographed at an angle, such as a receipt, drag the round
 handle above the region before annotating: the capture turns under the region, which

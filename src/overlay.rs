@@ -33,6 +33,7 @@ use crate::annotate::{
     MIN_WIDTH,
 };
 use crate::effects;
+use crate::help::{self, HelpLevel};
 use crate::read;
 use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::Settings;
@@ -966,6 +967,12 @@ struct Overlay {
     confirm_discard: bool,
     /// That question is on screen.
     confirm_open: bool,
+    /// How much the box beside the selection explains about the current tool.
+    help_level: HelpLevel,
+    /// The shortcut sheet (F1) is on screen.
+    help_open: bool,
+    /// The tool box's size last frame, to place it this frame.
+    help_box_size: Vec2,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -1147,6 +1154,9 @@ impl Overlay {
             reread: false,
             confirm_discard: settings.confirm_discard,
             confirm_open: false,
+            help_level: settings.help_level,
+            help_open: false,
+            help_box_size: vec2(help::BOX_WIDTH, 200.0),
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -2222,20 +2232,68 @@ impl Overlay {
         }
     }
 
-    /// "V select · R rect · …" for those of the tools `ids` that are switched on, with
-    /// their keys.
-    fn key_hints(&self, ids: &[&str]) -> String {
-        let hint = |id: &str| {
-            let (info, key) = self.tools.iter().find(|(t, _)| t.id == id)?;
-            let short = match id {
-                "rect" => "rect",
-                "highlighter" => "marker",
-                "emoji" => "emoji",
-                _ => info.name.split_whitespace().next()?,
-            };
-            Some(format!("{} {}", key.name(), short.to_lowercase()))
-        };
-        ids.iter().filter_map(|id| hint(id)).collect::<Vec<_>>().join(" · ")
+    /// What the hotkey strip shows now, in groups.
+    fn strip_entries(&self, reading_lines: bool) -> Vec<Vec<help::Entry>> {
+        use help::Entry as E;
+        let one = |entries: Vec<E>| vec![entries];
+        if self.confirm_open {
+            one(vec![E::new(&["Enter"], "discard"), E::new(&["Esc"], "keep editing")])
+        } else if reading_lines {
+            one(vec![
+                E::new(&["click"], "pick a line"),
+                E::new(&["Shift", "click"], "a word"),
+                E::new(&["Ctrl", "Enter"], "copy"),
+                E::new(&["Esc"], "close"),
+            ])
+        } else if self.picking_color {
+            one(vec![E::new(&["click"], "pick"), E::new(&["Shift"], "magnify"), E::new(&["Esc"], "cancel")])
+        } else if self.editing.is_some() {
+            one(vec![
+                E::new(&["Enter"], "finish"),
+                E::new(&["Shift", "Enter"], "new line"),
+                E::new(&["←", "→"], "move"),
+                E::new(&["Ctrl", "drag"], "move text"),
+            ])
+        } else if matches!(self.action, Some(Action::Rotate { .. })) {
+            one(vec![E::new(&["Shift"], "15° steps"), E::new(&["right-click"], "the handle to reset")])
+        } else if self.selection.is_none() {
+            one(vec![
+                E::new(&["Drag"], "select an area"),
+                E::new(&["Ctrl", "click"], "a window"),
+                E::new(&["Ctrl"], "snap"),
+                E::new(&["Ctrl", "A"], "whole screen"),
+                E::new(&["F1"], "help"),
+                E::new(&["Esc"], "cancel"),
+            ])
+        } else {
+            let tools = self
+                .tools
+                .iter()
+                .map(|(t, k)| E {
+                    keys: vec![k.symbol_or_name().to_owned()],
+                    what: help::What::Tool(t.icon),
+                    active: tool_for(t.icon) == Some(self.tool),
+                })
+                .collect();
+            let mut rest = vec![E::new(&["Ctrl", "C"], "copy"), E::new(&["Ctrl", "S"], "save"), E::new(&["Ctrl", "Z"], "undo")];
+            if self.desktop.opened.is_some() {
+                rest.push(E::new(&["Ctrl", "A"], "whole image"));
+            }
+            rest.extend([E::new(&["F1"], "help"), E::new(&["Esc"], "close")]);
+            // The current tool's own keys and modifiers, shortened to their first clause.
+            let own: Vec<E> = TOOLS
+                .iter()
+                .find(|t| tool_for(t.icon) == Some(self.tool))
+                .and_then(|t| help::tool_help(t.id))
+                .map(|h| {
+                    h.mods
+                        .iter()
+                        .map(|&(keys, does)| E::new(keys, does.split(", ").next().unwrap_or(does)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if own.is_empty() { vec![tools, rest] } else { vec![tools, own, rest] }
+        }
     }
 
     /// Draw `emoji` as large as fits in `area`, whole and centred, from a texture made
@@ -2627,6 +2685,11 @@ fn label(painter: &egui::Painter, pos: Pos2, anchor: Align2, text: String, color
     painter.galley(rect.min, galley, color);
 }
 
+/// The hotkey strip's distance from the top of the screen, and from the bottom (clear
+/// of the taskbar), in points.
+const STRIP_TOP: f32 = 12.0;
+const STRIP_BOTTOM: f32 = 56.0;
+
 /// The eyedropper spotlight's radius, in points.
 const SPOTLIGHT_RADIUS: f32 = 80.0;
 /// Points per captured pixel in the spotlight while Shift magnifies it.
@@ -2845,7 +2908,8 @@ impl eframe::App for Overlay {
             let p = to_px(p);
             overlay.selection.filter(|s| s.contains(p)).and_then(|_| overlay.reading.as_ref()?.hit(p))
         };
-        if response.drag_started() && !asking {
+        // A click while the shortcut sheet is up only closes it.
+        if response.drag_started() && !asking && !self.help_open {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
                 if let (Some(hit), Some(reading)) = (read_hit(self, origin), self.reading.as_mut()) {
                     reading.toggle(hit, mods.shift);
@@ -2924,6 +2988,7 @@ impl eframe::App for Overlay {
             eyedropper: bool,
             read: Option<read::Kind>,
             wheel: f32,
+            help: bool,
         }
         let typing = ctx.egui_wants_keyboard_input();
         let enabled = &self.tools;
@@ -2966,6 +3031,11 @@ impl eframe::App for Overlay {
                     _ => None,
                 },
                 wheel,
+                // F1, or ? unless a tool is on the / key.
+                help: plain
+                    && (i.key_pressed(Key::F1)
+                        || !enabled.iter().any(|(_, key)| *key == Key::Slash)
+                            && i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "?"))),
             }
         });
 
@@ -2978,6 +3048,23 @@ impl eframe::App for Overlay {
             }
             Keys::default()
         } else {
+            keys
+        };
+
+        // The shortcut sheet: F1 (or ?) opens it, and any key or click closes it without
+        // doing anything else.
+        let keys = if self.help_open {
+            let any = ctx.input(|i| {
+                i.pointer.any_released() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+            });
+            if any {
+                self.help_open = false;
+            }
+            Keys::default()
+        } else {
+            if keys.help && !typing && self.editing.is_none() && !asking {
+                self.help_open = true;
+            }
             keys
         };
 
@@ -3136,6 +3223,66 @@ impl eframe::App for Overlay {
             self.save_open = false;
             self.decor_open = false;
             self.reading = None;
+        }
+
+        // The hotkey strip's band: across the top of the screen, or the bottom while the
+        // selection covers the top and not the bottom.
+        let strip_band = {
+            let m = rect_to_pt(self.desktop.screens[self.current_monitor]);
+            let top = Rect::from_min_max(m.min, Pos2::new(m.right(), m.top() + STRIP_TOP + help::STRIP_HEIGHT + 6.0));
+            let bottom = Rect::from_min_max(Pos2::new(m.left(), m.bottom() - STRIP_BOTTOM - help::STRIP_HEIGHT - 6.0), m.max);
+            match self.selection.map(rect_to_pt) {
+                Some(sel) if sel.intersects(top) && !sel.intersects(bottom) => bottom,
+                _ => top,
+            }
+        };
+
+        // --- Tool help box ---------------------------------------------------------------
+        if let (Some(sel_px), false) = (self.selection, creating_region) {
+            let id = if self.picking_color {
+                Some("eyedropper")
+            } else if let Some(reading) = &self.reading {
+                Some(match reading.kind {
+                    read::Kind::Text => "read-text",
+                    read::Kind::Qr => "read-qr",
+                })
+            } else {
+                TOOLS.iter().find(|t| tool_for(t.icon) == Some(self.tool)).map(|t| t.id)
+            };
+            let show = self.help_level != HelpLevel::Off && !self.confirm_open && !self.help_open;
+            if let Some(info) = id.and_then(help::tool_help).filter(|_| show) {
+                let key = self.tools.iter().find(|(t, _)| Some(t.id) == id).map(|(_, k)| k.symbol_or_name());
+                let centre = sel_px.center();
+                let screen_px = self
+                    .desktop
+                    .screens
+                    .iter()
+                    .find(|m| m.contains(centre))
+                    .copied()
+                    .unwrap_or(self.desktop.screens[self.current_monitor]);
+                let monitor = rect_to_pt(screen_px);
+                let sel = rect_to_pt(sel_px);
+                // Keep clear of the toolbar, the round handle and any open panel.
+                let mut avoid: Vec<Rect> = toolbar.rect.into_iter().collect();
+                if let Some(handle) = self.rotate_handle(sel_px, tol) {
+                    let c = to_pt(handle);
+                    let edge = if c.y < sel.top() { sel.top() } else { sel.bottom() };
+                    avoid.push(Rect::from_two_pos(c, Pos2::new(c.x, edge)).expand(20.0));
+                }
+                for (open, name) in [
+                    (self.save_open, "darkshot-save-panel"),
+                    (self.decor_open, "darkshot-decor-panel"),
+                    (self.reading.is_some(), "darkshot-reading-panel"),
+                ] {
+                    if let Some(r) = ctx.memory(|m| m.area_rect(egui::Id::unique(name))).filter(|_| open) {
+                        avoid.push(r);
+                    }
+                }
+                avoid.push(strip_band);
+                let floor = monitor.bottom();
+                let (at, docked) = help::place_box(self.help_box_size, sel, monitor, &avoid, floor, hover);
+                self.help_box_size = help::tool_box(&ctx, &info, key, self.help_level, at, docked);
+            }
         }
         self.restyle_selected();
 
@@ -3375,35 +3522,35 @@ impl eframe::App for Overlay {
         }
 
         let reading_lines = self.reading.as_ref().is_some_and(|r| !r.lines().is_empty());
-        let hint = if self.confirm_open {
-            "Enter discard · Esc keep editing".to_owned()
-        } else if reading_lines {
-            "Click a line to pick it · Shift+click a word · Ctrl+Enter copy · Esc close".to_owned()
-        } else if self.picking_color {
-            "Click to pick a colour · hold Shift to magnify · Esc cancel".to_owned()
-        } else if self.editing.is_some() {
-            "Type · Enter finish · Shift+Enter new line · arrows move · Ctrl+drag moves the text".to_owned()
-        } else if self.selection.is_none() {
-            "Drag to select an area · Ctrl+click a window · hold Ctrl to snap · Ctrl+A whole screen · Esc cancel".to_owned()
-        } else if self.tool == Tool::Shape(ShapeKind::Emoji) && self.selected.is_none() {
-            "Click to place the stamp · mouse wheel resizes it · Ctrl+drag moves a drawing · Ctrl+Z undo".to_owned()
-        } else if self.selected.is_some() {
-            "Drag to move · handles resize · arrows nudge · wheel thickness · Del delete · Esc deselect".to_owned()
-        } else if matches!(self.action, Some(Action::Rotate { .. })) {
-            "Turning the capture · drawings stay put · Shift turns in 15° steps · right-click the handle to undo".to_owned()
-        } else if self.annotations.is_empty() {
-            let keys = self.key_hints(&["select", "rect", "ellipse", "line", "arrow", "text", "blur", "emoji"]);
-            format!("Round handle turns the capture (right-click resets) · {keys} · Ctrl+Z undo")
-        } else {
-            let keys = self.key_hints(&["select", "rect", "ellipse", "line", "arrow", "pen", "highlighter", "text", "blur"]);
-            format!("{keys} · Ctrl+drag moves a drawing · Shift constrain/straight · Ctrl+Z undo")
-        };
         let monitor = self.desktop.screens[self.current_monitor];
-        let bottom = to_pt(monitor.center_bottom()) + vec2(0.0, -24.0);
-        label(&painter, bottom, Align2::CENTER_BOTTOM, hint, Color32::WHITE);
+        let at_top = strip_band.top() <= to_pt(monitor.min).y + 0.5;
+        let bottom = if at_top {
+            Pos2::new(strip_band.center().x, strip_band.top() + STRIP_TOP + help::STRIP_HEIGHT)
+        } else {
+            Pos2::new(strip_band.center().x, strip_band.bottom() - STRIP_BOTTOM)
+        };
+        let strip = help::strip(&painter, bottom, &self.strip_entries(reading_lines));
         if let Some(err) = &self.error {
-            let pos = bottom + vec2(0.0, -30.0);
-            label(&painter, pos, Align2::CENTER_BOTTOM, err.clone(), Color32::LIGHT_RED);
+            let (pos, align) = if at_top {
+                (Pos2::new(bottom.x, strip.bottom() + 8.0), Align2::CENTER_TOP)
+            } else {
+                (Pos2::new(bottom.x, strip.top() - 8.0), Align2::CENTER_BOTTOM)
+            };
+            label(&painter, pos, align, err.clone(), Color32::LIGHT_RED);
+        }
+        // Hovering the round handle says what it does.
+        if let (None, false, Some(p), Some(sel)) = (&self.action, asking || self.help_open, hover, self.selection) {
+            if let Some(handle) = self.rotate_handle(sel, tol) {
+                if to_px(p).distance(handle) <= (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE {
+                    let tip = "Drag to turn the capture · Shift: 15° steps · right-click: reset".to_owned();
+                    label(&painter, p + vec2(16.0, 20.0), Align2::LEFT_TOP, tip, Color32::WHITE);
+                }
+            }
+        }
+        if self.help_open {
+            let tools: Vec<(&'static str, String)> =
+                self.tools.iter().map(|(t, k)| (t.name, k.symbol_or_name().to_owned())).collect();
+            help::sheet(&ctx, rect_to_pt(monitor), &tools);
         }
 
         // --- Actions -------------------------------------------------------------------
@@ -3816,7 +3963,22 @@ mod tests {
         let overlay = Overlay::with_desktop(desktop, None, &settings);
         let key_of = |id: &str| overlay.tools.iter().find(|(t, _)| t.id == id).map(|(_, k)| *k);
         assert_eq!((key_of("rect"), key_of("pen")), (Some(Key::K), Some(Key::P)));
-        assert_eq!(overlay.key_hints(&["select", "rect", "highlighter"]), "V select · K rect · M marker");
+        // The strip shows the chosen keys.
+        let mut with_region = Overlay::with_desktop(
+            Desktop::new(
+                vec![RgbaImage::new(10, 10)],
+                RECT { left: 0, top: 0, right: 10, bottom: 10 },
+                vec![rect(0.0, 0.0, 10.0, 10.0)],
+                0,
+                Snap::default(),
+            ),
+            None,
+            &settings,
+        );
+        with_region.selection = Some(rect(0.0, 0.0, 10.0, 10.0));
+        let strip = with_region.strip_entries(false);
+        let keys: Vec<&str> = strip[0].iter().map(|e| e.keys[0].as_str()).collect();
+        assert_eq!(&keys[..3], ["V", "K", "E"]);
 
         if !crate::emoji::available() {
             return;

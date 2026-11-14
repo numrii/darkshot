@@ -11,6 +11,7 @@ mod cursor;
 mod daemon;
 mod effects;
 mod emoji;
+mod help;
 mod hdr;
 mod icons;
 mod overlay;
