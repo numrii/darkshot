@@ -4016,7 +4016,8 @@ mod tests {
         for emoji in crate::emoji::FAVOURITES {
             let texture = emoji_texture(&ctx, emoji, 40).unwrap();
             let [w, h] = texture.size();
-            assert!(w > 10 && h > 10 && w <= 80 && h <= 80, "{emoji}: {w}x{h}");
+            // Narrow glyphs (❗) can be a few pixels wide, depending on the emoji font.
+            assert!(w > 2 && h > 10 && w <= 80 && h <= 80, "{emoji}: {w}x{h}");
         }
         assert!(crate::emoji::is_emoji("👍🏽") && !crate::emoji::is_emoji("ab") && !crate::emoji::is_emoji(""));
     }

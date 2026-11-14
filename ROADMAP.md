@@ -11,6 +11,12 @@ capture contains or how long it is kept.
 - Try HDR capture on a real HDR display: colours and brightness should match the screen,
   not look washed out. Not yet possible here.
 
+- A hotkey strip that fits: with many tools enabled and a tool with many modifiers
+  (Select), the strip can grow wider than the monitor and run off both sides. When it
+  would pass 95% of the monitor's width, wrap long descriptions onto another line
+  (growing the strip downwards) rather than letting it widen, and if it still
+  doesn't fit, break it into a second row of entries.
+
 - Editing an existing image, later additions: a shortcut for Edit clipboard image;
   zoom and pan for large images; "Open with" in Explorer (needs the registry, so only
   the personal build would offer it).
