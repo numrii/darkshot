@@ -1190,6 +1190,10 @@ struct Overlay {
     help_box_size: Vec2,
     /// Where the hotkey strip was drawn last frame, for the tool box to keep clear of.
     strip_rect: Option<Rect>,
+    /// The same, in desktop pixels, for the round handle to keep clear of.
+    strip_px: Option<Rect>,
+    /// Where the toolbar was drawn last frame, in desktop pixels, for the same.
+    toolbar_px: Option<Rect>,
     /// How far an opened image is zoomed in from fitting the screen (1 = fit), and how
     /// far it is panned, in points.
     zoom: f32,
@@ -1394,6 +1398,8 @@ impl Overlay {
             help_open: false,
             help_box_size: vec2(help::BOX_WIDTH, 200.0),
             strip_rect: None,
+            strip_px: None,
+            toolbar_px: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
             panning: false,
@@ -1641,7 +1647,8 @@ impl Overlay {
     }
 
     /// Where the round handle that turns the capture is, in desktop pixels: above the
-    /// region's top edge, or below its bottom edge when there is no room above. `tol`
+    /// region's top edge, or else the first of below, right, left, and just inside the
+    /// top or bottom edge that is on screen and clear of the hotkey strip and toolbar. `tol`
     /// is the grab tolerance in desktop pixels, which also gives the screen's scale.
     ///
     /// Also once things are drawn, to straighten it a little more: annotations stay
@@ -1653,8 +1660,23 @@ impl Overlay {
             return None;
         }
         let gap = ROTATE_HANDLE_GAP * tol / GRAB_TOLERANCE;
-        let above = sel.center_top() - vec2(0.0, gap);
-        Some(if above.y >= self.bounds().top() + tol { above } else { sel.center_bottom() + vec2(0.0, gap) })
+        let reach = (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE;
+        // On the region's own monitor: the desktop's bounds also take in other monitors
+        // and the gaps between them.
+        let screens = &self.desktop.screens;
+        let screen = screens.iter().find(|m| m.contains(sel.center())).copied().unwrap_or(screens[self.current_monitor]).shrink(tol);
+        let clear = |p: Pos2| screen.contains(p) && ![self.strip_px, self.toolbar_px].iter().flatten().any(|r| r.expand(reach).contains(p));
+        let inset = gap.min(sel.height() / 2.0);
+        let spots = [
+            sel.center_top() - vec2(0.0, gap),
+            sel.center_bottom() + vec2(0.0, gap),
+            sel.right_center() + vec2(gap, 0.0),
+            sel.left_center() - vec2(gap, 0.0),
+            // A region filling the screen has no room outside it.
+            sel.center_top() + vec2(0.0, inset),
+            sel.center_bottom() - vec2(0.0, inset),
+        ];
+        Some(spots.into_iter().find(|&p| clear(p)).unwrap_or(spots[4]))
     }
 
     /// Back to the capture as it was taken, reading again if the panel is open.
@@ -3912,7 +3934,7 @@ impl eframe::App for Overlay {
                 let mut avoid: Vec<Rect> = toolbar.rect.into_iter().collect();
                 if let Some(handle) = self.rotate_handle(sel_px, tol) {
                     let c = to_pt(handle);
-                    let edge = if c.y < sel.top() { sel.top() } else { sel.bottom() };
+                    let edge = c.y.clamp(sel.top(), sel.bottom());
                     avoid.push(Rect::from_two_pos(c, Pos2::new(c.x, edge)).expand(20.0));
                 }
                 for (open, name) in [
@@ -4042,7 +4064,13 @@ impl eframe::App for Overlay {
                 // The round handle that turns the capture, on a stem from the region.
                 let turning = matches!(self.action, Some(Action::Rotate { .. }));
                 if let Some(knob) = self.rotate_handle(sel_px, tol).map(to_pt) {
-                    let stem = if knob.y < sel.top() { sel.center_top() } else { sel.center_bottom() };
+                    // From the nearest point of the region's edge; inside it, from the
+                    // nearer of top and bottom.
+                    let stem = if sel.contains(knob) {
+                        Pos2::new(knob.x, if knob.y < sel.center().y { sel.top() } else { sel.bottom() })
+                    } else {
+                        sel.clamp(knob)
+                    };
                     painter.line_segment([stem, knob], Stroke::new(1.0, Color32::WHITE));
                     let fill = if turning { ACCENT } else { Color32::WHITE };
                     painter.circle_filled(knob, ROTATE_HANDLE_RADIUS, fill);
@@ -4183,6 +4211,15 @@ impl eframe::App for Overlay {
         let max_width = rect_to_pt(monitor).width() * 0.95;
         let strip = help::strip(&painter, bottom, at_top, max_width, &self.strip_entries(reading_lines));
         self.strip_rect = Some(strip);
+        // The round handle moves out from under the strip; it was placed before the
+        // strip was drawn, so a change shows on the next frame.
+        let strip_px = Some(Rect::from_two_pos(to_px(strip.min), to_px(strip.max)));
+        let toolbar_px = toolbar.rect.map(|r| Rect::from_two_pos(to_px(r.min), to_px(r.max)));
+        if (strip_px, toolbar_px) != (self.strip_px, self.toolbar_px) {
+            self.strip_px = strip_px;
+            self.toolbar_px = toolbar_px;
+            ctx.request_repaint();
+        }
         if let Some(err) = &self.error {
             let (pos, align) = if at_top {
                 (Pos2::new(bottom.x, strip.bottom() + 8.0), Align2::CENTER_TOP)
@@ -4487,6 +4524,18 @@ mod tests {
 
         // With a region at the very top, the handle goes below it.
         assert_eq!(overlay.rotate_handle(rect(100.0, 0.0, 300.0, 50.0), GRAB_TOLERANCE), Some(Pos2::new(200.0, 50.0 + ROTATE_HANDLE_GAP)));
+        // Likewise when the hotkey strip covers the spot above.
+        overlay.strip_px = Some(rect(0.0, 0.0, 400.0, 80.0));
+        assert_eq!(overlay.rotate_handle(sel, GRAB_TOLERANCE), Some(Pos2::new(200.0, 200.0 + ROTATE_HANDLE_GAP)));
+        // With the toolbar covering the spot below too, beside the region.
+        overlay.toolbar_px = Some(rect(50.0, 208.0, 300.0, 250.0));
+        assert_eq!(overlay.rotate_handle(sel, GRAB_TOLERANCE), Some(Pos2::new(300.0 + ROTATE_HANDLE_GAP, 150.0)));
+        // A region filling the screen, the strip over its top: just inside the bottom.
+        overlay.toolbar_px = Some(rect(250.0, 250.0, 392.0, 292.0));
+        let full = rect(0.0, 0.0, 400.0, 300.0);
+        assert_eq!(overlay.rotate_handle(full, GRAB_TOLERANCE), Some(Pos2::new(200.0, 300.0 - ROTATE_HANDLE_GAP)));
+        overlay.strip_px = None;
+        overlay.toolbar_px = None;
 
         // With things drawn, the handle stays, for small corrections; turning leaves
         // the drawings where they are.
