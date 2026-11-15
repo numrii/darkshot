@@ -900,8 +900,9 @@ impl StampSet {
     fn items(self) -> &'static [&'static str] {
         match self {
             StampSet::Emoji => &crate::emoji::FAVOURITES,
-            StampSet::Kaomoji => &crate::emoji::KAOMOJI,
-            StampSet::Symbols => &crate::emoji::SYMBOLS,
+            // Only what this computer's fonts can draw.
+            StampSet::Kaomoji => crate::emoji::kaomoji(),
+            StampSet::Symbols => crate::emoji::symbols(),
         }
     }
 
@@ -2808,7 +2809,7 @@ impl Overlay {
             ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
         }
         // The current stamp on its own picker; a sample on the others.
-        let shown = if ours { current.as_str() } else { set.items()[0] };
+        let shown = if ours { current.as_str() } else { set.items().first().copied().unwrap_or_default() };
         let icon = Rect::from_min_max(rect.left_top() + vec2(5.0, 5.0), rect.right_bottom() - vec2(15.0, 5.0));
         let icon = if set == StampSet::Kaomoji { icon.shrink2(vec2(0.0, 3.0)) } else { icon };
         self.paint_emoji(ui, shown, icon);

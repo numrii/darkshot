@@ -130,6 +130,30 @@ pub const SYMBOLS: [&str; 60] = [
     "π", "Ω", "µ", "Δ", "€", "£", "$", "¥", "½", "¾",
 ];
 
+/// The kaomoji in `KAOMOJI` that this computer's fonts can draw, worked out once. A
+/// Windows without some of its fonts (a server edition, say) misses a few.
+pub fn kaomoji() -> &'static [&'static str] {
+    static DRAWN: OnceLock<Vec<&'static str>> = OnceLock::new();
+    DRAWN.get_or_init(|| KAOMOJI.into_iter().filter(|k| can_stamp(k)).collect())
+}
+
+/// The symbols in `SYMBOLS` that this computer's fonts can draw, worked out once.
+pub fn symbols() -> &'static [&'static str] {
+    static DRAWN: OnceLock<Vec<&'static str>> = OnceLock::new();
+    DRAWN.get_or_init(|| SYMBOLS.into_iter().filter(|k| can_stamp(k)).collect())
+}
+
+/// Whether every font in `FONT_FILES` is on this computer, as on any Windows 10 or 11
+/// desktop. For the tests, which can expect every listed stamp to draw only then.
+#[cfg(test)]
+fn every_font() -> bool {
+    let missing: Vec<&str> = (0..FONT_FILES.len()).filter(|&i| font_at(i).is_none()).map(|i| FONT_FILES[i]).collect();
+    if !missing.is_empty() {
+        eprintln!("fonts missing here: {missing:?}");
+    }
+    missing.is_empty()
+}
+
 struct Font {
     face: Face<'static>,
     shaper: harfrust::ShaperData,
@@ -683,8 +707,21 @@ mod tests {
         if !available() {
             return;
         }
+        // With every font Windows' desktop has, everything listed draws. Without some
+        // (GitHub's Windows Server runners lack a few), the pickers leave out what
+        // cannot be drawn, and the rest must still draw properly.
+        let every_font = every_font();
+        assert!(!every_font || (kaomoji().len() == KAOMOJI.len() && symbols().len() == SYMBOLS.len()));
+        assert!(kaomoji().iter().all(|k| can_stamp(k)) && symbols().iter().all(|k| can_stamp(k)));
+        // Basic Latin and the common symbols are in Segoe UI itself: always drawn.
+        assert!(kaomoji().contains(&"(^_^)") && symbols().contains(&"→") && symbols().contains(&"€"));
         for k in PANEL_SAMPLES.iter().chain(&KAOMOJI).chain(&SYMBOLS) {
-            assert!(can_stamp(k) && !is_emoji(k), "{k}");
+            assert!(!is_emoji(k), "{k}");
+            if !every_font && !can_stamp(k) {
+                eprintln!("{k}: not drawn with the fonts here");
+                continue;
+            }
+            assert!(can_stamp(k), "{k}");
             // A kaomoji is wider than tall; each is drawn in the stamp's colour.
             let size = 40.0;
             let area = bounds(k, size, Pos2::ZERO);
