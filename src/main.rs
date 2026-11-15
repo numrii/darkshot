@@ -19,6 +19,7 @@ mod icons;
 #[cfg(feature = "open-with")]
 mod openwith;
 mod overlay;
+mod perf;
 mod picker;
 mod read;
 mod save;
@@ -40,8 +41,11 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// `darkshot --clipboard`  edits the image on the clipboard.
 /// `darkshot --reopen`     reopens a kept capture, read from standard input (the tray's
 ///                         Reopen last capture; see `handoff`).
-/// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder
-/// (debug builds and builds with the `trace` feature only).
+/// Add `--trace` to either to log frame timings to `darkshot-trace.log` and memory, CPU
+/// and GPU use to `darkshot-perf.log`, both in the temp folder (debug builds and builds
+/// with the `trace` feature only; see `perf`).
+/// `darkshot --trace-cycles 20` opens and closes the capture window 20 times, logging
+///                         resources after each, for numbers to compare across versions.
 fn main() -> AnyResult<()> {
     // Load DLLs only from System32, never from the exe's own folder or the current
     // directory, so a DLL planted next to a portable darkshot.exe is not picked up.
@@ -52,8 +56,16 @@ fn main() -> AnyResult<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
-    let file = args.iter().find(|a| !a.starts_with("--")).map(std::path::PathBuf::from);
-    if flag("--capture") {
+    let cycles = args.iter().position(|a| a == "--trace-cycles");
+    let file = args
+        .iter()
+        .enumerate()
+        .find(|&(i, a)| !a.starts_with("--") && cycles.is_none_or(|c| i != c + 1))
+        .map(|(_, a)| std::path::PathBuf::from(a));
+    if let Some(c) = cycles.filter(|_| perf::enabled() && !flag("--trace-autoclose")) {
+        let n = args.get(c + 1).and_then(|n| n.parse().ok()).unwrap_or(20);
+        daemon::cycles(n)
+    } else if flag("--capture") {
         overlay::run(overlay::Source::Capture)
     } else if flag("--reopen") {
         overlay::run(overlay::Source::Kept)

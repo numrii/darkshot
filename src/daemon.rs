@@ -8,7 +8,8 @@
 //! (`darkshot --settings`); when it closes, the settings are read again.
 
 use std::process::{Child, Command};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -141,6 +142,13 @@ pub fn run() -> AnyResult<()> {
 
     apply_hotkey(&hotkeys, &active, &items, &tray);
     let mut settings_open = false;
+    crate::perf::sample("ready");
+    if crate::perf::enabled() {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(crate::perf::IDLE_EVERY);
+            crate::perf::sample("idle");
+        });
+    }
 
     // The tray icon and the hotkey both deliver their events through this thread's
     // Win32 message queue, so pump it until Quit posts WM_QUIT.
@@ -162,12 +170,11 @@ pub fn run() -> AnyResult<()> {
                 WM_SETTINGS_CLOSED if msg.hwnd.is_null() => {
                     settings_open = false;
                     apply_hotkey(&hotkeys, &active, &items, &tray);
+                    crate::perf::sample("settings closed");
                     // Reopen last capture switched off: let go of a kept capture now,
                     // rather than when its time would have run out.
                     if Settings::load().keep_minutes == 0 {
-                        let mut c = overlay.lock().unwrap();
-                        c.kept = None;
-                        c.generation += 1;
+                        overlay.lock().unwrap().kept = None;
                     }
                 }
                 _ => {
@@ -276,8 +283,12 @@ fn open_settings(main_thread: u32) -> bool {
 struct Captures {
     child: Option<Child>,
     kept: Option<Vec<u8>>,
-    /// Counts changes to `kept`, so a timer only drops the capture it was set for.
-    generation: u64,
+    /// When `kept` is let go.
+    expires: Option<Instant>,
+    /// Whether the thread that lets `kept` go (see `keep_for`) is running.
+    timer: bool,
+    /// Wakes that thread when `kept` changes.
+    kept_changed: Arc<Condvar>,
 }
 
 impl Captures {
@@ -303,7 +314,6 @@ fn reopen(captures: &Shared) {
             bring_forward(pid);
             return;
         }
-        c.generation += 1;
         c.kept.take()
     };
     if let Some(bytes) = bytes {
@@ -313,27 +323,48 @@ fn reopen(captures: &Shared) {
 
 /// Keep a capture the overlay handed over as it closed, for the minutes set in the
 /// settings, then let it go.
-fn keep(captures: &Shared, mut bytes: Vec<u8>) {
+fn keep(captures: &Shared, bytes: Vec<u8>) {
     let minutes = Settings::load().keep_minutes;
     if minutes == 0 {
         return;
     }
+    keep_for(captures, bytes, Duration::from_secs(u64::from(minutes) * 60));
+}
+
+/// Keep `bytes` for `time`, replacing any capture kept before.
+fn keep_for(captures: &Shared, mut bytes: Vec<u8>, time: Duration) {
     bytes.shrink_to_fit();
-    let generation = {
-        let mut c = captures.lock().unwrap();
-        c.kept = Some(bytes);
-        c.generation += 1;
-        c.generation
-    };
+    let mut c = captures.lock().unwrap();
+    c.kept = Some(bytes);
+    c.expires = Some(Instant::now() + time);
+    // One thread waits for whichever capture is kept now, however many come and go:
+    // woken here when a new one replaces it, gone once nothing is kept.
+    if c.timer {
+        c.kept_changed.notify_all();
+        return;
+    }
+    c.timer = true;
+    drop(c);
     let captures = captures.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(u64::from(minutes) * 60));
         let mut c = captures.lock().unwrap();
-        if c.generation == generation {
-            c.kept = None;
+        loop {
+            let (true, Some(expires)) = (c.kept.is_some(), c.expires) else { break };
+            let left = expires.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                // Still holding the lock, so no new capture can slip in unwatched
+                // between letting this one go and the thread ending.
+                c.kept = None;
+                crate::perf::sample("kept let go");
+                continue;
+            }
+            let kept_changed = c.kept_changed.clone();
+            c = kept_changed.wait_timeout(c, left).unwrap().0;
         }
+        c.timer = false;
     });
 }
+
 
 /// Launch the overlay as a child process with `mode` (`--capture`, `--open`,
 /// `--clipboard`, or `--reopen` with the kept capture's `bytes`), unless one is already
@@ -350,7 +381,6 @@ fn start_overlay(captures: &Shared, mode: &str, bytes: Option<Vec<u8>>) {
     }
     if bytes.is_none() {
         c.kept = None;
-        c.generation += 1;
     }
     let spawned = std::env::current_exe().and_then(|exe| {
         // Pass our own flags (such as `--trace`) on to the overlay.
@@ -360,6 +390,9 @@ fn start_overlay(captures: &Shared, mode: &str, bytes: Option<Vec<u8>>) {
             .args(std::env::args().skip(1).filter(|a| {
                 a.starts_with("--")
                     && !["--capture", "--open", "--clipboard", "--reopen", "--tray"].contains(&a.as_str())
+            }))
+            .args(crate::perf::enabled().then_some("--trace-autoclose").filter(|_| {
+                std::env::args().any(|a| a == "--trace-cycles")
             }))
             .stdin(if bytes.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
@@ -379,9 +412,12 @@ fn start_overlay(captures: &Shared, mode: &str, bytes: Option<Vec<u8>>) {
                 let captures = captures.clone();
                 std::thread::spawn(move || {
                     let mut bytes = Vec::new();
-                    if output.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    let kept = output.read_to_end(&mut bytes).is_ok() && !bytes.is_empty();
+                    if kept {
                         keep(&captures, bytes);
                     }
+                    // Its output ends when it closes.
+                    crate::perf::sample(if kept { "overlay closed kept" } else { "overlay closed" });
                 });
             }
             c.child = Some(child);
@@ -391,6 +427,33 @@ fn start_overlay(captures: &Shared, mode: &str, bytes: Option<Vec<u8>>) {
             c.child = None;
         }
     }
+}
+
+/// `--trace-cycles N`: open the capture window `n` times the way the tray does, each one
+/// closing itself once it is on screen (and handing over its capture, if Reopen last
+/// capture is on), and log this process's resources after each. Growth in the tray
+/// rows from cycle to cycle is a leak in the tray; the capture windows' own rows give
+/// startup time and peak memory to compare across versions. Takes neither the hotkey
+/// nor the tray icon, so it runs beside a Darkshot already in the tray.
+pub fn cycles(n: u32) -> AnyResult<()> {
+    let captures: Shared = Arc::default();
+    crate::perf::sample("cycles start");
+    for i in 1..=n {
+        start_overlay(&captures, "--capture", None);
+        let started = Instant::now();
+        while captures.lock().unwrap().running().is_some() {
+            if started.elapsed() > Duration::from_secs(30) {
+                return Err(format!("cycle {i}: the capture window did not close by itself").into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let the handed-over capture arrive and settle before measuring.
+        std::thread::sleep(Duration::from_millis(500));
+        crate::perf::sample(&format!("cycle {i}"));
+    }
+    captures.lock().unwrap().kept = None;
+    crate::perf::sample("cycles done");
+    Ok(())
 }
 
 /// Give the keyboard to the visible window of process `pid`, if it has one.
@@ -433,4 +496,60 @@ fn acquire_single_instance() -> bool {
 /// The tray icon: the app icon at 32x32.
 fn tray_icon() -> AnyResult<Icon> {
     Ok(Icon::from_rgba(crate::appicon::rgba(32), 32, 32)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait(ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn a_kept_capture_is_let_go_when_its_time_is_up() {
+        let captures: Shared = Arc::default();
+        keep_for(&captures, vec![1], Duration::from_millis(100));
+        wait(50);
+        assert_eq!(captures.lock().unwrap().kept, Some(vec![1]));
+        wait(150);
+        let c = captures.lock().unwrap();
+        assert_eq!(c.kept, None);
+        assert!(!c.timer, "the timer thread ends once nothing is kept");
+    }
+
+    #[test]
+    fn a_newer_capture_gets_its_own_time_and_one_thread_watches_both() {
+        let captures: Shared = Arc::default();
+        keep_for(&captures, vec![1], Duration::from_millis(100));
+        wait(60);
+        keep_for(&captures, vec![2], Duration::from_millis(100));
+        wait(80); // past the first one's time, within the second's
+        assert_eq!(captures.lock().unwrap().kept, Some(vec![2]));
+        wait(100);
+        assert_eq!(captures.lock().unwrap().kept, None);
+    }
+
+    #[test]
+    fn a_shorter_time_wakes_the_timer_early() {
+        let captures: Shared = Arc::default();
+        keep_for(&captures, vec![1], Duration::from_secs(60));
+        wait(20);
+        keep_for(&captures, vec![2], Duration::from_millis(50));
+        wait(150);
+        assert_eq!(captures.lock().unwrap().kept, None);
+    }
+
+    #[test]
+    fn a_capture_kept_after_one_was_taken_is_still_let_go() {
+        let captures: Shared = Arc::default();
+        keep_for(&captures, vec![1], Duration::from_millis(80));
+        captures.lock().unwrap().kept = None; // reopened, or replaced by a new capture
+        wait(20);
+        keep_for(&captures, vec![2], Duration::from_millis(80));
+        wait(150);
+        let c = captures.lock().unwrap();
+        assert_eq!(c.kept, None);
+        assert!(!c.timer);
+    }
 }

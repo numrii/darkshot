@@ -98,6 +98,7 @@ pub fn run(source: Source) -> AnyResult<()> {
 
     // Grab the screen before our own window exists so the overlay is never in the shot.
     trace("start");
+    crate::perf::sample("start");
     let settings = Settings::load();
     let mut kept = None;
     let desktop = match source {
@@ -131,6 +132,7 @@ pub fn run(source: Source) -> AnyResult<()> {
         },
     };
     trace("captured");
+    crate::perf::sample("captured");
 
     // Create the window at its final size. If it were created small and resized
     // afterwards, the first frame would be drawn into the small surface and stretched.
@@ -181,6 +183,9 @@ pub fn run(source: Source) -> AnyResult<()> {
         &event_loop,
     );
     event_loop.run_app(&mut app)?;
+    // After the window and its GPU resources are gone: what is left should be little.
+    drop(app);
+    crate::perf::sample("closed");
     Ok(())
 }
 
@@ -3468,6 +3473,9 @@ impl eframe::App for Overlay {
             ctx.request_repaint(); // check again next frame that the move stuck
         }
         self.claim_focus(&ctx);
+        if crate::perf::frame(&ctx) {
+            self.leave(&ctx); // `--trace-cycles`: shown, measured, done
+        }
 
         // The whole window, across every monitor. (The content rect is only the monitor
         // popups are kept on; see `raw_input_hook`.)
