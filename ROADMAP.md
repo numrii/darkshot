@@ -45,6 +45,21 @@ annotations):
 
 ## Done
 
+- Version 1.4.0:
+  - The emoji stamp has a full emoji picker: recent emoji, a tab per group, and a
+    search by name, tag or shortcode (Unicode's list and GitHub's gemoji). Kaomoji
+    and symbol pickers stamp in the current colour.
+  - Right-click backs out one step at a time (a panel, the selection, the tool)
+    instead of drawing; only the left button draws.
+  - Shortcut and tool keys follow the keyboard layout, shown as printed on the key.
+  - Settings rearranged: shortcuts and tool keys on the left, the rest on the right.
+    Tool help is off by default.
+  - A click on the tray or the shortcut while a capture is open brings it to the front.
+  - Graphics through Direct3D 12 alone (other backends only without a Direct3D 12
+    GPU) with a memory-saving allocator: about a fifth of the GPU memory of before.
+  - Reopen last capture: a closing capture hands its state, compressed, to the tray
+    and exits, instead of staying open hidden (a few MB instead of hundreds). Turning
+    the option off lets go of a kept capture at once.
 - Version 1.3.0:
   - The hotkey strip wraps onto more rows instead of running off the screen past 95%
     of its width; groups stay together on one row when they fit on one.

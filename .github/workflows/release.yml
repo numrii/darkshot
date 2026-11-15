@@ -37,8 +37,13 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
-      - name: Test
+      - name: Test the restrictive version
         run: cargo test --release --locked
+
+      # The personal version compiles in modules of its own (start with Windows, Open
+      # with, freeing a Windows shortcut), whose tests run only with its features.
+      - name: Test the personal version
+        run: cargo test --release --locked --features personal --target-dir target/personal
 
       - name: Build the restrictive version
         run: cargo build --release --locked

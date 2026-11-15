@@ -79,7 +79,6 @@ fn trace(what: &str) {
     }
 }
 
-/// Capture all monitors and run the overlay until the user copies, saves or cancels.
 /// What the overlay opens with.
 pub enum Source {
     /// A capture of the screen, taken now.
@@ -92,6 +91,7 @@ pub enum Source {
     Kept,
 }
 
+/// Open the overlay over `source` and run it until the user copies, saves or cancels.
 pub fn run(source: Source) -> AnyResult<()> {
     // Must happen first: without it Windows reports scaled, not physical, coordinates.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
@@ -240,7 +240,7 @@ fn read_kept(bytes: &[u8]) -> crate::handoff::Result<(Desktop, Kept)> {
             format: r.option(|r| r.choice(&[Format::Png, Format::Jpeg]))?,
         })
     })?;
-    if shots.is_empty() || shots.len() != monitors.len() || screens.is_empty() {
+    if shots.is_empty() || shots.len() != monitors.len() || screens.len() != monitors.len() {
         return Err("no screens");
     }
     let snap = Snap::new(windows, &monitors);
@@ -1996,9 +1996,6 @@ impl Overlay {
 
     // --- Editing commands --------------------------------------------------------------
 
-    /// Switch tools. Every tool keeps its own size; the highlighter, text, blur and step
-    /// tools also keep their own colour (the highlighter starts yellow), while the
-    /// other tools share one.
     /// Right-click: close whatever is open, or else let go of the selected annotation,
     /// or else put the tool down (back to Select). One step per click.
     fn back_out(&mut self, ctx: &egui::Context) {
@@ -2021,6 +2018,9 @@ impl Overlay {
         }
     }
 
+    /// Switch tools. Every tool keeps its own size; the highlighter, text, blur and step
+    /// tools also keep their own colour (the highlighter starts yellow), while the
+    /// other tools share one.
     fn set_tool(&mut self, tool: Tool) {
         if tool == self.tool {
             return;
@@ -2772,6 +2772,9 @@ impl Overlay {
         }
         if let Some(texture) = self.emoji_icons.get(&key) {
             let size = vec2(texture.size()[0] as f32, texture.size()[1] as f32);
+            // Normally it fits as made; if it still does not (a glyph that kept growing
+            // past the cell), shrink it evenly rather than spill into the next cell.
+            let size = size * (fit[0] as f32 / size.x).min(fit[1] as f32 / size.y).min(1.0);
             let min = ((area.center().to_vec2() * ppp - size / 2.0).round() / ppp).to_pos2();
             let shown = Rect::from_min_size(min, size / ppp);
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
@@ -3232,10 +3235,6 @@ pub(crate) fn setup_text(ctx: &egui::Context) {
     });
 }
 
-/// `emoji` drawn about `px` pixels tall, cropped to the pixels it actually covers, with
-/// any kaomoji or symbol in `ink`. Emoji differ in width and some reach beyond their
-/// box, so the toolbar and picker fit this whole image into their cells rather than
-/// drawing a fixed square.
 /// `text` drawn as large as fits `fit` pixels once cropped: drawn at the height that
 /// fills it, then smaller if what it covers is wider or taller than that.
 fn fitted_texture(ctx: &egui::Context, text: &str, fit: [u32; 2], ink: Color32, plain: bool) -> Option<egui::TextureHandle> {
@@ -3257,6 +3256,10 @@ fn emoji_texture(ctx: &egui::Context, emoji: &str, px: u32, ink: Color32) -> Opt
     emoji_texture_with(ctx, emoji, px, ink, false)
 }
 
+/// `emoji` drawn about `px` pixels tall, cropped to the pixels it actually covers, with
+/// any kaomoji or symbol in `ink`. Emoji differ in width and some reach beyond their
+/// box, so the toolbar and picker fit this whole image into their cells rather than
+/// drawing a fixed square.
 fn emoji_texture_with(ctx: &egui::Context, emoji: &str, px: u32, ink: Color32, plain: bool) -> Option<egui::TextureHandle> {
     // Room on every side for whatever spills out of the emoji's box; a kaomoji is wide.
     let wide = crate::emoji::bounds(emoji, px as f32, Pos2::ZERO).width().ceil() as u32;
@@ -4558,6 +4561,29 @@ mod tests {
         });
         overlay.reset_rotation();
         assert!(overlay.rotation.is_none() && overlay.reread);
+    }
+
+    /// Right-click backs out one step at a time: a panel, then the selection, then the
+    /// tool. It never removes anything or closes the capture.
+    #[test]
+    fn right_click_backs_out_one_step_at_a_time() {
+        let ctx = egui::Context::default();
+        let mut overlay = plain_overlay(400, 300, RgbaImage::new(400, 300));
+        overlay.selection = Some(rect(100.0, 100.0, 300.0, 200.0));
+        overlay.annotations.push(Annotation::stroked(ShapeKind::Rect, Pos2::new(120.0, 120.0), Pos2::new(160.0, 160.0), Color32::RED, 3.0, Dash::Solid));
+        overlay.set_tool(Tool::Shape(ShapeKind::Arrow));
+        overlay.selected = Some(0);
+        overlay.save_open = true;
+        overlay.back_out(&ctx);
+        assert!(!overlay.save_open && overlay.selected == Some(0) && overlay.tool == Tool::Shape(ShapeKind::Arrow));
+        overlay.back_out(&ctx);
+        assert!(overlay.selected.is_none() && overlay.tool == Tool::Shape(ShapeKind::Arrow));
+        overlay.back_out(&ctx);
+        assert_eq!(overlay.tool, Tool::Select);
+        overlay.back_out(&ctx);
+        assert_eq!(overlay.tool, Tool::Select);
+        assert_eq!(overlay.annotations.len(), 1);
+        assert!(overlay.selection.is_some());
     }
 
     /// A blur region blurs what is under it after a turn, not what was there before.

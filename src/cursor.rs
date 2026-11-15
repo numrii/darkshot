@@ -129,6 +129,9 @@ fn paint(handle: HCURSOR, patch: &mut RgbaImage) -> bool {
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
         let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
         if dib.is_null() || bits.is_null() {
+            if !dib.is_null() {
+                DeleteObject(dib);
+            }
             DeleteDC(dc);
             return false;
         }

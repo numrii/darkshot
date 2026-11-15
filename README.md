@@ -53,7 +53,7 @@ register.
   While a capture is kept, the capture window is closed completely; only the tray holds
   on to the capture, compressed, in memory: a few MB (5.4 MB for two 2560×1440 screens),
   more for busy or larger screens. Leave the option off if you would rather the tray
-  keep nothing between captures.
+  keep nothing between captures; turning it off lets go of a kept capture at once.
 
 ### Editing an existing image
 

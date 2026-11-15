@@ -162,6 +162,13 @@ pub fn run() -> AnyResult<()> {
                 WM_SETTINGS_CLOSED if msg.hwnd.is_null() => {
                     settings_open = false;
                     apply_hotkey(&hotkeys, &active, &items, &tray);
+                    // Reopen last capture switched off: let go of a kept capture now,
+                    // rather than when its time would have run out.
+                    if Settings::load().keep_minutes == 0 {
+                        let mut c = overlay.lock().unwrap();
+                        c.kept = None;
+                        c.generation += 1;
+                    }
                 }
                 _ => {
                     TranslateMessage(&msg);
