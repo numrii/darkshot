@@ -59,7 +59,7 @@ jobs:
       # Attestations need a public repository (or GitHub Enterprise); a private
       # repository still gets its release, just without them.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v3
         continue-on-error: true
         with:
           subject-path: out/*.exe
