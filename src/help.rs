@@ -17,11 +17,11 @@ use crate::icons::{self, Icon};
 #[serde(rename_all = "lowercase")]
 pub enum HelpLevel {
     /// What the tool does, its clicks and drags, keys and modifiers, toolbar options.
-    #[default]
     Full,
     /// Everything but the keys and modifiers, which the strip already shows.
     Compact,
     /// No tool box; the strip at the bottom stays.
+    #[default]
     Off,
 }
 
@@ -129,12 +129,12 @@ pub fn tool_help(id: &str) -> Option<ToolHelp> {
         },
         "emoji" => ToolHelp {
             name: "Emoji stamp",
-            does: "Stamps an emoji.",
-            acts: &[("Click", "Place the emoji"), ("Drag", "Place it where you let go")],
+            does: "Stamps an emoji, a kaomoji or a symbol.",
+            acts: &[("Click", "Place the stamp"), ("Drag", "Place it where you let go")],
             mods: &[MOVE, (&["Wheel"], "Size")],
             opts: Some(
-                "Emoji: pick a favourite, or press Win+. in its field for any emoji. A placed stamp stays \
-                 unselected, so a new emoji is for the next one",
+                "Emoji, kaomoji and symbol pickers; Win+. in the emoji picker for any other. Kaomoji and \
+                 symbols take the colour. A placed stamp stays unselected, so a new pick is for the next one",
             ),
         },
         "eyedropper" => ToolHelp {
@@ -528,6 +528,7 @@ pub fn sheet(ctx: &egui::Context, monitor: Rect, tools: &[(&'static str, String)
                             (&["Wheel"], "Thickness or size (each tool keeps its own)"),
                             (&["Del"], "Delete selected"),
                             (&["Esc"], "Deselect"),
+                            (&["Right-click"], "Close a panel, deselect, or put the tool down"),
                             (&["Ctrl", "Z"], "Undo"),
                             (&["Ctrl", "Y"], "Redo (or Ctrl+Shift+Z)"),
                         ]),
@@ -637,7 +638,8 @@ mod strip_tests {
             vec![Entry::new(&["Esc"], "close")],
         ];
         let ctx = egui::Context::default();
-        let _ = ctx.run_pass(Default::default(), |ctx| {
+        // A frame's texture updates must be handled or cleared before it is dropped.
+        let mut out = ctx.run_pass(Default::default(), |ctx| {
             let painter = ctx.layer_painter(egui::LayerId::background());
             let wide = strip(&painter, Pos2::new(500.0, 10.0), true, 10_000.0, &groups);
             assert!((wide.height() - STRIP_HEIGHT).abs() < 0.5, "one row: {wide:?}");
@@ -648,5 +650,6 @@ mod strip_tests {
             let below = strip(&painter, Pos2::new(500.0, 900.0), false, 600.0, &groups);
             assert_eq!(below.bottom(), 900.0);
         });
+        out.textures_delta.clear();
     }
 }

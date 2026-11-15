@@ -1,6 +1,6 @@
 //! The settings window (`darkshot --settings`), opened from the tray menu.
 
-use eframe::egui::{self, vec2, Color32, Key, Rect, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, Key, RichText, Sense, Vec2};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::{
@@ -38,8 +38,12 @@ mod recorder {
             ctx.input_mut(|input| {
                 let found = input.events.iter().find_map(|event| match event {
                     // Windows reports only the release of PrintScreen.
-                    egui::Event::Key { key, pressed, modifiers, .. } if *pressed || *key == Key::PrintScreen => {
-                        let vk = vk_code(*key)?;
+                    egui::Event::Key { key, physical_key, pressed, modifiers, .. }
+                        if *pressed || *key == Key::PrintScreen =>
+                    {
+                        // The key's own code in this layout: egui may name Ö after the
+                        // US key in its place.
+                        let vk = physical_key.and_then(crate::keys::virtual_key_at).or_else(|| vk_code(*key))?;
                         let mut mods = 0;
                         for (held, bit) in [(modifiers.ctrl, MOD_CTRL), (modifiers.alt, MOD_ALT), (modifiers.shift, MOD_SHIFT)] {
                             if held {
@@ -132,9 +136,10 @@ pub fn run() -> AnyResult<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Darkshot settings")
             .with_icon(crate::appicon::window_icon())
-            .with_inner_size([860.0, if cfg!(feature = "autostart") { 880.0 } else { 820.0 }])
+            .with_inner_size([880.0, 700.0])
             .with_min_inner_size([680.0, 300.0])
             .with_resizable(true),
+        wgpu_options: crate::overlay::gpu_options(eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT),
         ..Default::default()
     };
     eframe::run_native(
@@ -257,7 +262,7 @@ impl SettingsApp {
                     .find(|w| self.shortcut_mut(*w).eq_ignore_ascii_case(&text));
                 match taken {
                     Some(other) => {
-                        self.message = Some((format!("{text} is already the {} shortcut.", other.name()), true));
+                        self.message = Some((format!("{} is already the {} shortcut.", crate::keys::shortcut_label(&text), other.name()), true));
                     }
                     None => {
                         *self.shortcut_mut(which) = text;
@@ -265,7 +270,9 @@ impl SettingsApp {
                     }
                 }
             }
-            Some(text) => self.message = Some((format!("{text} can't be used as a shortcut."), true)),
+            Some(text) => {
+                self.message = Some((format!("{} can't be used as a shortcut.", crate::keys::shortcut_label(&text)), true));
+            }
             None => self.message = Some(("That key can't be used as a shortcut.".to_owned(), true)),
         }
     }
@@ -293,10 +300,10 @@ impl SettingsApp {
         let problem = if modifiers.ctrl || modifiers.alt || modifiers.command {
             Some("A tool's key is a single key, without Ctrl or Alt.".to_owned())
         } else if !settings::tool_key_allowed(key) {
-            Some(format!("{} can't pick a tool: the capture uses it.", key.name()))
+            Some(format!("{} can't pick a tool: the capture uses it.", crate::keys::label(key)))
         } else {
             self.settings.tool_with_key(key, tool.id).map(|other| {
-                format!("{} already picks {}. Give that tool another key first.", key.name(), other.name)
+                format!("{} already picks {}. Give that tool another key first.", crate::keys::label(key), other.name)
             })
         };
         match problem {
@@ -309,59 +316,47 @@ impl SettingsApp {
     #[cfg(feature = "autostart")]
     fn startup_setting(&mut self, ui: &mut egui::Ui) {
         use crate::autostart::{self, Status};
-        section(ui, "Startup");
         let mut on = self.autostart == Status::On;
-        let toggle = ui
-            .checkbox(&mut on, "Start Darkshot when I sign in to Windows")
-            .on_hover_text("Darkshot starts in the notification area when you sign in.");
+        let toggle = ui.checkbox(&mut on, "Start with Windows").on_hover_text("Darkshot starts in the tray when you sign in.");
         if toggle.changed() {
             match autostart::set(on) {
                 Ok(()) => self.autostart = autostart::status(),
-                Err(e) => self.message = Some((format!("Could not change startup: {e}"), true)),
+                Err(e) => self.message = Some((format!("Couldn't change startup: {e}"), true)),
             }
         }
         if let Status::Elsewhere(path) = &self.autostart {
             let weak = ui.visuals().weak_text_color();
-            let text = format!("Another copy of Darkshot starts with Windows ({path}). Tick the box to start this copy instead.");
-            ui.label(RichText::new(text).color(weak).small());
+            let text = "Another copy of Darkshot starts with Windows. Tick to start this one instead.";
+            ui.label(RichText::new(text).color(weak).small()).on_hover_text(path.as_str());
         }
     }
 
-    /// Free the shortcut's Win+ letter from Windows, or give letters back; applied at once.
+    /// Free the capture shortcut from Windows, or give shortcuts back; applied at once.
     #[cfg(feature = "free-shortcut")]
     fn free_shortcut_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
         use crate::winkeys;
         let current = winkeys::letter_of(&self.settings.hotkey);
         let mut changes = Vec::new();
         if let Some(letter) = current {
-            ui.add_space(4.0);
+            let shortcut = crate::keys::shortcut_label(&self.settings.hotkey);
             let mut on = self.freed.contains(letter);
             let tip = format!(
-                "Windows stops using its own Win+{letter} shortcuts (with any of Ctrl, Alt or Shift), \
-                 so Darkshot can register {}. Untick to give them back to Windows.",
-                self.settings.hotkey
+                "Windows stops using Win+{letter} and its combinations with Ctrl, Alt or Shift, so Darkshot \
+                 can use {shortcut}. Untick to give them back. Doesn't work on every version of Windows."
             );
             ui.horizontal(|ui| {
-                let label = format!("Free Win+{letter} shortcuts from Windows");
-                if ui.checkbox(&mut on, label).on_hover_text(tip).changed() {
+                if ui.checkbox(&mut on, format!("Free {shortcut} from Windows")).on_hover_text(tip).changed() {
                     changes.push((letter, on));
                 }
-                // Works on some Windows versions and not others.
                 ui.label(RichText::new("(experimental)").color(ERROR_RED));
             });
-            let hint = format!(
-                "If Windows still keeps {} after Explorer restarts, choose another shortcut above, \
-                 such as Ctrl+Shift+S.",
-                self.settings.hotkey
-            );
-            ui.label(RichText::new(hint).color(weak).small());
         }
         let others: Vec<char> = self.freed.chars().filter(|&c| Some(c) != current).collect();
         if !others.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 let list: Vec<String> = others.iter().map(|c| format!("Win+{c}")).collect();
-                ui.label(RichText::new(format!("Also freed from Windows: {}", list.join(", "))).color(weak).small());
-                if ui.small_button("Give back").on_hover_text("Let Windows use these shortcuts again").clicked() {
+                ui.label(RichText::new(format!("Also freed: {}", list.join(", "))).color(weak).small());
+                if ui.small_button("Give back").on_hover_text("Let Windows use these again").clicked() {
                     changes.extend(others.iter().map(|&c| (c, false)));
                 }
             });
@@ -369,7 +364,7 @@ impl SettingsApp {
         if !changes.is_empty() {
             for (letter, free) in changes {
                 if let Err(e) = winkeys::set(letter, free) {
-                    self.message = Some((format!("Could not change Windows shortcuts: {e}"), true));
+                    self.message = Some((format!("Couldn't change Windows shortcuts: {e}"), true));
                 }
             }
             self.freed = winkeys::freed();
@@ -377,14 +372,14 @@ impl SettingsApp {
         }
         if self.explorer_stale {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Takes effect when Explorer restarts or you sign in again.").color(weak).small());
+                ui.label(RichText::new("Takes effect when Explorer restarts.").color(weak).small());
                 let restart = ui
-                    .small_button("Restart Explorer now")
-                    .on_hover_text("The taskbar disappears for a moment, and open File Explorer windows close.");
+                    .small_button("Restart Explorer")
+                    .on_hover_text("The taskbar disappears for a moment, and File Explorer windows close.");
                 if restart.clicked() {
                     match winkeys::restart_explorer() {
                         Ok(()) => self.explorer_stale = false,
-                        Err(e) => self.message = Some((format!("Could not restart Explorer: {e}"), true)),
+                        Err(e) => self.message = Some((format!("Couldn't restart Explorer: {e}"), true)),
                     }
                 }
             });
@@ -394,51 +389,48 @@ impl SettingsApp {
     /// The tools list: a box per tool, with its icon and the key that picks it.
     fn tools_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
         section(ui, "Tools");
-        ui.label(
-            RichText::new(
-                "Untick the tools you don't use: they leave the toolbar, and their keys do nothing. \
-                 Click a key to give the tool another.",
-            )
-            .color(weak)
-            .small(),
-        );
-        ui.add_space(6.0);
+        hint(ui, "Untick tools you don't use. Click a key to change it.");
+        ui.add_space(4.0);
         let (ink, paper) = (ui.visuals().text_color(), ui.visuals().panel_fill);
-        for info in &TOOLS {
-            ui.horizontal(|ui| {
-                let mut on = self.settings.tool_enabled(info.id);
-                let mut changed = ui.checkbox(&mut on, "").changed();
-                let (area, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                crate::icons::paint(ui.painter(), area, info.icon, if on { ink } else { weak }, paper);
-                ui.add_space(4.0);
-                if ui.add(egui::Label::new(info.name).sense(Sense::click())).clicked() {
-                    on = !on;
-                    changed = true;
-                }
-                if changed {
-                    self.settings.set_tool_enabled(info.id, on);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // The key buttons line up in a column of their own, just past the longest name.
+        egui::Grid::new("tools").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+            for info in &TOOLS {
+                ui.horizontal(|ui| {
+                    let mut on = self.settings.tool_enabled(info.id);
+                    let mut changed = ui.checkbox(&mut on, "").changed();
+                    let (area, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                    crate::icons::paint(ui.painter(), area, info.icon, if on { ink } else { weak }, paper);
+                    ui.add_space(4.0);
+                    if ui.add(egui::Label::new(info.name).sense(Sense::click())).clicked() {
+                        on = !on;
+                        changed = true;
+                    }
+                    if changed {
+                        self.settings.set_tool_enabled(info.id, on);
+                    }
+                });
+                ui.horizontal(|ui| {
                     let recording = self.tool_recording.is_some_and(|t| t.id == info.id);
                     let key = self.settings.tool_key(info);
                     let custom = key != info.key;
-                    let text = if recording { "Press a key…".to_owned() } else { key.name().to_owned() };
-                    let (field, clear) = key_field(ui, &text, recording, custom);
+                    let text = if recording { "Press a key…".to_owned() } else { crate::keys::label(key) };
+                    let button = ui.add_sized([100.0, 22.0], egui::Button::new(text).selected(recording));
                     let tip = format!("The key that picks {}. Click, then press a key. Esc cancels.", info.name);
-                    if field.on_hover_text(tip).clicked() {
+                    if button.on_hover_text(tip).clicked() {
                         self.message = None;
                         self.recorder = None;
                         self.tool_recording = if recording { None } else { Some(info) };
                     }
-                    let tip = format!("Back to {}", info.key.name());
-                    if clear.is_some_and(|clear| clear.on_hover_text(tip).clicked()) {
+                    let reset = custom && ui.small_button("Reset").on_hover_text(format!("Back to {}", crate::keys::label(info.key))).clicked();
+                    if reset {
                         self.settings.set_tool_key(info, None);
                         self.tool_recording = None;
                         self.message = None;
                     }
                 });
-            });
-        }
+                ui.end_row();
+            }
+        });
         if !self.settings.disabled_tools.is_empty() {
             ui.add_space(4.0);
             if ui.small_button("Enable all").clicked() {
@@ -446,46 +438,6 @@ impl SettingsApp {
             }
         }
     }
-}
-
-/// A field showing a tool's key, clicked to choose another. With `custom`, an × at its
-/// right end puts the tool's own key back; its response is the second one returned.
-fn key_field(ui: &mut egui::Ui, text: &str, recording: bool, custom: bool) -> (egui::Response, Option<egui::Response>) {
-    let (rect, field) = ui.allocate_exact_size(vec2(104.0, 22.0), Sense::click());
-    let clear_rect = Rect::from_center_size(rect.right_center() - vec2(11.0, 0.0), Vec2::splat(16.0));
-    let clear = custom.then(|| ui.interact(clear_rect, field.id.with("clear"), Sense::click()));
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.visuals();
-        let border = if recording {
-            visuals.selection.stroke
-        } else if field.hovered() {
-            visuals.widgets.hovered.bg_stroke
-        } else {
-            visuals.widgets.inactive.bg_stroke
-        };
-        ui.painter().rect(rect, 3.0, visuals.extreme_bg_color, border, egui::StrokeKind::Inside);
-        let color = if recording { visuals.weak_text_color() } else { visuals.text_color() };
-        let font = egui::FontId::proportional(13.0);
-        let text = if custom && !recording { RichText::new(text).strong() } else { RichText::new(text) };
-        let galley = egui::WidgetText::from(text.color(color)).into_galley(
-            ui,
-            Some(egui::TextWrapMode::Truncate),
-            rect.width() - 30.0,
-            font,
-        );
-        ui.painter().galley(rect.left_center() + vec2(8.0, -galley.size().y / 2.0), galley, color);
-        if let Some(clear) = &clear {
-            let ink = if clear.hovered() { visuals.strong_text_color() } else { visuals.weak_text_color() };
-            if clear.hovered() {
-                ui.painter().rect_filled(clear_rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
-            }
-            let (c, r) = (clear_rect.center(), 3.5);
-            let stroke = Stroke::new(1.4, ink);
-            ui.painter().line_segment([c + vec2(-r, -r), c + vec2(r, r)], stroke);
-            ui.painter().line_segment([c + vec2(-r, r), c + vec2(r, -r)], stroke);
-        }
-    }
-    (field, clear)
 }
 
 /// A colour button that edits a `#RRGGBB` setting, or `#RRGGBBAA` with `alpha`.
@@ -548,7 +500,7 @@ impl eframe::App for SettingsApp {
                 if ui.button("Cancel").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if ui.small_button("Restore all defaults").clicked() {
+                if ui.small_button("Restore defaults").clicked() {
                     self.settings = Settings::default();
                     self.tool_recording = None;
                 }
@@ -574,205 +526,155 @@ impl eframe::App for SettingsApp {
                 // Columns lay out justified (buttons as wide as the column): undo that.
                 let layout = egui::Layout::top_down(egui::Align::Min);
                 ui.columns(2, |columns| {
-                    columns[0].with_layout(layout, |ui| self.options(ui, weak));
-                    columns[1].with_layout(layout, |ui| self.tools_setting(ui, weak));
+                    columns[0].with_layout(layout, |ui| self.keys_column(ui, weak));
+                    columns[1].with_layout(layout, |ui| self.options_column(ui, weak));
                 });
             });
         });
     }
 }
 
+/// Width of the label column, the same in every section so the controls line up.
+const LABEL_WIDTH: f32 = 128.0;
+
+/// A two-column grid of labelled rows, lined up with the other sections.
+fn rows(id: &str) -> egui::Grid {
+    egui::Grid::new(id).num_columns(2).min_col_width(LABEL_WIDTH).spacing([8.0, 6.0])
+}
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    let weak = ui.visuals().weak_text_color();
+    ui.label(RichText::new(text).color(weak).small());
+}
+
 impl SettingsApp {
-    /// The left column: everything but the tools.
-    fn options(&mut self, ui: &mut egui::Ui, weak: Color32) {
-        {
-            section(ui, "Capture shortcut");
+    /// The left column: shortcuts and tools.
+    fn keys_column(&mut self, ui: &mut egui::Ui, weak: Color32) {
+        section(ui, "Shortcuts");
+        hint(ui, "Click a button, then press the keys. Esc cancels.");
+        ui.add_space(2.0);
+        rows("capture-shortcut").show(ui, |ui| {
+            ui.label("Capture");
             ui.horizontal(|ui| {
                 let recording = self.recorder.is_some() && self.recording_for == Which::Capture;
-                let text = if recording { "Press keys…".to_owned() } else { self.settings.hotkey.clone() };
-                let button = ui.add_sized([160.0, 26.0], egui::Button::new(text).selected(recording));
-                if button.on_hover_text("Click, then press the combination. Esc cancels.").clicked() {
+                let text = if recording { "Press keys…".to_owned() } else { crate::keys::shortcut_label(&self.settings.hotkey) };
+                if ui.add_sized([140.0, 22.0], egui::Button::new(text).selected(recording)).clicked() {
                     self.toggle_recording(Which::Capture);
                 }
-                if ui.button("Reset").on_hover_text(DEFAULT_HOTKEY).clicked() {
+                if self.settings.hotkey != DEFAULT_HOTKEY && ui.small_button("Reset").on_hover_text(DEFAULT_HOTKEY).clicked() {
                     self.settings.hotkey = DEFAULT_HOTKEY.into();
                     self.recorder = None;
                 }
             });
-            let hint = if settings::FREE_SHORTCUT_AVAILABLE {
-                "Click the button and press a combination, e.g. Ctrl+F9 or PrintScreen. \
-                 Combinations Windows keeps for itself, such as Win+Shift+S, work once freed below."
-            } else {
-                "Click the button and press a combination, e.g. Ctrl+F9 or PrintScreen. \
-                 Combinations Windows keeps for itself cannot be used."
-            };
-            ui.label(RichText::new(hint).color(weak).small());
-            #[cfg(feature = "free-shortcut")]
-            self.free_shortcut_setting(ui, weak);
-            ui.add_space(6.0);
-            egui::Grid::new("other-shortcuts").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                for which in [Which::Clipboard, Which::Reopen] {
-                    ui.label(which.name());
-                    ui.horizontal(|ui| {
-                        let recording = self.recorder.is_some() && self.recording_for == which;
-                        let current = self.shortcut_mut(which).clone();
-                        let text = if recording {
-                            "Press keys…".to_owned()
-                        } else if current.is_empty() {
-                            "None".to_owned()
-                        } else {
-                            current.clone()
-                        };
-                        let button = ui.add_sized([140.0, 22.0], egui::Button::new(text).selected(recording));
-                        if button.on_hover_text("Click, then press the combination. Esc cancels.").clicked() {
-                            self.toggle_recording(which);
-                        }
-                        if !current.is_empty() && ui.small_button("Clear").clicked() {
-                            self.shortcut_mut(which).clear();
-                            self.recorder = None;
-                        }
-                    });
-                    ui.end_row();
-                }
-            });
-
-            section(ui, "Capturing");
-            ui.checkbox(&mut self.settings.include_cursor, "Include the mouse cursor")
-                .on_hover_text("The cursor is drawn into the capture where it was when you pressed the shortcut.");
-            ui.checkbox(&mut self.settings.confirm_discard, "Ask before discarding annotations")
-                .on_hover_text("Esc and Close ask first when a capture with annotations has not been copied or saved.");
-            ui.horizontal(|ui| {
-                let mut keep = self.settings.keep_minutes > 0;
-                let tip = "After you copy, save or close, the capture, selection and drawings are kept in memory \
-                           (never on disk) for this long. Reopen them from the tray menu or with the Reopen last \
-                           capture shortcut. The next capture replaces them, and they are gone when Darkshot quits.";
-                if ui.checkbox(&mut keep, "Keep the last capture to reopen for").on_hover_text(tip).changed() {
-                    self.settings.keep_minutes = if keep { 5 } else { 0 };
-                }
-                if keep {
-                    ui.add(egui::DragValue::new(&mut self.settings.keep_minutes).range(1..=settings::MAX_KEEP_MINUTES));
-                    ui.label("minutes");
-                }
-            });
-
-            section(ui, "Default colours");
-            ui.label(
-                RichText::new("The colours every capture starts with. Click one to choose your own.").color(weak).small(),
-            );
-            ui.add_space(4.0);
-
-            egui::Grid::new("colours").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label("Swatches");
+            ui.end_row();
+        });
+        #[cfg(feature = "free-shortcut")]
+        self.free_shortcut_setting(ui, weak);
+        rows("other-shortcuts").show(ui, |ui| {
+            for which in [Which::Clipboard, Which::Reopen] {
+                ui.label(which.name());
                 ui.horizontal(|ui| {
-                    for (hex, fallback) in self.settings.swatches.iter_mut().zip(DEFAULT_SWATCHES) {
-                        color_setting(ui, hex, fallback, false);
+                    let recording = self.recorder.is_some() && self.recording_for == which;
+                    let current = self.shortcut_mut(which).clone();
+                    let text = if recording {
+                        "Press keys…".to_owned()
+                    } else if current.is_empty() {
+                        "None".to_owned()
+                    } else {
+                        crate::keys::shortcut_label(&current)
+                    };
+                    if ui.add_sized([140.0, 22.0], egui::Button::new(text).selected(recording)).clicked() {
+                        self.toggle_recording(which);
+                    }
+                    if !current.is_empty() && ui.small_button("Clear").clicked() {
+                        self.shortcut_mut(which).clear();
+                        self.recorder = None;
                     }
                 });
                 ui.end_row();
-                ui.label("Highlighter");
-                color_setting(ui, &mut self.settings.marker_color, DEFAULT_MARKER_COLOR, false);
-                ui.end_row();
-            });
-            if ui.small_button("Reset colours").clicked() {
-                let defaults = Settings::default();
-                self.settings.swatches = defaults.swatches;
-                self.settings.marker_color = defaults.marker_color;
             }
+        });
+        self.tools_setting(ui, weak);
+    }
 
-            section(ui, "Appearance");
+    /// The right column: general options, colours and saving.
+    fn options_column(&mut self, ui: &mut egui::Ui, weak: Color32) {
+        use crate::help::HelpLevel;
+        section(ui, "General");
+        rows("general").show(ui, |ui| {
+            ui.label("Theme");
             ui.horizontal(|ui| {
-                ui.label("Theme");
-                ui.add_space(8.0);
-                for (value, name) in
-                    [(ThemeSetting::System, "System"), (ThemeSetting::Light, "Light"), (ThemeSetting::Dark, "Dark")]
-                {
+                for (value, name) in [(ThemeSetting::System, "System"), (ThemeSetting::Light, "Light"), (ThemeSetting::Dark, "Dark")] {
                     ui.selectable_value(&mut self.settings.theme, value, name);
                 }
             });
+            ui.end_row();
+            ui.label("Tool help");
             ui.horizontal(|ui| {
-                use crate::help::HelpLevel;
-                ui.label("Tool help");
-                ui.add_space(8.0);
                 for (value, name, tip) in [
-                    (HelpLevel::Full, "Full", "A box beside the selection explains the current tool: what it does, its keys and its options."),
-                    (HelpLevel::Compact, "Compact", "The box beside the selection explains the current tool and its options, leaving its keys and modifiers to the strip."),
-                    (HelpLevel::Off, "Disabled", "No box beside the selection. The keys still show at the bottom of the screen, and F1 lists them all."),
+                    (HelpLevel::Off, "Off", "No box beside the selection. The keys show at the bottom, and F1 lists them all."),
+                    (HelpLevel::Compact, "Compact", "A box beside the selection explains the current tool and its options."),
+                    (HelpLevel::Full, "Full", "As Compact, plus the tool's keys."),
                 ] {
                     ui.selectable_value(&mut self.settings.help_level, value, name).on_hover_text(tip);
                 }
             });
-
-            #[cfg(feature = "autostart")]
-            self.startup_setting(ui);
-            #[cfg(feature = "open-with")]
-            {
-                let toggle = ui
-                    .checkbox(&mut self.open_with, "Offer Darkshot under Open with for PNG and JPEG files")
-                    .on_hover_text("Explorer lists Darkshot when you right-click a picture and choose Open with. It does not become the default app.");
-                if toggle.changed() {
-                    if let Err(e) = crate::openwith::set(self.open_with) {
-                        self.message = Some((format!("Could not change Open with: {e}"), true));
-                    }
-                    self.open_with = crate::openwith::is_on();
-                }
+            ui.end_row();
+        });
+        ui.add_space(2.0);
+        ui.checkbox(&mut self.settings.include_cursor, "Include the mouse cursor")
+            .on_hover_text("Drawn where it was when you pressed the shortcut.");
+        ui.checkbox(&mut self.settings.confirm_discard, "Ask before discarding annotations")
+            .on_hover_text("When you press Esc or Close before copying or saving.");
+        ui.horizontal(|ui| {
+            let mut keep = self.settings.keep_minutes > 0;
+            let tip = "Reopen it from the tray menu or its shortcut. Kept in memory only, until the next \
+                       capture or until Darkshot quits.";
+            if ui.checkbox(&mut keep, "Keep the last capture for").on_hover_text(tip).changed() {
+                self.settings.keep_minutes = if keep { 5 } else { 0 };
             }
-
-            section(ui, "Saving");
-            let save = &mut self.settings.save;
-            egui::Grid::new("saving").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                crate::save::name_row(ui, "File name", &mut save.name, 240.0);
-
-                ui.label("Format");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut save.format, FormatSetting::Png, "PNG");
-                    ui.selectable_value(&mut save.format, FormatSetting::Jpeg, "JPEG");
-                });
-                ui.end_row();
-
-                ui.label("JPEG quality");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut save.jpeg_quality, QUALITY_HIGH, "High");
-                    ui.selectable_value(&mut save.jpeg_quality, QUALITY_MEDIUM, "Medium");
-                    ui.add(egui::Slider::new(&mut save.jpeg_quality, 10..=100));
-                });
-                ui.end_row();
-
-                ui.label("Folder");
-                ui.horizontal(|ui| {
-                    let shown = if save.folder.trim().is_empty() { "Pictures".to_owned() } else { save.folder.clone() };
-                    ui.add(egui::Label::new(shown).truncate()).on_hover_text("The save dialog opens here");
-                    if ui.button("Browse…").clicked() {
-                        let mut dialog = rfd::FileDialog::new().set_title("Default save folder");
-                        if let Some(dir) = settings::pictures_folder() {
-                            dialog = dialog.set_directory(dir);
-                        }
-                        if let Some(dir) = dialog.pick_folder() {
-                            save.folder = dir.display().to_string();
-                        }
-                    }
-                    if !save.folder.is_empty() && ui.small_button("Use Pictures").clicked() {
-                        save.folder.clear();
-                    }
-                });
-                ui.end_row();
+            ui.add_enabled_ui(keep, |ui| {
+                let mut minutes = self.settings.keep_minutes.max(1);
+                ui.add(egui::DragValue::new(&mut minutes).range(1..=settings::MAX_KEEP_MINUTES));
+                if keep {
+                    self.settings.keep_minutes = minutes;
+                }
+                ui.label("minutes");
             });
-            let mut preview = SaveOptions::from_settings(&self.settings);
-            preview.format = Format::from(self.settings.save.format);
-            ui.label(RichText::new(format!("Example: {}", preview.file_name())).color(weak).small());
+        });
+        #[cfg(feature = "autostart")]
+        self.startup_setting(ui);
+        #[cfg(feature = "open-with")]
+        {
+            let toggle = ui
+                .checkbox(&mut self.open_with, "Show in Open with for images")
+                .on_hover_text("Right-click a PNG or JPEG, then Open with. Doesn't change the default app.");
+            if toggle.changed() {
+                if let Err(e) = crate::openwith::set(self.open_with) {
+                    self.message = Some((format!("Couldn't change Open with: {e}"), true));
+                }
+                self.open_with = crate::openwith::is_on();
+            }
+        }
 
-            section(ui, "Border and shadow");
-            ui.label(
-                RichText::new(
-                    "What each capture starts with. The Decoration button in the toolbar changes it for one capture.",
-                )
-                .color(weak)
-                .small(),
-            );
-            ui.add_space(4.0);
-            let frame = &mut self.settings.frame;
+        section(ui, "Colours");
+        hint(ui, "What every capture starts with. Click one to change it.");
+        ui.add_space(2.0);
+        let frame = &mut self.settings.frame;
+        rows("colours").show(ui, |ui| {
+            ui.label("Swatches");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut frame.border, "Border");
-                ui.add_enabled_ui(frame.border, |ui| {
+                for (hex, fallback) in self.settings.swatches.iter_mut().zip(DEFAULT_SWATCHES) {
+                    color_setting(ui, hex, fallback, false);
+                }
+            });
+            ui.end_row();
+            ui.label("Highlighter");
+            color_setting(ui, &mut self.settings.marker_color, DEFAULT_MARKER_COLOR, false);
+            ui.end_row();
+            ui.checkbox(&mut frame.border, "Border").on_hover_text("Added around the image when it is copied or saved.");
+            ui.add_enabled_ui(frame.border, |ui| {
+                ui.horizontal(|ui| {
                     color_setting(ui, &mut frame.border_color, settings::DEFAULT_BORDER_COLOR, true);
                     ui.add(
                         egui::DragValue::new(&mut frame.border_width)
@@ -781,19 +683,60 @@ impl SettingsApp {
                             .suffix(" px"),
                     )
                     .on_hover_text("Thickness");
-                    crate::icons::picker(
-                        ui,
-                        &mut frame.border_style,
-                        true,
-                        &crate::annotate::Dash::ALL,
-                        crate::icons::dash_preview,
-                    )
-                    .on_hover_text("Line style");
+                    crate::icons::picker(ui, &mut frame.border_style, true, &crate::annotate::Dash::ALL, crate::icons::dash_preview)
+                        .on_hover_text("Line style");
                 });
             });
-            ui.checkbox(&mut frame.shadow, "Drop shadow")
-                .on_hover_text("A soft shadow in a margin around the image.");
-            ui.add_space(8.0);
+            ui.end_row();
+            ui.checkbox(&mut frame.shadow, "Drop shadow").on_hover_text("A soft shadow in a margin around the image.");
+            ui.end_row();
+        });
+        if ui.small_button("Reset colours").clicked() {
+            let defaults = Settings::default();
+            self.settings.swatches = defaults.swatches;
+            self.settings.marker_color = defaults.marker_color;
+            self.settings.frame.border_color = defaults.frame.border_color;
         }
+
+        section(ui, "Saving");
+        let save = &mut self.settings.save;
+        rows("saving").show(ui, |ui| {
+            crate::save::name_row(ui, "File name", &mut save.name, 200.0);
+            ui.label("Format");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut save.format, FormatSetting::Png, "PNG");
+                ui.selectable_value(&mut save.format, FormatSetting::Jpeg, "JPEG");
+            });
+            ui.end_row();
+            ui.label("JPEG quality");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut save.jpeg_quality, QUALITY_HIGH, "High");
+                ui.selectable_value(&mut save.jpeg_quality, QUALITY_MEDIUM, "Medium");
+                ui.add(egui::DragValue::new(&mut save.jpeg_quality).range(10..=100));
+            });
+            ui.end_row();
+            ui.label("Folder");
+            ui.horizontal(|ui| {
+                let shown = if save.folder.trim().is_empty() { "Pictures".to_owned() } else { save.folder.clone() };
+                ui.add(egui::Label::new(shown).truncate()).on_hover_text("Where the save dialog opens");
+                if ui.button("Browse…").clicked() {
+                    let mut dialog = rfd::FileDialog::new().set_title("Default save folder");
+                    if let Some(dir) = settings::pictures_folder() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(dir) = dialog.pick_folder() {
+                        save.folder = dir.display().to_string();
+                    }
+                }
+                if !save.folder.is_empty() && ui.small_button("Use Pictures").clicked() {
+                    save.folder.clear();
+                }
+            });
+            ui.end_row();
+        });
+        let mut preview = SaveOptions::from_settings(&self.settings);
+        preview.format = Format::from(self.settings.save.format);
+        ui.label(RichText::new(preview.file_name()).color(weak).small());
+        ui.add_space(8.0);
     }
 }

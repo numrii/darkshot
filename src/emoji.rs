@@ -2,11 +2,12 @@
 //! Windows. Its emoji are vector shapes (OpenType `COLR` layers), so a stamp is drawn
 //! sharp at any size, on screen and in the copied or saved image alike. Sequences such
 //! as skin tones, flags and families are put together by harfrust, the text shaper egui
-//! already uses.
+//! already uses. Kaomoji and symbols, such as (●'◡'●) or ©, are drawn from other fonts
+//! that come with Windows, in the stamp's colour.
 
 use std::sync::OnceLock;
 
-use eframe::egui::{Pos2, Rect, Vec2};
+use eframe::egui::{Color32, Pos2, Rect, Vec2};
 use tiny_skia::{
     BlendMode, Color, FillRule, GradientStop, Mask, Paint, Path, PathBuilder, Pixmap, PixmapPaint, Point, Shader,
     SpreadMode, Transform,
@@ -15,7 +16,8 @@ use ttf_parser::colr::{self, CompositeMode, GradientExtend};
 use ttf_parser::{Face, GlyphId, RgbaColor};
 
 /// The emoji the picker offers, a handful of the most useful for pointing things out
-/// in a screenshot. Any other can be typed or picked with Windows' emoji panel (Win+.).
+/// in a screenshot. Any other, or a kaomoji or symbol, can be picked with Windows'
+/// emoji panel (Win+.).
 pub const FAVOURITES: [&str; 40] = [
     "👍", "👎", "👌", "👉", "👈", "👆", "👇", "👀", "✅", "❌", "⚠️", "❗", "❓", "💡", "🔥", "⭐",
     "❤️", "💯", "🎉", "🚀", "🐛", "🔒", "🔑", "📌", "📎", "🗑️", "⏰", "🛑", "🆕", "🆗", "😀", "😂",
@@ -23,23 +25,173 @@ pub const FAVOURITES: [&str; 40] = [
 ];
 pub const DEFAULT: &str = "👍";
 
+
+/// Every emoji, by group, with its name: Unicode's list, built into the program and
+/// read only when the picker shows a group or searches. See `emoji_list.txt`.
+const LIST: &str = include_str!("emoji_list.txt");
+
+/// The picker's groups, as `LIST` names them, and the emoji on each tab.
+pub const GROUPS: [(&str, &str); 9] = [
+    ("Smileys & Emotion", "😀"),
+    ("People & Body", "👋"),
+    ("Animals & Nature", "🐱"),
+    ("Food & Drink", "🍕"),
+    ("Travel & Places", "🚗"),
+    ("Activities", "⚽"),
+    ("Objects", "💡"),
+    ("Symbols", "❤️"),
+    ("Flags", "🏁"),
+];
+
+/// One emoji in `LIST`.
+struct Entry {
+    /// Index into `GROUPS`.
+    group: usize,
+    emoji: &'static str,
+    /// Unicode's name, such as `face holding back tears`.
+    name: &'static str,
+    /// Shortcodes as in GitHub, Slack and Discord (`face_holding_back_tears`, `+1`),
+    /// space-separated.
+    codes: &'static str,
+    /// Extra words to find it by, space-separated.
+    tags: &'static str,
+}
+
+/// Every entry in `LIST`, read straight from the text built into the program.
+fn entries() -> impl Iterator<Item = Entry> {
+    let mut group = None;
+    LIST.lines().filter_map(move |line| {
+        if let Some(name) = line.strip_prefix('@') {
+            group = GROUPS.iter().position(|g| g.0 == name);
+            return None;
+        }
+        if line.starts_with('#') {
+            return None;
+        }
+        let (emoji, rest) = line.split_once(' ')?;
+        let mut fields = rest.split('|');
+        let name = fields.next()?;
+        let (codes, tags) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
+        Some(Entry { group: group?, emoji, name, codes, tags })
+    })
+}
+
+/// The emoji in group `index` that this computer's emoji font draws (it has no
+/// country flags, for one, and older Windows lacks the newest emoji).
+pub fn group(index: usize) -> Vec<&'static str> {
+    entries().filter(|e| e.group == index && is_emoji(e.emoji)).map(|e| e.emoji).collect()
+}
+
+/// Up to `limit` emoji for `query`, best first: a shortcode typed whole (`joy`,
+/// `:face_holding_back_tears:`), then shortcodes that start with it, then emoji whose
+/// name, shortcodes or tags hold every word of it (`back tears`, `holding_back`).
+pub fn search(query: &str, limit: usize) -> Vec<&'static str> {
+    let query = query.trim().trim_matches(':').to_lowercase();
+    let words: Vec<&str> = query.split(|c: char| c.is_whitespace() || c == '_' || c == '-').filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let single = !query.contains(char::is_whitespace);
+    let rank = |e: &Entry| -> Option<u8> {
+        let mut codes = e.codes.split(' ');
+        if single && codes.clone().any(|c| c == query) {
+            return Some(0);
+        }
+        if single && codes.any(|c| c.starts_with(query.as_str())) {
+            return Some(1);
+        }
+        let found = |w: &&str| e.name.contains(*w) || e.codes.contains(*w) || e.tags.contains(*w);
+        words.iter().all(found).then_some(2)
+    };
+    let mut found: Vec<(u8, usize, &'static str)> =
+        entries().enumerate().filter_map(|(i, e)| rank(&e).map(|r| (r, i, e.emoji))).collect();
+    found.sort_unstable();
+    found.into_iter().map(|(_, _, e)| e).filter(|e| is_emoji(e)).take(limit).collect()
+}
+
+/// The kaomoji the kaomoji picker offers.
+pub const KAOMOJI: [&str; 36] = [
+    "(●'◡'●)", "(^_^)", "(^▽^)", "(≧▽≦)", "(◕‿◕)", "(｡♥‿♥｡)",
+    "ヽ(•‿•)ノ", "\\(^o^)/", "(*^‿^*)", "(⌐■_■)", "(￣ー￣)", "(￢‿￢ )",
+    "(•_•)", "(¬_¬)", "ಠ_ಠ", "(◔_◔)", "(⊙_⊙)", "(°ロ°)",
+    "(・_・;)", "(；一_一)", "(T_T)", "(╥﹏╥)", "(；´д｀)", "( •́ ̯•̀ )",
+    "¯\\_(ツ)_/¯", "(╯°□°）╯︵ ┻━┻", "┬─┬ノ( º _ ºノ)", "(ง •̀_•́)ง", "(づ｡◕‿‿◕｡)づ", "ʕ•ᴥ•ʔ",
+    "(=^･ω･^=)", "(っ˘ڡ˘ς)", "(～￣▽￣)～", "o(〃＾▽＾〃)o", "(._.)", "(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧",
+];
+
+/// The symbols the symbols picker offers: arrows, marks, shapes, maths, currency.
+/// Those that are emoji too are asked for as text (U+FE0E), in the stamp's colour.
+pub const SYMBOLS: [&str; 60] = [
+    "→", "←", "↑", "↓", "↗\u{FE0E}", "↘\u{FE0E}", "↙\u{FE0E}", "↖\u{FE0E}", "⇒", "⇔",
+    "✓", "✗", "✔\u{FE0E}", "✘", "★", "☆", "●", "○", "■", "□",
+    "▲", "▼", "◆", "◇", "♥\u{FE0E}", "♦\u{FE0E}", "♣\u{FE0E}", "♠\u{FE0E}", "•", "…",
+    "©\u{FE0E}", "®\u{FE0E}", "™\u{FE0E}", "§", "¶", "°", "†", "‡", "«", "»",
+    "±", "×", "÷", "≠", "≈", "≤", "≥", "∞", "√", "∑",
+    "π", "Ω", "µ", "Δ", "€", "£", "$", "¥", "½", "¾",
+];
+
 struct Font {
     face: Face<'static>,
     shaper: harfrust::ShaperData,
     data: &'static [u8],
 }
 
-/// Segoe UI Emoji from the local Windows font folder; `None` if it is missing.
+impl Font {
+    fn has(&self, c: char) -> bool {
+        self.face.glyph_index(c).is_some_and(|g| g.0 != 0)
+    }
+
+    fn units(&self) -> f32 {
+        f32::from(self.face.units_per_em())
+    }
+
+    /// Halfway between the font's ascent and descent, in ems: where its glyphs are
+    /// vertically centred.
+    fn middle(&self) -> f32 {
+        (f32::from(self.face.ascender()) + f32::from(self.face.descender())) / 2.0 / self.units()
+    }
+}
+
+/// Segoe UI Emoji, then the fonts tried in turn for characters it should not draw,
+/// such as the kaomoji and symbols in Windows' emoji panel: Segoe UI, Segoe UI Symbol,
+/// and fonts for Japanese, Indic, Thai and Lao, Korean, Chinese, Canadian syllabics,
+/// Ethiopic, historic scripts and maths. All come with Windows; each is read only when
+/// a character needs it.
+const FONT_FILES: [&str; 13] = [
+    "seguiemj.ttf",
+    "segoeui.ttf",
+    "seguisym.ttf",
+    "YuGothR.ttc",
+    "msgothic.ttc",
+    "Nirmala.ttf",
+    "LeelawUI.ttf",
+    "malgun.ttf",
+    "msyh.ttc",
+    "gadugi.ttf",
+    "ebrima.ttf",
+    "seguihis.ttf",
+    "cambria.ttc",
+];
+const EMOJI_FONT: usize = 0;
+const TEXT_FONT: usize = 1;
+
+/// The font `FONT_FILES[index]` from the local Windows font folder; `None` if missing.
+fn font_at(index: usize) -> Option<&'static Font> {
+    static FONTS: [OnceLock<Option<Font>>; FONT_FILES.len()] = [const { OnceLock::new() }; FONT_FILES.len()];
+    FONTS[index]
+        .get_or_init(|| {
+            let path = std::path::PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts").join(FONT_FILES[index]);
+            let data: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+            let face = Face::parse(data, 0).ok()?;
+            let shaper = harfrust::ShaperData::new(&harfrust::FontRef::from_index(data, 0).ok()?);
+            Some(Font { face, shaper, data })
+        })
+        .as_ref()
+}
+
+/// Segoe UI Emoji; `None` if it is missing.
 fn font() -> Option<&'static Font> {
-    static FONT: OnceLock<Option<Font>> = OnceLock::new();
-    FONT.get_or_init(|| {
-        let path = std::path::PathBuf::from(std::env::var_os("WINDIR")?).join("Fonts").join("seguiemj.ttf");
-        let data: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
-        let face = Face::parse(data, 0).ok()?;
-        let shaper = harfrust::ShaperData::new(&harfrust::FontRef::new(data).ok()?);
-        Some(Font { face, shaper, data })
-    })
-    .as_ref()
+    font_at(EMOJI_FONT)
 }
 
 /// Whether emoji can be drawn at all on this computer.
@@ -47,71 +199,184 @@ pub fn available() -> bool {
     font().is_some()
 }
 
-/// The glyphs for `text` and where each goes, in font units along the baseline, and
-/// the total advance.
-fn shape(font: &Font, text: &str) -> (Vec<(GlyphId, f32, f32)>, f32) {
-    let Ok(font_ref) = harfrust::FontRef::new(font.data) else { return (Vec::new(), 0.0) };
+/// A glyph, the font it comes from, and where it goes, in ems from the start of the
+/// baseline.
+struct Placed {
+    font: &'static Font,
+    glyph: GlyphId,
+    x: f32,
+    y: f32,
+}
+
+/// The glyphs for `text` in `font` and where each goes, and the total advance in ems.
+fn shape(font: &'static Font, text: &str) -> (Vec<Placed>, f32) {
+    let Ok(font_ref) = harfrust::FontRef::from_index(font.data, 0) else { return (Vec::new(), 0.0) };
     let shaper = font.shaper.shaper(&font_ref).build();
     let mut buffer = harfrust::UnicodeBuffer::new();
     buffer.push_str(text);
     buffer.guess_segment_properties();
     let shaped = shaper.shape(buffer, harfrust::ShapeOptions::new());
+    let units = font.units();
     let mut x = 0.0;
     let mut glyphs = Vec::new();
     for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
         let Ok(id) = u16::try_from(info.glyph_id) else { continue };
-        glyphs.push((GlyphId(id), x + pos.x_offset as f32, pos.y_offset as f32));
+        let at = (x + pos.x_offset as f32) / units;
+        glyphs.push(Placed { font, glyph: GlyphId(id), x: at, y: pos.y_offset as f32 / units });
         x += pos.x_advance as f32;
     }
-    (glyphs, x)
+    (glyphs, x / units)
+}
+
+/// `text` laid out: its glyphs, its advance in ems, and its vertical middle in ems
+/// above the baseline.
+struct Line {
+    glyphs: Vec<Placed>,
+    advance: f32,
+    middle: f32,
+}
+
+/// Asks for the character before it as text rather than as an emoji.
+const TEXT_STYLE: char = '\u{FE0E}';
+
+/// Characters that belong with the one before them and are drawn in its font: joiners,
+/// variation selectors, skin tones, tags and combining marks.
+fn joins_previous(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x200D | 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0x0300..=0x036F | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+    )
+}
+
+/// The font for `c`: Segoe UI Emoji when it is asked for as an emoji (followed by
+/// U+FE0F, or from the emoji blocks), otherwise the first text font that has it, with
+/// Segoe UI Emoji and then Segoe UI as the last resorts.
+fn font_for(c: char, next: Option<char>) -> usize {
+    let has = |i: usize| font_at(i).is_some_and(|f| f.has(c));
+    let wants_emoji = next == Some('\u{FE0F}') || (c as u32) >= 0x1F000;
+    if wants_emoji && has(EMOJI_FONT) {
+        return EMOJI_FONT;
+    }
+    (TEXT_FONT..FONT_FILES.len()).find(|&i| has(i)).unwrap_or(if has(EMOJI_FONT) { EMOJI_FONT } else { TEXT_FONT })
+}
+
+/// Lay out `text`. One emoji (or a sequence drawn as one) comes from Segoe UI Emoji
+/// alone; anything else, such as a kaomoji, is split into runs by the font each
+/// character needs.
+fn layout(text: &str) -> Line {
+    let empty = Line { glyphs: Vec::new(), advance: 0.0, middle: 0.0 };
+    let Some(emoji) = font() else { return empty };
+    if is_emoji(text) {
+        let (glyphs, advance) = shape(emoji, text);
+        return Line { glyphs, advance, middle: emoji.middle() };
+    }
+    // The text-style selector has done its job once the font is chosen below.
+    let text: String = text.chars().filter(|&c| c != TEXT_STYLE).collect();
+    let text = text.as_str();
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new(); // font, start, end
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let end = at + c.len_utf8();
+        let next = chars.peek().map(|&(_, n)| n);
+        if let Some(run) = runs.last_mut().filter(|_| joins_previous(c)) {
+            run.2 = end;
+            continue;
+        }
+        let font = font_for(c, next);
+        match runs.last_mut() {
+            Some(run) if run.0 == font => run.2 = end,
+            _ => runs.push((font, at, end)),
+        }
+    }
+    let mut line = empty;
+    for (index, start, end) in runs {
+        let Some(font) = font_at(index) else { continue };
+        let (glyphs, advance) = shape(font, &text[start..end]);
+        let offset = line.advance;
+        line.glyphs.extend(glyphs.into_iter().map(|g| Placed { x: g.x + offset, ..g }));
+        line.advance += advance;
+    }
+    // Lined up as text, on Segoe UI's middle, unless it is all emoji.
+    let all_emoji = line.glyphs.iter().all(|g| std::ptr::eq(g.font, emoji));
+    line.middle = if all_emoji { emoji.middle() } else { font_at(TEXT_FONT).unwrap_or(emoji).middle() };
+    line
 }
 
 /// Whether `text` is one emoji (or a sequence drawn as one, such as a flag or a
 /// thumbs-up with a skin tone) that the font draws in colour.
 pub fn is_emoji(text: &str) -> bool {
+    if text.contains(TEXT_STYLE) {
+        return false;
+    }
     let Some(font) = font() else { return false };
     let (glyphs, _) = shape(font, text);
-    glyphs.len() == 1 && font.face.is_color_glyph(glyphs[0].0)
+    glyphs.len() == 1 && font.face.is_color_glyph(glyphs[0].glyph)
+}
+
+/// The longest text a stamp takes, in characters: enough for any kaomoji.
+const MAX_STAMP_CHARS: usize = 48;
+
+/// Whether `text` can be a stamp: an emoji, or a short line, such as a kaomoji or a
+/// symbol, whose every character one of the fonts can draw.
+pub fn can_stamp(text: &str) -> bool {
+    if is_emoji(text) {
+        return true;
+    }
+    if text.trim().is_empty() || text.chars().count() > MAX_STAMP_CHARS || text.chars().any(char::is_control) {
+        return false;
+    }
+    let line = layout(text);
+    !line.glyphs.is_empty() && line.glyphs.iter().all(|g| g.glyph.0 != 0)
 }
 
 /// The area `text` covers when drawn `size` pixels tall, centred on `centre`.
 pub fn bounds(text: &str, size: f32, centre: Pos2) -> Rect {
-    let width = match font() {
-        Some(font) => shape(font, text).1 / f32::from(font.face.units_per_em()) * size,
-        None => size,
-    };
+    let width = if available() { layout(text).advance * size } else { size };
     Rect::from_center_size(centre, Vec2::new(width.max(size * 0.5), size))
 }
 
 /// Draw `text` `size` pixels tall, centred on desktop position `centre`, into `pixmap`
-/// whose top-left pixel is desktop position `origin`.
-pub fn rasterize(text: &str, size: f32, centre: Pos2, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
-    let Some(font) = font() else { return };
-    let (glyphs, advance) = shape(font, text);
+/// whose top-left pixel is desktop position `origin`. Emoji keep their own colours;
+/// other characters, such as a kaomoji's, are drawn in `color`.
+pub fn rasterize(text: &str, size: f32, centre: Pos2, color: Color32, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
+    draw(text, size, centre, color, false, pixmap, origin);
+}
+
+/// As [`rasterize`], but every glyph in one colour, emoji too: the font's own
+/// black-and-white emoji, for icons such as the emoji picker's tabs.
+pub fn rasterize_plain(text: &str, size: f32, centre: Pos2, color: Color32, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
+    draw(text, size, centre, color, true, pixmap, origin);
+}
+
+fn draw(text: &str, size: f32, centre: Pos2, color: Color32, plain: bool, pixmap: &mut tiny_skia::PixmapMut<'_>, origin: Pos2) {
+    if !available() {
+        return;
+    }
+    let line = layout(text);
     // Drawn into a layer of its own just big enough for the stamp (with a margin for
     // glyphs that reach outside their box), then onto the target.
     let area = bounds(text, size, centre).expand(size * 0.25);
     let area = Rect::from_min_max((area.min - origin.to_vec2()).floor(), (area.max - origin.to_vec2()).ceil());
     let Some(mut layer) = Pixmap::new(area.width().max(1.0) as u32, area.height().max(1.0) as u32) else { return };
 
-    let face = &font.face;
-    let scale = size / f32::from(face.units_per_em());
-    // Vertically centred on the font's ascent and descent, where emoji are designed.
-    let middle = (f32::from(face.ascender()) + f32::from(face.descender())) / 2.0;
+    // Centred on the advance, and vertically on the middle of the font's ascent and
+    // descent, where emoji are designed.
     let local = centre - origin.to_vec2() - area.min.to_vec2();
     let base = Transform::from_translate(local.x, local.y)
-        .pre_scale(scale, -scale)
-        .pre_translate(-advance / 2.0, -middle);
-    for (glyph, x, y) in glyphs {
-        let transform = base.pre_translate(x, y);
-        if face.is_color_glyph(glyph) {
+        .pre_scale(size, -size)
+        .pre_translate(-line.advance / 2.0, -line.middle);
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    for Placed { font, glyph, x, y } in line.glyphs {
+        let face = &font.face;
+        let transform = base.pre_translate(x, y).pre_scale(1.0 / font.units(), 1.0 / font.units());
+        if !plain && face.is_color_glyph(glyph) {
             let mut painter = Painter::new(face, &mut layer, transform);
-            let black = RgbaColor::new(0, 0, 0, 255);
-            face.paint_color_glyph(glyph, 0, black, &mut painter);
+            // Emoji that use the text colour are drawn black, as in Windows.
+            face.paint_color_glyph(glyph, 0, RgbaColor::new(0, 0, 0, 255), &mut painter);
             painter.finish();
         } else if let Some(path) = outline(face, glyph) {
             let mut paint = Paint::default();
-            paint.set_color_rgba8(0, 0, 0, 255);
+            paint.set_color_rgba8(r, g, b, a);
             paint.anti_alias = true;
             layer.fill_path(&path, &paint, FillRule::Winding, transform, None);
         }
@@ -366,7 +631,7 @@ mod tests {
             let n = (size * 2.0) as u32;
             let mut pixmap = Pixmap::new(n, n).unwrap();
             let centre = Pos2::new(size, size);
-            rasterize("🔥", size, centre, &mut pixmap.as_mut(), Pos2::ZERO);
+            rasterize("🔥", size, centre, Color32::BLACK, &mut pixmap.as_mut(), Pos2::ZERO);
             let painted: Vec<_> = pixmap.pixels().iter().filter(|p| p.alpha() > 200).collect();
             // Covers a fair part of its box, and not in one flat colour.
             assert!(painted.len() as f32 > size * size * 0.2, "{size}: {}", painted.len());
@@ -378,23 +643,104 @@ mod tests {
         let toned = bounds("👍🏽", 64.0, Pos2::ZERO).width();
         assert!((one - toned).abs() < 4.0, "{one} vs {toned}");
     }
+
+    #[test]
+    fn catalogue() {
+        // Every line of the list belongs to a group, and every group is there.
+        assert!(entries().count() > 1800);
+        for (i, (name, icon)) in GROUPS.iter().enumerate() {
+            assert!(entries().any(|e| e.group == i), "{name}");
+            assert!(entries().any(|e| e.emoji == *icon), "{name}: {icon}");
+        }
+        assert_eq!(search("", 10), Vec::<&str>::new());
+        if !available() {
+            return;
+        }
+        let smileys = group(0);
+        assert!(smileys.len() > 100 && smileys[0] == "😀", "{}", smileys.len());
+        assert!(smileys.iter().all(|e| is_emoji(e)));
+        // Words in any order, any case; only what the font draws.
+        assert!(search("Thumbs UP", 50).contains(&"👍"));
+        assert!(search("face grinning", 50).contains(&"😀"));
+        assert!(search("fire", 50).contains(&"🔥"));
+        assert!(search("zzzz-nothing", 50).is_empty());
+        // Shortcodes as in Slack and Discord, with or without colons, best match first.
+        assert_eq!(search(":slightly_smiling_face:", 5).first(), Some(&"🙂"));
+        assert_eq!(search("slightly_smiling", 5).first(), Some(&"🙂"));
+        // 🥹 is newer than Windows 10's emoji font: found only where it is drawn.
+        assert_eq!(search("holding_back_tears", 5).first() == Some(&"🥹"), is_emoji("🥹"));
+        assert_eq!(search("joy", 5).first(), Some(&"😂"));
+        assert_eq!(search(":+1:", 5).first(), Some(&"👍"));
+        assert_eq!(search("thumbsup", 5).first(), Some(&"👍"));
+        assert!(search("tears_of_joy", 5).contains(&"😂"));
+        assert!(search("face", 5).len() <= 5);
+        // Country flags are letters in Windows' emoji font, so they are left out.
+        assert!(!group(8).contains(&"🇸🇪"));
+    }
+
+    #[test]
+    fn kaomoji_and_symbols() {
+        if !available() {
+            return;
+        }
+        for k in PANEL_SAMPLES.iter().chain(&KAOMOJI).chain(&SYMBOLS) {
+            assert!(can_stamp(k) && !is_emoji(k), "{k}");
+            // A kaomoji is wider than tall; each is drawn in the stamp's colour.
+            let size = 40.0;
+            let area = bounds(k, size, Pos2::ZERO);
+            assert!(SYMBOLS.contains(k) || area.width() > size, "{k}: {area:?}");
+            let mut pixmap = Pixmap::new(600, 120).unwrap();
+            let green = Color32::from_rgb(0, 200, 0);
+            rasterize(k, size, Pos2::new(300.0, 60.0), green, &mut pixmap.as_mut(), Pos2::ZERO);
+            let inked = pixmap.pixels().iter().filter(|p| p.alpha() > 200 && p.green() > 150 && p.red() < 50).count();
+            assert!(inked > 30, "{k}: {inked}");
+        }
+        assert!(can_stamp("👍🏽") && can_stamp("❗") && can_stamp("OK!") && can_stamp("(👍)"));
+        assert!(!can_stamp("") && !can_stamp("   ") && !can_stamp("a\nb") && !can_stamp(&"x".repeat(60)));
+        // An unassigned character, which no font draws.
+        assert!(!can_stamp("\u{0378}"));
+    }
 }
+
+/// Kaomoji and symbols from Windows' emoji panel, for the tests.
+#[cfg(test)]
+const PANEL_SAMPLES: [&str; 9] = [
+    "(●'◡'●)",
+    "¯\\_(ツ)_/¯",
+    "(╯°□°）╯︵ ┻━┻",
+    "ಠ_ಠ",
+    "ʕ•ᴥ•ʔ",
+    "(づ｡◕‿‿◕｡)づ",
+    "ლ(ಠ益ಠლ)",
+    "© ™ → ½ Ω ♥",
+    "ヽ(•‿•)ノ",
+];
 
 #[cfg(test)]
 #[test]
 #[ignore]
 fn emoji_sheet() {
     assert!(available());
-    let mut pixmap = Pixmap::new(900, 260).unwrap();
+    let mut pixmap = Pixmap::new(900, 880).unwrap();
     pixmap.fill(Color::WHITE);
     for (i, e) in FAVOURITES.iter().enumerate() {
         let (col, row) = ((i % 20) as f32, (i / 20) as f32);
-        rasterize(e, 36.0, Pos2::new(25.0 + col * 44.0, 25.0 + row * 44.0), &mut pixmap.as_mut(), Pos2::ZERO);
+        rasterize(e, 36.0, Pos2::new(25.0 + col * 44.0, 25.0 + row * 44.0), Color32::BLACK, &mut pixmap.as_mut(), Pos2::ZERO);
     }
     for (i, e) in ["👍🏽", "🇸🇪", "👨‍👩‍👧", "🏳️‍🌈"].iter().enumerate() {
-        rasterize(e, 64.0, Pos2::new(50.0 + i as f32 * 90.0, 160.0), &mut pixmap.as_mut(), Pos2::ZERO);
+        rasterize(e, 64.0, Pos2::new(50.0 + i as f32 * 90.0, 160.0), Color32::BLACK, &mut pixmap.as_mut(), Pos2::ZERO);
     }
-    rasterize("🚀", 120.0, Pos2::new(700.0, 180.0), &mut pixmap.as_mut(), Pos2::ZERO);
-    let img = image::RgbaImage::from_raw(900, 260, pixmap.data().to_vec()).unwrap();
+    rasterize("🚀", 120.0, Pos2::new(700.0, 180.0), Color32::BLACK, &mut pixmap.as_mut(), Pos2::ZERO);
+    let blue = Color32::from_rgb(0x11, 0x8A, 0xB2);
+    for (i, k) in KAOMOJI.iter().chain(&SYMBOLS).enumerate() {
+        let (col, row) = ((i % 6) as f32, (i / 6) as f32);
+        rasterize(k, 22.0, Pos2::new(75.0 + col * 150.0, 250.0 + row * 34.0), blue, &mut pixmap.as_mut(), Pos2::ZERO);
+    }
+    // The picker's tabs: the font's black-and-white emoji.
+    let tabs = std::iter::once("🕘").chain(GROUPS.iter().map(|g| g.1));
+    for (i, icon) in tabs.enumerate() {
+        rasterize_plain(icon, 28.0, Pos2::new(40.0 + i as f32 * 44.0, 845.0), Color32::from_gray(60), &mut pixmap.as_mut(), Pos2::ZERO);
+    }
+    let img = image::RgbaImage::from_raw(900, 880, pixmap.data().to_vec()).unwrap();
     img.save(std::env::var("EMOJI_SHEET").unwrap()).unwrap();
 }

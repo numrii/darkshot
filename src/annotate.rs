@@ -419,7 +419,7 @@ impl Annotation {
         match self.kind {
             ShapeKind::Text => return self.rasterize_text(pixmap, origin),
             ShapeKind::Step => return self.rasterize_step(pixmap, origin),
-            ShapeKind::Emoji => return crate::emoji::rasterize(&self.text, self.width, self.a, pixmap, origin),
+            ShapeKind::Emoji => return crate::emoji::rasterize(&self.text, self.width, self.a, self.color, pixmap, origin),
             // Blur regions need the capture's pixels; the overlay applies them.
             ShapeKind::Blur => return,
             _ => {}
@@ -822,6 +822,16 @@ impl History {
         }
         self.undo.push(before.to_vec());
         self.redo.clear();
+    }
+
+    /// The undo and redo steps, oldest first, to keep for Reopen last capture.
+    pub fn steps(&self) -> (&[Vec<Annotation>], &[Vec<Annotation>]) {
+        (&self.undo, &self.redo)
+    }
+
+    /// History with these undo and redo steps, as kept by [`History::steps`].
+    pub fn from_steps(undo: Vec<Vec<Annotation>>, redo: Vec<Vec<Annotation>>) -> Self {
+        Self { undo, redo, last_repeat: None }
     }
 
     /// Drop the most recent entry (for a change that was abandoned, e.g. a stray click).

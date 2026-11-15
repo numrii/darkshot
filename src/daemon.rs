@@ -2,7 +2,9 @@
 //!
 //! Each capture runs as a short-lived child process (`darkshot --capture`), so the
 //! background process holds no GPU resources and a crash in the overlay cannot take
-//! the hotkey down with it. The settings window is a child process too
+//! the hotkey down with it. With Reopen last capture on, a closing capture hands its
+//! state to this process, which keeps it in memory and passes it to the next overlay
+//! (see `handoff`). The settings window is a child process too
 //! (`darkshot --settings`); when it closes, the settings are read again.
 
 use std::process::{Child, Command};
@@ -61,7 +63,7 @@ pub fn run() -> AnyResult<()> {
         return Ok(()); // already running in the tray
     }
 
-    let overlay: Arc<Mutex<Option<Child>>> = Arc::default();
+    let overlay: Shared = Arc::default();
     let main_thread = unsafe { GetCurrentThreadId() };
 
     let hotkeys = GlobalHotKeyManager::new()?;
@@ -75,7 +77,7 @@ pub fn run() -> AnyResult<()> {
             let which = active.lock().unwrap().iter().find(|(h, _)| h.id() == e.id).map(|(_, s)| *s);
             match which {
                 Some(Shortcut::Capture) => start_capture(&overlay),
-                Some(Shortcut::Clipboard) => start_overlay(&overlay, "--clipboard"),
+                Some(Shortcut::Clipboard) => start_overlay(&overlay, "--clipboard", None),
                 Some(Shortcut::Reopen) => reopen(&overlay),
                 None => {}
             }
@@ -124,9 +126,9 @@ pub fn run() -> AnyResult<()> {
             if e.id == MENU_CAPTURE {
                 start_capture(&overlay);
             } else if e.id == MENU_OPEN {
-                start_overlay(&overlay, "--open");
+                start_overlay(&overlay, "--open", None);
             } else if e.id == MENU_CLIPBOARD {
-                start_overlay(&overlay, "--clipboard");
+                start_overlay(&overlay, "--clipboard", None);
             } else if e.id == MENU_REOPEN {
                 reopen(&overlay);
             } else if e.id == MENU_SETTINGS {
@@ -182,6 +184,7 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
         (&settings.reopen_hotkey, Shortcut::Reopen, &items.reopen, "Reopen last capture"),
     ] {
         let label = text.trim();
+        let shown = crate::keys::shortcut_label(label);
         item.set_text(name);
         if label.is_empty() || which == Shortcut::Reopen && settings.keep_minutes == 0 {
             continue;
@@ -191,7 +194,7 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
         }) {
             Ok(hotkey) => {
                 active.lock().unwrap().push((hotkey, which));
-                item.set_text(format!("{name}\t{label}"));
+                item.set_text(format!("{name}\t{shown}"));
             }
             Err(e) => {
                 eprintln!("could not register {label}: {e}");
@@ -199,7 +202,7 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
                     .set_level(rfd::MessageLevel::Warning)
                     .set_title("Darkshot")
                     .set_description(format!(
-                        "The {name} shortcut {label} could not be registered. Windows or another \
+                        "The {name} shortcut {shown} could not be registered. Windows or another \
                          application may already use it. You can choose another under Settings."
                     ))
                     .show();
@@ -208,6 +211,7 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
     }
     let capture_item = &items.capture;
     let label = settings.hotkey.trim().to_owned();
+    let shown = crate::keys::shortcut_label(&label);
     let result = match parse_hotkey(&label) {
         Some(hotkey) => hotkeys.register(hotkey).map(|()| hotkey).map_err(|e| e.to_string()),
         None => Err("not a valid key combination".to_owned()),
@@ -215,18 +219,18 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
     match result {
         Ok(shortcut) => {
             active.lock().unwrap().push((shortcut, Shortcut::Capture));
-            capture_item.set_text(format!("Capture\t{label}"));
-            let _ = tray.set_tooltip(Some(format!("Darkshot: press {label} to capture")));
+            capture_item.set_text(format!("Capture\t{shown}"));
+            let _ = tray.set_tooltip(Some(format!("Darkshot: press {shown} to capture")));
         }
         Err(e) => {
             eprintln!("could not register {label}: {e}");
             capture_item.set_text("Capture");
-            let _ = tray.set_tooltip(Some(format!("Darkshot: {label} is unavailable, click here to capture")));
+            let _ = tray.set_tooltip(Some(format!("Darkshot: {shown} is unavailable, click here to capture")));
             rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Warning)
                 .set_title("Darkshot")
                 .set_description(format!(
-                    "The capture shortcut {label} could not be registered. Windows or another \
+                    "The capture shortcut {shown} could not be registered. Windows or another \
                      application may already use it.\n\nYou can still capture by clicking the \
                      Darkshot tray icon. Under Settings you can choose another shortcut{}.",
                     if crate::settings::FREE_SHORTCUT_AVAILABLE {
@@ -259,60 +263,152 @@ fn open_settings(main_thread: u32) -> bool {
     }
 }
 
-/// Launch the overlay to capture the screen, unless one is already on screen.
-fn start_capture(overlay: &Mutex<Option<Child>>) {
-    start_overlay(overlay, "--capture");
+/// The capture window, if one is open, and the last capture kept for Reopen last
+/// capture (see `handoff`): only its bytes, in memory, never on disk.
+#[derive(Default)]
+struct Captures {
+    child: Option<Child>,
+    kept: Option<Vec<u8>>,
+    /// Counts changes to `kept`, so a timer only drops the capture it was set for.
+    generation: u64,
 }
 
-/// Bring back the last capture, if an overlay is keeping one (Reopen last capture).
-fn reopen(overlay: &Mutex<Option<Child>>) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
-    let mut slot = overlay.lock().unwrap();
-    let Some(child) = slot.as_mut() else { return };
-    if !matches!(child.try_wait(), Ok(None)) {
+impl Captures {
+    /// The process id of the capture window, if one is open.
+    fn running(&mut self) -> Option<u32> {
+        let child = self.child.as_mut()?;
+        matches!(child.try_wait(), Ok(None)).then(|| child.id())
+    }
+}
+
+type Shared = Arc<Mutex<Captures>>;
+
+/// Launch the overlay to capture the screen, unless one is already on screen.
+fn start_capture(captures: &Shared) {
+    start_overlay(captures, "--capture", None);
+}
+
+/// Bring back the last capture, if one is kept (Reopen last capture).
+fn reopen(captures: &Shared) {
+    let bytes = {
+        let mut c = captures.lock().unwrap();
+        if let Some(pid) = c.running() {
+            bring_forward(pid);
+            return;
+        }
+        c.generation += 1;
+        c.kept.take()
+    };
+    if let Some(bytes) = bytes {
+        start_overlay(captures, "--reopen", Some(bytes));
+    }
+}
+
+/// Keep a capture the overlay handed over as it closed, for the minutes set in the
+/// settings, then let it go.
+fn keep(captures: &Shared, mut bytes: Vec<u8>) {
+    let minutes = Settings::load().keep_minutes;
+    if minutes == 0 {
         return;
     }
-    if let (Some(kept), Some(again)) = (crate::keep::kept(), crate::keep::reopen()) {
-        if kept.is_set() {
-            unsafe { AllowSetForegroundWindow(child.id()) };
-            again.set();
+    bytes.shrink_to_fit();
+    let generation = {
+        let mut c = captures.lock().unwrap();
+        c.kept = Some(bytes);
+        c.generation += 1;
+        c.generation
+    };
+    let captures = captures.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(u64::from(minutes) * 60));
+        let mut c = captures.lock().unwrap();
+        if c.generation == generation {
+            c.kept = None;
+        }
+    });
+}
+
+/// Launch the overlay as a child process with `mode` (`--capture`, `--open`,
+/// `--clipboard`, or `--reopen` with the kept capture's `bytes`), unless one is already
+/// on screen: that one is brought to the front. A new capture replaces a kept one.
+fn start_overlay(captures: &Shared, mode: &str, bytes: Option<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let mut c = captures.lock().unwrap();
+    if let Some(pid) = c.running() {
+        // Already on screen: bring it to the front, in case a second click on the tray
+        // icon took the keyboard from it.
+        bring_forward(pid);
+        return;
+    }
+    if bytes.is_none() {
+        c.kept = None;
+        c.generation += 1;
+    }
+    let spawned = std::env::current_exe().and_then(|exe| {
+        // Pass our own flags (such as `--trace`) on to the overlay.
+        Command::new(exe)
+            .arg(mode)
+            .arg("--tray")
+            .args(std::env::args().skip(1).filter(|a| {
+                a.starts_with("--")
+                    && !["--capture", "--open", "--clipboard", "--reopen", "--tray"].contains(&a.as_str())
+            }))
+            .stdin(if bytes.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .spawn()
+    });
+    match spawned {
+        Ok(mut child) => {
+            // Let it take the foreground even if the taskbar gets it first.
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(child.id()) };
+            if let (Some(bytes), Some(mut input)) = (bytes, child.stdin.take()) {
+                std::thread::spawn(move || {
+                    let _ = input.write_all(&bytes);
+                });
+            }
+            // What it hands over as it closes, if anything, is the capture to keep.
+            if let Some(mut output) = child.stdout.take() {
+                let captures = captures.clone();
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    if output.read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                        keep(&captures, bytes);
+                    }
+                });
+            }
+            c.child = Some(child);
+        }
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            c.child = None;
         }
     }
 }
 
-/// Launch the overlay as a child process with `mode` (`--capture`, `--open` or
-/// `--clipboard`), unless one is already on screen. One that is hidden, keeping the
-/// last capture, is ended first: the new capture replaces it.
-fn start_overlay(overlay: &Mutex<Option<Child>>, mode: &str) {
-    let mut slot = overlay.lock().unwrap();
-    if let Some(child) = slot.as_mut() {
-        if matches!(child.try_wait(), Ok(None)) {
-            match crate::keep::kept().filter(|k| k.is_set()) {
-                Some(kept) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    kept.reset();
-                }
-                None => return,
-            }
+/// Give the keyboard to the visible window of process `pid`, if it has one.
+fn bring_forward(pid: u32) {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    };
+    unsafe extern "system" fn find(hwnd: HWND, lparam: LPARAM) -> i32 {
+        // SAFETY: `lparam` points at the (pid, found) pair below, alive for the call.
+        let wanted = unsafe { &mut *(lparam as *mut (u32, HWND)) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == wanted.0 && unsafe { IsWindowVisible(hwnd) } != 0 {
+            wanted.1 = hwnd;
+            return 0; // found: stop
         }
+        1
     }
-    let spawned = std::env::current_exe()
-        .and_then(|exe| {
-            // Pass our own flags (such as `--trace`) on to the overlay.
-            Command::new(exe)
-                .arg(mode)
-                .arg("--tray")
-                .args(std::env::args().skip(1).filter(|a| {
-                    a.starts_with("--") && !["--capture", "--open", "--clipboard", "--tray"].contains(&a.as_str())
-                }))
-                .spawn()
-        });
-    match spawned {
-        Ok(child) => *slot = Some(child),
-        Err(e) => {
-            eprintln!("could not start capture: {e}");
-            *slot = None;
+    let mut wanted: (u32, HWND) = (pid, std::ptr::null_mut());
+    unsafe {
+        AllowSetForegroundWindow(pid);
+        EnumWindows(Some(find), std::ptr::from_mut(&mut wanted) as LPARAM);
+        if !wanted.1.is_null() {
+            SetForegroundWindow(wanted.1);
         }
     }
 }

@@ -50,6 +50,10 @@ register.
   and never on disk. Bring them back from the tray menu or with their own shortcut, to
   copy again or fix something. The next capture replaces them, the time you set ends
   them, and they are gone when Darkshot quits.
+  While a capture is kept, the capture window is closed completely; only the tray holds
+  on to the capture, compressed, in memory: a few MB (5.4 MB for two 2560×1440 screens),
+  more for busy or larger screens. Leave the option off if you would rather the tray
+  keep nothing between captures.
 
 ### Editing an existing image
 
@@ -81,7 +85,7 @@ it again. Annotations, copies and saves are always in the image's own pixels.
 | T | Text |
 | B | Blur: pixelate, Gaussian or solid redaction |
 | N | Numbered steps |
-| J | Emoji stamp: a faded preview follows the pointer, the wheel sizes it, a click places it |
+| J | Stamp an emoji, kaomoji or symbol: a faded preview follows the pointer, the wheel sizes it, a click places it |
 | I | Eyedropper (Shift magnifies to single pixels) |
 | O | Copy text: read the text in the region (OCR) |
 | Q | Read the QR codes in the region |
@@ -93,6 +97,19 @@ Ctrl-dragging empty space moves the region. Each tool remembers its own size, so
 large text size does not carry over to the next arrow. While typing a text, Enter
 finishes it and Shift+Enter starts a new line.
 
+Right-click backs out one step at a time: it closes an open picker or panel, then
+deselects, then puts the tool down (back to Select). It never draws and never closes the
+capture.
+
+The emoji stamp has three pickers in the toolbar. The emoji picker has a tab of recent
+emoji (it starts with a set of favourites; each emoji you place moves to the front and
+pushes the oldest out) and a tab per group, as in Windows' emoji panel, and a search
+field that finds emoji by name, by tag, or by the shortcodes Slack, Discord and GitHub
+use, such as `joy`, `+1` or `:slightly_smiling_face:`. The kaomoji and symbol pickers
+offer a set of each, such as (●'◡'●) or →, drawn in the current colour. Emoji are drawn
+from Windows' own emoji font, so the picker shows the ones your Windows has: Windows 11
+has newer emoji than Windows 10, and neither has country flags.
+
 Help is on screen as you work. A strip at the top of the screen (or the bottom, when
 the region covers the top) shows the keys that do something right now: each tool's
 symbol under its key, with the current one lit, then the current tool's own keys and
@@ -100,8 +117,8 @@ modifiers. When it would be wider than the screen it wraps onto another row. Bes
 region, a box explains the current tool: what it does, what clicking and dragging do,
 its keys and modifiers, and its toolbar options. It moves when you move or redraw the
 region, and sits inside it, see-through, when there is no room outside. Settings → Tool
-help chooses Full, Compact (everything but the keys and modifiers, which the strip
-already shows) or Disabled (just the strip). F1, or ?, shows every shortcut on one
+help chooses Off (the default: just the strip), Compact (the box, without the keys and
+modifiers the strip already shows) or Full. F1, or ?, shows every shortcut on one
 sheet; any key or click closes it. None of this is ever in what you copy or save.
 
 To straighten something photographed at an angle, such as a receipt, drag the round
@@ -140,11 +157,24 @@ folder and the file name. Three options are off until you turn them on: includin
 mouse cursor in the capture, asking before Esc or Close discards a capture that has
 annotations, and keeping the last capture to reopen (for 1 to 60 minutes).
 You can also choose the border and shadow each capture starts with (see below). Under Tools you can untick the tools you don't use; they leave the
-toolbar and their keys do nothing. Click a tool's key to give it another; the × in the
-field puts its own key back. The file name is a
+toolbar and their keys do nothing. Click a tool's key to give it another; Reset beside
+it puts its own key back. The file name is a
 template that can use `{date}`, `{time}`, `{year}`, `{month}`, `{day}`, `{hour}`,
 `{minute}`, `{second}` and `{counter}` (the next number not yet used in the save
 folder); hover the `?` beside the field for examples.
+
+#### Keyboard layouts
+
+Shortcuts and tool keys go by the key you press, in whatever keyboard layout you use,
+and are shown as printed on your keyboard: on a Swedish keyboard the key right of L
+shows as Ö. With AZERTY, Dvorak and other Latin layouts, letters show as the letters
+on your keys too.
+
+With a layout that does not use Latin letters, such as Russian (Cyrillic), Greek or
+Arabic, letter keys are shown by the Latin letter in that place on a US keyboard: the
+key that types Й shows as Q. The key itself is the right one, so pressing Й picks the
+tool shown as Q, and a shortcut recorded as Ctrl+Q is pressed with Ctrl+Й. This is
+how Windows itself names such shortcuts.
 
 ## Two builds
 
@@ -283,3 +313,9 @@ publishes them with their checksums as a GitHub release.
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+The emoji picker's list, [src/emoji_list.txt](src/emoji_list.txt), is made by
+[scripts/emoji_list.py](scripts/emoji_list.py) from Unicode's
+[emoji-test.txt](https://unicode.org/Public/emoji/latest/emoji-test.txt) (© Unicode,
+Inc., [Unicode License v3](https://www.unicode.org/license.txt)) and the shortcodes and
+tags of GitHub's [gemoji](https://github.com/github/gemoji) (© GitHub, Inc., MIT).

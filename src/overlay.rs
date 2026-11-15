@@ -88,6 +88,8 @@ pub enum Source {
     File(Option<std::path::PathBuf>),
     /// The image on the clipboard, to edit.
     Clipboard,
+    /// A capture kept by the tray for Reopen last capture, read from standard input.
+    Kept,
 }
 
 pub fn run(source: Source) -> AnyResult<()> {
@@ -97,7 +99,15 @@ pub fn run(source: Source) -> AnyResult<()> {
     // Grab the screen before our own window exists so the overlay is never in the shot.
     trace("start");
     let settings = Settings::load();
+    let mut kept = None;
     let desktop = match source {
+        Source::Kept => {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes)?;
+            let (desktop, state) = read_kept(&bytes).map_err(|e| format!("Could not reopen the capture: {e}"))?;
+            kept = Some(state);
+            desktop
+        }
         Source::Capture => Desktop::capture(settings.include_cursor)?,
         Source::File(path) => {
             let path = path.or_else(|| {
@@ -142,12 +152,10 @@ pub fn run(source: Source) -> AnyResult<()> {
         // never draws more frames than the screen shows. Without the wait, moving the
         // mouse drew hundreds of frames a second, which kept the GPU busy in bursts
         // (audible as coil whine on some machines) for frames nobody could see.
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration::default().with_surface_config(
-            eframe::egui_wgpu::SurfaceConfig {
-                present_mode: eframe::wgpu::PresentMode::AutoVsync,
-                desired_maximum_frame_latency: Some(1),
-            },
-        ),
+        wgpu_options: gpu_options(eframe::egui_wgpu::SurfaceConfig {
+            present_mode: eframe::wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: Some(1),
+        }),
         ..Default::default()
     };
 
@@ -163,18 +171,152 @@ pub fn run(source: Source) -> AnyResult<()> {
         options,
         Box::new(move |cc| {
             let mut overlay = Overlay::new(cc, desktop, &settings);
-            // Only an overlay the tray started can be reopened.
-            if std::env::args().any(|a| a == "--tray") && settings.keep_minutes > 0 {
-                if let (Some(kept), Some(reopen)) = (crate::keep::kept(), crate::keep::reopen()) {
-                    overlay.keep = Some((settings.keep_minutes, kept, reopen));
-                }
+            if let Some(kept) = kept {
+                overlay.restore(kept);
             }
+            // Only an overlay the tray started can be reopened: the tray keeps it.
+            overlay.handoff = std::env::args().any(|a| a == "--tray") && settings.keep_minutes > 0;
             Ok(Box::new(overlay))
         }),
         &event_loop,
     );
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Every tool, in a fixed order for kept captures.
+fn all_tools() -> Vec<Tool> {
+    std::iter::once(Tool::Select).chain(crate::handoff::SHAPES.iter().map(|&k| Tool::Shape(k))).collect()
+}
+
+const STYLE_SLOTS: [StyleSlot; 5] = [StyleSlot::Shared, StyleSlot::Marker, StyleSlot::Text, StyleSlot::Blur, StyleSlot::Step];
+
+/// A kept capture's state besides the desktop, read back (see `Overlay::kept_bytes`).
+struct Kept {
+    current_monitor: usize,
+    selection: Option<Rect>,
+    rotation: Rotation,
+    tool: Tool,
+    color: Color32,
+    width: f32,
+    dash: Dash,
+    head: ArrowHead,
+    double_head: bool,
+    text_style: TextStyle,
+    effect: Effect,
+    emoji: String,
+    styles: Vec<(StyleSlot, Color32)>,
+    widths: Vec<(Tool, f32)>,
+    border_on: bool,
+    border: effects::Border,
+    border_unset: bool,
+    shadow: bool,
+    zoom: f32,
+    pan: Vec2,
+    annotations: Vec<Annotation>,
+    history: History,
+}
+
+/// Read a kept capture: the desktop to open over, and the rest to put back.
+fn read_kept(bytes: &[u8]) -> crate::handoff::Result<(Desktop, Kept)> {
+    let mut r = crate::handoff::Reader::new(bytes);
+    if r.take(4)? != crate::handoff::MAGIC {
+        return Err("not a kept capture");
+    }
+    let shots = r.list(|r| {
+        let png = r.bytes()?;
+        image::load_from_memory_with_format(png, image::ImageFormat::Png).map(|i| i.to_rgba8()).map_err(|_| "unreadable screen")
+    })?;
+    let bounds = RECT { left: r.i32()?, top: r.i32()?, right: r.i32()?, bottom: r.i32()? };
+    let monitors = r.list(|r| r.rect())?;
+    let home = r.u32()? as usize;
+    let windows = r.list(|r| r.rect())?;
+    let screens = r.list(|r| r.rect())?;
+    let space = r.vec2()?;
+    let opened = r.option(|r| {
+        Ok(Opened {
+            stem: r.option(|r| r.str())?,
+            folder: r.option(|r| r.str().map(std::path::PathBuf::from))?,
+            format: r.option(|r| r.choice(&[Format::Png, Format::Jpeg]))?,
+        })
+    })?;
+    if shots.is_empty() || shots.len() != monitors.len() || screens.is_empty() {
+        return Err("no screens");
+    }
+    let snap = Snap::new(windows, &monitors);
+    let desktop = Desktop { shots, bounds, home: home.min(monitors.len() - 1), monitors, snap, screens, space, opened };
+
+    let dashes = Dash::ALL.map(|d| d.0);
+    let kept = Kept {
+        current_monitor: r.u32()? as usize,
+        selection: r.option(|r| r.rect())?,
+        rotation: Rotation { angle: r.f32()?, offset: r.vec2()? },
+        tool: r.choice(&all_tools())?,
+        color: r.color()?,
+        width: r.f32()?,
+        dash: r.choice(&dashes)?,
+        head: r.choice(&ArrowHead::ALL.map(|h| h.0))?,
+        double_head: r.bool()?,
+        text_style: r.choice(&TextStyle::ALL.map(|t| t.0))?,
+        effect: r.choice(&Effect::ALL.map(|e| e.0))?,
+        emoji: r.str()?,
+        styles: r.list(|r| Ok((r.choice(&STYLE_SLOTS)?, r.color()?)))?,
+        widths: r.list(|r| Ok((r.choice(&all_tools())?, r.f32()?)))?,
+        border_on: r.bool()?,
+        border: effects::Border { color: r.color()?, width: r.f32()?, dash: r.choice(&dashes)? },
+        border_unset: r.bool()?,
+        shadow: r.bool()?,
+        zoom: r.f32()?,
+        pan: r.vec2()?,
+        annotations: r.annotations()?,
+        history: {
+            let undo = r.list(|r| r.annotations())?;
+            let redo = r.list(|r| r.annotations())?;
+            History::from_steps(undo, redo)
+        },
+    };
+    r.done()?;
+    Ok((desktop, kept))
+}
+
+/// How Darkshot's windows use the GPU, set to hold as little as it can:
+/// - Direct3D 12 alone. By default wgpu starts Vulkan, Direct3D 12 and OpenGL to choose
+///   between them, which alone commits over 100 MB, and then picks Vulkan, whose driver
+///   reserves several times the graphics memory. Without a Direct3D 12 GPU, the usual
+///   choice.
+/// - Memory reserved in small blocks rather than large ones kept for speed.
+///
+/// The high-performance GPU stays the choice: an integrated GPU's memory is the
+/// computer's own RAM, so the low-power one used more of it (measured: 440 MB against
+/// 216 MB). `WGPU_BACKEND` and `WGPU_POWER_PREF` override the choices.
+pub(crate) fn gpu_options(surface: eframe::egui_wgpu::SurfaceConfig) -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+    use eframe::wgpu;
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    if wgpu::Backends::from_env().is_none() {
+        setup.instance_descriptor.backends =
+            if has_dx12_gpu() { wgpu::Backends::DX12 } else { wgpu::Backends::PRIMARY | wgpu::Backends::GL };
+    }
+    let device = setup.device_descriptor.clone();
+    setup.device_descriptor =
+        std::sync::Arc::new(move |adapter| wgpu::DeviceDescriptor { memory_hints: wgpu::MemoryHints::MemoryUsage, ..device(adapter) });
+    WgpuConfiguration { wgpu_setup: WgpuSetup::CreateNew(setup), ..WgpuConfiguration::default() }.with_surface_config(surface)
+}
+
+/// Whether a GPU can be used through Direct3D 12.
+fn has_dx12_gpu() -> bool {
+    use eframe::wgpu;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    // Answered at once on Windows: one poll is enough.
+    let mut found = std::pin::pin!(instance.enumerate_adapters(wgpu::Backends::DX12));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match found.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(adapters) => !adapters.is_empty(),
+        std::task::Poll::Pending => false,
+    }
 }
 
 /// Tell the user why there is nothing to show, and stop.
@@ -746,6 +888,41 @@ const TEXT_SIZE: f32 = 24.0;
 const BLUR_STRENGTH: f32 = 12.0;
 /// Default step marker diameter, in pixels.
 const STEP_SIZE: f32 = 28.0;
+/// The stamp tool's pickers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StampSet {
+    Emoji,
+    Kaomoji,
+    Symbols,
+}
+
+impl StampSet {
+    fn items(self) -> &'static [&'static str] {
+        match self {
+            StampSet::Emoji => &crate::emoji::FAVOURITES,
+            StampSet::Kaomoji => &crate::emoji::KAOMOJI,
+            StampSet::Symbols => &crate::emoji::SYMBOLS,
+        }
+    }
+
+    /// Which picker `stamp` belongs with: its own list's, or else emoji for an emoji,
+    /// symbols for a character or two, kaomoji for anything longer.
+    fn of(stamp: &str) -> Self {
+        let listed = [StampSet::Emoji, StampSet::Kaomoji, StampSet::Symbols].into_iter().find(|s| s.items().contains(&stamp));
+        listed.unwrap_or(if crate::emoji::is_emoji(stamp) {
+            StampSet::Emoji
+        } else if stamp.chars().count() <= 2 {
+            StampSet::Symbols
+        } else {
+            StampSet::Kaomoji
+        })
+    }
+}
+
+/// How long the emoji picker's field waits for the rest of what Windows' emoji panel
+/// is sending before using it.
+const PANEL_PAUSE: std::time::Duration = std::time::Duration::from_millis(150);
+
 /// Default emoji stamp height, in pixels.
 const EMOJI_SIZE: f32 = 48.0;
 
@@ -952,11 +1129,25 @@ struct Overlay {
     emoji: String,
     /// What is typed (or put by Windows' emoji panel) into the emoji picker's field.
     emoji_field: String,
+    /// The emoji picker's tab: 0 for recent emoji, else a group in `emoji::GROUPS` + 1.
+    emoji_tab: usize,
+    /// The emoji groups shown so far, read when first opened.
+    emoji_groups: HashMap<usize, Vec<&'static str>>,
+    /// The last search and what it found.
+    emoji_search: Option<(String, Vec<&'static str>)>,
+    /// The emoji stamped most recently, newest first: the picker's first tab. Starts
+    /// as the favourites; each new one pushes the oldest out.
+    recent_emoji: Vec<String>,
+    /// Whether `recent_emoji` is saved (not in tests).
+    persist_recent: bool,
+    /// When Windows' emoji panel last put text in the field, while waiting for the
+    /// rest of a kaomoji, which can arrive a character at a time.
+    emoji_pending: Option<std::time::Instant>,
     /// The emoji shown in the toolbar and picker, drawn once per emoji and size.
-    emoji_icons: HashMap<(String, u32), egui::TextureHandle>,
-    /// The stamp shown under the pointer before it is placed, for its emoji and size,
-    /// and the area it covers relative to the pointer.
-    emoji_preview: Option<((String, u32), egui::TextureHandle, Rect)>,
+    emoji_icons: HashMap<(String, [u32; 2], bool), egui::TextureHandle>,
+    /// The stamp shown under the pointer before it is placed, for its emoji, size and
+    /// colour, and the area it covers relative to the pointer.
+    emoji_preview: Option<((String, u32, Color32), egui::TextureHandle, Rect)>,
     /// Colour and size remembered per style slot, swapped in and out with `color` and
     /// `width` when switching tools.
     styles: HashMap<StyleSlot, Color32>,
@@ -1006,7 +1197,11 @@ struct Overlay {
     panning: bool,
     /// Started from the tray with Reopen last capture on: hide when done, keeping the
     /// capture, for this many minutes.
-    keep: Option<(u32, crate::keep::Event, crate::keep::Event)>,
+    handoff: bool,
+    /// Until when the window takes the keyboard back if something else has it. A
+    /// second click on the tray icon while the overlay opens gives it to the taskbar,
+    /// and then Esc would not reach the overlay.
+    claim_focus_until: Option<std::time::Instant>,
     annotations: Vec<Annotation>,
     selected: Option<usize>,
     history: History,
@@ -1158,6 +1353,12 @@ impl Overlay {
             effect: Effect::Pixelate,
             emoji: crate::emoji::DEFAULT.to_owned(),
             emoji_field: String::new(),
+            emoji_pending: None,
+            emoji_tab: 0,
+            emoji_groups: HashMap::new(),
+            emoji_search: None,
+            recent_emoji: crate::emoji::FAVOURITES.iter().map(|e| (*e).to_owned()).collect(),
+            persist_recent: false,
             emoji_icons: HashMap::new(),
             emoji_preview: None,
             styles: HashMap::from([
@@ -1195,7 +1396,8 @@ impl Overlay {
             zoom: 1.0,
             pan: Vec2::ZERO,
             panning: false,
-            keep: None,
+            handoff: false,
+            claim_focus_until: None,
             annotations: Vec::new(),
             selected: None,
             history: History::default(),
@@ -1211,7 +1413,12 @@ impl Overlay {
         setup_text(&cc.egui_ctx);
         cc.egui_ctx.set_theme(settings.theme);
         icons::set_marker_color(&cc.egui_ctx, settings.marker());
-        let overlay = Self::with_desktop(desktop, hwnd_of(cc), settings);
+        let mut overlay = Self::with_desktop(desktop, hwnd_of(cc), settings);
+        overlay.claim_focus_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+        if let Some(recent) = crate::settings::load_recent() {
+            overlay.recent_emoji = recent;
+        }
+        overlay.persist_recent = true;
         if let Some(hwnd) = overlay.hwnd {
             // Switch off the window's fade-in. During that animation the live desktop
             // shows through the frozen capture, which looks like ghosting when
@@ -1234,6 +1441,22 @@ impl Overlay {
         overlay
     }
 
+    /// Take the keyboard back while the overlay is opening, if something else took it.
+    fn claim_focus(&mut self, ctx: &egui::Context) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let (Some(until), Some(hwnd)) = (self.claim_focus_until, self.hwnd) else { return };
+        if std::time::Instant::now() >= until {
+            self.claim_focus_until = None;
+            return;
+        }
+        unsafe {
+            if GetForegroundWindow() != hwnd {
+                SetForegroundWindow(hwnd);
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
     /// Make the window cover exactly the captured desktop, above everything else.
     /// Returns true if it had to move. Checked every frame (`force` = false) because
     /// Windows may resize the window when it lands on a monitor with a different DPI scale.
@@ -1251,41 +1474,118 @@ impl Overlay {
         }
     }
 
-    /// Done: close, or with Reopen last capture, hide and keep everything until the
-    /// tray asks for it back or the time runs out.
+    /// Done: close. Started from the tray with Reopen last capture on, first hand the
+    /// tray what it takes to bring this back (see `handoff`).
     fn leave(&mut self, ctx: &egui::Context) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, ShowWindowAsync, SW_HIDE, SW_SHOW};
-        let (Some((minutes, kept, reopen)), Some(hwnd)) = (self.keep, self.hwnd) else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        };
-        // Back as it was, without anything half done.
-        self.finish_editing();
-        self.action = None;
-        self.confirm_open = false;
-        self.help_open = false;
-        self.save_open = false;
-        self.decor_open = false;
-        self.reading = None;
-        self.picking_color = false;
-        self.panning = false;
-        self.error = None;
-        reopen.reset();
-        unsafe { ShowWindow(hwnd, SW_HIDE) };
-        kept.set();
-        let (hwnd, ctx) = (hwnd as usize, ctx.clone());
-        std::thread::spawn(move || {
-            if reopen.wait(minutes.saturating_mul(60_000)) {
-                kept.reset();
-                unsafe {
-                    ShowWindowAsync(hwnd as HWND, SW_SHOW);
-                    SetForegroundWindow(hwnd as HWND);
-                }
-                ctx.request_repaint();
-            } else {
-                std::process::exit(0); // still hidden: the time is up
+        if self.handoff {
+            // Gone from the screen at once; the capture is packed up after.
+            if let Some(hwnd) = self.hwnd {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                unsafe { ShowWindow(hwnd, SW_HIDE) };
             }
+            // As it was, without anything half done.
+            self.finish_editing();
+            self.action = None;
+            let bytes = self.kept_bytes();
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&bytes).and_then(|()| out.flush());
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// The capture, region, drawings, undo history, and the tool and its style, as
+    /// bytes for the tray to keep (see `handoff`).
+    fn kept_bytes(&self) -> Vec<u8> {
+        use crate::handoff::Writer;
+        let mut w = Writer::default();
+        w.0.extend_from_slice(crate::handoff::MAGIC);
+        let d = &self.desktop;
+        // Each screen as a quickly compressed PNG: a screenshot shrinks several times
+        // over, and the tray holds less for as long as it keeps it.
+        w.list(&d.shots, |w, shot| {
+            use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+            let mut png = Vec::new();
+            let encoder = PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive);
+            let _ = shot.write_with_encoder(encoder);
+            w.bytes(&png);
         });
+        for v in [d.bounds.left, d.bounds.top, d.bounds.right, d.bounds.bottom] {
+            w.i32(v);
+        }
+        w.list(&d.monitors, |w, r| w.rect(*r));
+        w.len(d.home);
+        w.list(&d.snap.windows, |w, r| w.rect(*r));
+        w.list(&d.screens, |w, r| w.rect(*r));
+        w.vec2(d.space);
+        w.option(d.opened.as_ref(), |w, o| {
+            w.option(o.stem.as_deref(), |w, s| w.str(s));
+            w.option(o.folder.as_deref(), |w, f| w.str(&f.to_string_lossy()));
+            w.option(o.format, |w, f| w.choice(&f, &[Format::Png, Format::Jpeg]));
+        });
+
+        w.len(self.current_monitor);
+        w.option(self.selection, |w, r| w.rect(r));
+        w.f32(self.rotation.angle);
+        w.vec2(self.rotation.offset);
+        w.choice(&self.tool, &all_tools());
+        w.color(self.color);
+        w.f32(self.width);
+        w.choice(&self.dash, &Dash::ALL.map(|d| d.0));
+        w.choice(&self.head, &ArrowHead::ALL.map(|h| h.0));
+        w.bool(self.double_head);
+        w.choice(&self.text_style, &TextStyle::ALL.map(|t| t.0));
+        w.choice(&self.effect, &Effect::ALL.map(|e| e.0));
+        w.str(&self.emoji);
+        // In a fixed order, so the same state always gives the same bytes.
+        let styles: Vec<(StyleSlot, Color32)> = STYLE_SLOTS.iter().filter_map(|k| Some((*k, *self.styles.get(k)?))).collect();
+        w.list(&styles, |w, (slot, c)| {
+            w.choice(slot, &STYLE_SLOTS);
+            w.color(*c);
+        });
+        let widths: Vec<(Tool, f32)> = all_tools().into_iter().filter_map(|k| Some((k, *self.widths.get(&k)?))).collect();
+        w.list(&widths, |w, (tool, width)| {
+            w.choice(tool, &all_tools());
+            w.f32(*width);
+        });
+        w.bool(self.border_on);
+        w.color(self.border.color);
+        w.f32(self.border.width);
+        w.choice(&self.border.dash, &Dash::ALL.map(|d| d.0));
+        w.bool(self.border_unset);
+        w.bool(self.shadow);
+        w.f32(self.zoom);
+        w.vec2(self.pan);
+        w.annotations(&self.annotations);
+        let (undo, redo) = self.history.steps();
+        w.list(undo, |w, s| w.annotations(s));
+        w.list(redo, |w, s| w.annotations(s));
+        w.0
+    }
+
+    /// Put back what [`Overlay::kept_bytes`] kept, besides the desktop.
+    fn restore(&mut self, kept: Kept) {
+        self.current_monitor = kept.current_monitor.min(self.desktop.monitors.len().saturating_sub(1));
+        self.selection = kept.selection;
+        self.rotation = kept.rotation;
+        self.tool = kept.tool;
+        self.color = kept.color;
+        self.width = kept.width;
+        self.dash = kept.dash;
+        self.head = kept.head;
+        self.double_head = kept.double_head;
+        self.text_style = kept.text_style;
+        self.effect = kept.effect;
+        self.emoji = kept.emoji;
+        self.styles = kept.styles.into_iter().collect();
+        self.widths = kept.widths.into_iter().collect();
+        self.border_on = kept.border_on;
+        self.border = kept.border;
+        self.border_unset = kept.border_unset;
+        self.shadow = kept.shadow;
+        self.zoom = kept.zoom;
+        self.pan = kept.pan;
+        self.annotations = kept.annotations;
+        self.history = kept.history;
     }
 
     /// Ctrl+wheel zooms an opened image around the pointer, Ctrl+0 fits it again, and
@@ -1500,6 +1800,7 @@ impl Overlay {
                     if let Some(stamp) = self.annotations.last_mut() {
                         stamp.text = self.emoji.clone();
                     }
+                    self.note_recent();
                 }
                 self.selected = Some(self.annotations.len() - 1);
             }
@@ -1698,6 +1999,28 @@ impl Overlay {
     /// Switch tools. Every tool keeps its own size; the highlighter, text, blur and step
     /// tools also keep their own colour (the highlighter starts yellow), while the
     /// other tools share one.
+    /// Right-click: close whatever is open, or else let go of the selected annotation,
+    /// or else put the tool down (back to Select). One step per click.
+    fn back_out(&mut self, ctx: &egui::Context) {
+        if egui::Popup::is_any_open(ctx) {
+            egui::Popup::close_all(ctx);
+        } else if self.editing.is_some() {
+            self.finish_editing();
+        } else if self.help_open {
+            self.help_open = false;
+        } else if self.picking_color {
+            self.picking_color = false;
+        } else if self.save_open || self.decor_open || self.reading.is_some() {
+            self.save_open = false;
+            self.decor_open = false;
+            self.reading = None;
+        } else if self.selected.is_some() {
+            self.selected = None;
+        } else if self.tool != Tool::Select {
+            self.set_tool(Tool::Select);
+        }
+    }
+
     fn set_tool(&mut self, tool: Tool) {
         if tool == self.tool {
             return;
@@ -1728,9 +2051,10 @@ impl Overlay {
         self.selected = Some(index);
         let shape = self.annotations[index].clone();
         if shape.kind == ShapeKind::Emoji {
-            // A stamp has no colour of its own to show.
             self.emoji = shape.text.clone();
-        } else {
+        }
+        // An emoji stamp has no colour of its own to show; a kaomoji or symbol does.
+        if shape.kind != ShapeKind::Emoji || !crate::emoji::is_emoji(&shape.text) {
             self.color = shape.color;
         }
         self.width = shape.width;
@@ -1756,8 +2080,10 @@ impl Overlay {
             ShapeKind::Text => shape.text_style = self.text_style,
             ShapeKind::Blur => shape.effect = self.effect,
             ShapeKind::Emoji => {
-                shape.color = self.annotations[index].color;
                 shape.text = self.emoji.clone();
+                if crate::emoji::is_emoji(&shape.text) {
+                    shape.color = self.annotations[index].color;
+                }
             }
             _ => {}
         }
@@ -2330,7 +2656,7 @@ impl Overlay {
             }
             // Step markers have no options beyond colour and size.
             ShapeKind::Step => {}
-            ShapeKind::Emoji => self.emoji_picker(ui),
+            ShapeKind::Emoji => self.stamp_pickers(ui),
             ShapeKind::Blur => {
                 icons::picker(ui, &mut self.effect, true, &Effect::ALL, icons::effect_preview)
                     .on_hover_text("Effect");
@@ -2393,7 +2719,7 @@ impl Overlay {
                 .tools
                 .iter()
                 .map(|(t, k)| E {
-                    keys: vec![k.symbol_or_name().to_owned()],
+                    keys: vec![crate::keys::label(*k)],
                     what: help::What::Tool(t.icon),
                     active: tool_for(t.icon) == Some(self.tool),
                 })
@@ -2428,96 +2754,237 @@ impl Overlay {
     /// Draw `emoji` as large as fits in `area`, whole and centred, from a texture made
     /// once per emoji and size.
     fn paint_emoji(&mut self, ui: &egui::Ui, emoji: &str, area: Rect) {
-        let px = (area.height() * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
-        let key = (emoji.to_owned(), px);
+        self.paint_icon(ui, emoji, area, false);
+    }
+
+    /// Draw `text` as large as fits in `area`, centred, from a texture made once per
+    /// text and size. The texture is drawn at the screen's own pixel size, on whole
+    /// pixels, so it stays sharp; with `plain`, in one colour (the font's black-and-white
+    /// emoji).
+    fn paint_icon(&mut self, ui: &egui::Ui, text: &str, area: Rect, plain: bool) {
+        let ppp = ui.ctx().pixels_per_point();
+        let fit = [(area.width() * ppp).floor().max(1.0) as u32, (area.height() * ppp).floor().max(1.0) as u32];
+        let key = (text.to_owned(), fit, plain);
         if !self.emoji_icons.contains_key(&key) {
-            let Some(texture) = emoji_texture(ui.ctx(), emoji, px) else { return };
+            let ink = ui.visuals().strong_text_color();
+            let Some(texture) = fitted_texture(ui.ctx(), text, fit, ink, plain) else { return };
             self.emoji_icons.insert(key.clone(), texture);
         }
         if let Some(texture) = self.emoji_icons.get(&key) {
-            // Some emoji are wider than tall (or the reverse): fit the longer side.
-            let [w, h] = texture.size().map(|n| n as f32);
-            let scale = (area.width() / w).min(area.height() / h);
-            let shown = Rect::from_center_size(area.center(), vec2(w, h) * scale);
+            let size = vec2(texture.size()[0] as f32, texture.size()[1] as f32);
+            let min = ((area.center().to_vec2() * ppp - size / 2.0).round() / ppp).to_pos2();
+            let shown = Rect::from_min_size(min, size / ppp);
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             ui.painter().image(texture.id(), shown, uv, Color32::WHITE);
         }
     }
 
-    /// The emoji stamp's picker: the current emoji on a button that opens a grid of
-    /// favourites, and a field that takes any emoji, typed or put there by Windows'
-    /// emoji panel (Win+.).
-    fn emoji_picker(&mut self, ui: &mut egui::Ui) {
-        const COLUMNS: usize = 8;
-        const CELL: f32 = 30.0;
-        let popup_id = ui.auto_id_with("emoji-picker");
+    /// The stamp tool's three pickers side by side: emoji, kaomoji and symbols. Each is
+    /// a button that opens a grid; the one the current stamp comes from shows it.
+    fn stamp_pickers(&mut self, ui: &mut egui::Ui) {
+        for set in [StampSet::Emoji, StampSet::Kaomoji, StampSet::Symbols] {
+            self.stamp_picker(ui, set);
+        }
+    }
+
+    /// One stamp picker. The emoji grid also has a field that takes any emoji,
+    /// kaomoji or symbol, put there by Windows' emoji panel (Win+.) or typed.
+    fn stamp_picker(&mut self, ui: &mut egui::Ui, set: StampSet) {
+        let (columns, cell, button_width, tip) = match set {
+            StampSet::Emoji => (8, vec2(30.0, 30.0), icons::PICKER_WIDTH, "Emoji"),
+            StampSet::Kaomoji => (3, vec2(124.0, 30.0), 64.0, "Kaomoji"),
+            StampSet::Symbols => (10, vec2(28.0, 28.0), icons::PICKER_WIDTH, "Symbols"),
+        };
+        let popup_id = ui.auto_id_with(("stamp-picker", tip));
         let open = egui::Popup::is_id_open(ui.ctx(), popup_id);
-        let (rect, response) = ui.allocate_exact_size(vec2(icons::PICKER_WIDTH, icons::BUTTON), Sense::click());
-        let visuals = ui.style().interact_selectable(&response, open);
-        if open || response.hovered() {
+        let current = self.emoji.clone();
+        let ours = StampSet::of(&current) == set;
+        let (rect, response) = ui.allocate_exact_size(vec2(button_width, icons::BUTTON), Sense::click());
+        let visuals = ui.style().interact_selectable(&response, open || ours);
+        if open || ours || response.hovered() {
             ui.painter().rect_filled(rect, 4.0, visuals.bg_fill);
         }
-        let current = self.emoji.clone();
-        let icon = Rect::from_center_size(rect.left_center() + vec2(16.0, 0.0), Vec2::splat(20.0));
-        self.paint_emoji(ui, &current, icon);
+        // The current stamp on its own picker; a sample on the others.
+        let shown = if ours { current.as_str() } else { set.items()[0] };
+        let icon = Rect::from_min_max(rect.left_top() + vec2(5.0, 5.0), rect.right_bottom() - vec2(15.0, 5.0));
+        let icon = if set == StampSet::Kaomoji { icon.shrink2(vec2(0.0, 3.0)) } else { icon };
+        self.paint_emoji(ui, shown, icon);
         let c = Pos2::new(rect.right() - 7.0, rect.center().y + 1.0);
         let caret = vec![c + vec2(-3.0, -1.5), c + vec2(3.0, -1.5), c + vec2(0.0, 1.8)];
         ui.painter().add(egui::Shape::convex_polygon(caret, visuals.fg_stroke.color, Stroke::NONE));
-        let response = response.on_hover_text("Emoji");
+        let response = response.on_hover_text(tip);
         let just_opened = response.clicked() && !open;
 
         let mut chosen = None;
-        let mut close = false;
         egui::Popup::menu(&response)
             .id(popup_id)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                let mut list: Vec<&str> = crate::emoji::FAVOURITES.to_vec();
-                if !list.contains(&current.as_str()) {
+                if set == StampSet::Emoji {
+                    chosen = self.emoji_panel(ui, just_opened);
+                    return;
+                }
+                let mut list: Vec<&str> = set.items().to_vec();
+                if ours && !list.contains(&current.as_str()) {
                     list.insert(0, &current);
                 }
-                egui::Grid::new("emoji-grid").spacing(vec2(2.0, 2.0)).show(ui, |ui| {
-                    for (i, &emoji) in list.iter().enumerate() {
-                        let (cell, cell_response) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
-                        let selected = emoji == current;
+                egui::Grid::new(("stamp-grid", tip)).spacing(vec2(2.0, 2.0)).show(ui, |ui| {
+                    for (i, &item) in list.iter().enumerate() {
+                        let (area, cell_response) = ui.allocate_exact_size(cell, Sense::click());
+                        let selected = item == current;
                         let visuals = ui.style().interact_selectable(&cell_response, selected);
                         if selected || cell_response.hovered() {
-                            ui.painter().rect_filled(cell, 4.0, visuals.bg_fill);
+                            ui.painter().rect_filled(area, 4.0, visuals.bg_fill);
                         }
-                        self.paint_emoji(ui, emoji, cell.shrink(4.0));
+                        let inset = if set == StampSet::Kaomoji { vec2(6.0, 7.0) } else { Vec2::splat(4.0) };
+                        self.paint_emoji(ui, item, area.shrink2(inset));
                         if cell_response.clicked() {
-                            chosen = Some(emoji.to_owned());
-                            close = true;
+                            chosen = Some(item.to_owned());
                         }
-                        if (i + 1) % COLUMNS == 0 {
+                        if (i + 1) % columns == 0 {
                             ui.end_row();
                         }
                     }
                 });
-                ui.add_space(4.0);
-                let width = COLUMNS as f32 * (CELL + 2.0) - 2.0;
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.emoji_field)
-                        .hint_text("Any emoji: press Win+.")
-                        .desired_width(width),
-                );
-                if just_opened {
-                    field.request_focus();
-                }
-                // Each emoji picked in Windows' panel replaces the stamp; the panel and
-                // this picker stay open for another go.
-                let typed = self.emoji_field.trim();
-                if field.changed() && crate::emoji::is_emoji(typed) {
-                    chosen = Some(typed.to_owned());
-                    self.emoji_field.clear();
+            });
+        // Picking closes the grid, so the stamp shows under the pointer at once.
+        if let Some(stamp) = chosen {
+            egui::Popup::close_id(ui.ctx(), popup_id);
+            self.choose_emoji(stamp);
+        }
+    }
+
+    /// The emoji picker: a search field, a tab for recent emoji and one per group, and
+    /// the grid. Only the rows in view are drawn. Returns the emoji picked, if any.
+    fn emoji_panel(&mut self, ui: &mut egui::Ui, focus: bool) -> Option<String> {
+        const COLUMNS: usize = 9;
+        const CELL: f32 = 30.0;
+        const ROWS_SHOWN: f32 = 7.0;
+        let width = COLUMNS as f32 * (CELL + 2.0) - 2.0;
+        // Icons are drawn once per emoji and kept; let them go now and then, so
+        // browsing every group does not pile them up.
+        if self.emoji_icons.len() > 600 {
+            self.emoji_icons.clear();
+        }
+        ui.set_max_width(width);
+        let mut chosen = self.panel_field(ui, width, focus);
+
+        let query = self.emoji_field.trim().to_owned();
+        let searching = !query.is_empty() && self.emoji_pending.is_none();
+        // Tabs: recent, then the groups.
+        if !searching {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let tabs = std::iter::once("🕘").chain(crate::emoji::GROUPS.iter().map(|g| g.1));
+                for (i, icon) in tabs.enumerate() {
+                    let (area, tab) = ui.allocate_exact_size(vec2(CELL - 3.0, CELL - 3.0), Sense::click());
+                    let selected = self.emoji_tab == i;
+                    let visuals = ui.style().interact_selectable(&tab, selected);
+                    if selected || tab.hovered() {
+                        ui.painter().rect_filled(area, 4.0, visuals.bg_fill);
+                    }
+                    // In one colour, so the tabs read as tabs, not as emoji to pick.
+                    self.paint_icon(ui, icon, area.shrink(5.0), true);
+                    let name = if i == 0 { "Recent" } else { crate::emoji::GROUPS[i - 1].0 };
+                    if tab.on_hover_text(name).clicked() {
+                        self.emoji_tab = i;
+                    }
                 }
             });
-        if close {
-            egui::Popup::close_id(ui.ctx(), popup_id);
+            ui.separator();
         }
-        if let Some(emoji) = chosen {
-            self.choose_emoji(emoji);
+        let list: Vec<String> = if searching {
+            if self.emoji_search.as_ref().is_none_or(|(q, _)| *q != query) {
+                self.emoji_search = Some((query.clone(), crate::emoji::search(&query, 200)));
+            }
+            self.emoji_search.as_ref().map(|(_, found)| found.iter().map(|e| (*e).to_owned()).collect()).unwrap_or_default()
+        } else if self.emoji_tab == 0 {
+            self.recent_emoji.clone()
+        } else {
+            let tab = self.emoji_tab - 1;
+            self.emoji_groups.entry(tab).or_insert_with(|| crate::emoji::group(tab)).iter().map(|e| (*e).to_owned()).collect()
+        };
+        let entered = ui.input(|i| i.key_pressed(Key::Enter));
+        if searching && entered && chosen.is_none() {
+            chosen = list.first().cloned();
         }
+        if searching && list.is_empty() {
+            ui.label(egui::RichText::new("No emoji found").color(ui.visuals().weak_text_color()));
+            return chosen;
+        }
+        let current = self.emoji.clone();
+        let rows = list.len().div_ceil(COLUMNS);
+        egui::ScrollArea::vertical()
+            .max_height(ROWS_SHOWN * (CELL + 2.0))
+            .min_scrolled_height(ROWS_SHOWN * (CELL + 2.0))
+            .auto_shrink([true, true])
+            .show_rows(ui, CELL, rows, |ui, range| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                for row in range {
+                    ui.horizontal(|ui| {
+                        for emoji in list.iter().skip(row * COLUMNS).take(COLUMNS) {
+                            let (area, cell) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
+                            let selected = *emoji == current;
+                            let visuals = ui.style().interact_selectable(&cell, selected);
+                            if selected || cell.hovered() {
+                                ui.painter().rect_filled(area, 4.0, visuals.bg_fill);
+                            }
+                            self.paint_emoji(ui, emoji, area.shrink(4.0));
+                            if cell.clicked() {
+                                chosen = Some(emoji.clone());
+                            }
+                        }
+                    });
+                }
+            });
+        chosen
+    }
+
+    /// Put `self.emoji` first among the recent emoji, if it is one, and save the list.
+    fn note_recent(&mut self) {
+        if !crate::emoji::is_emoji(&self.emoji) {
+            return;
+        }
+        self.recent_emoji.retain(|e| *e != self.emoji);
+        self.recent_emoji.insert(0, self.emoji.clone());
+        self.recent_emoji.truncate(crate::emoji::FAVOURITES.len());
+        if self.persist_recent {
+            crate::settings::store_recent(&self.recent_emoji);
+        }
+    }
+
+    /// The emoji picker's field: typing searches. It also takes what Windows' emoji
+    /// panel (Win+.) puts there. Returns a stamp once one is complete.
+    fn panel_field(&mut self, ui: &mut egui::Ui, width: f32, focus: bool) -> Option<String> {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut self.emoji_field)
+                .hint_text("Search emoji")
+                .desired_width(width),
+        );
+        if focus {
+            field.request_focus();
+        }
+        if field.changed() {
+            // Keys typed here come with the key that typed them; the panel sends its
+            // text alone, a kaomoji perhaps a character at a time.
+            let keyed = ui.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, physical_key: Some(_), .. }))
+            });
+            self.emoji_pending = (!keyed).then(std::time::Instant::now);
+        }
+        let typed = self.emoji_field.trim().to_owned();
+        let settled = self.emoji_pending.is_some_and(|t| t.elapsed() >= PANEL_PAUSE);
+        if (field.changed() && crate::emoji::is_emoji(&typed)) || settled {
+            self.emoji_pending = None;
+            if crate::emoji::can_stamp(&typed) {
+                self.emoji_field.clear();
+                return Some(typed);
+            }
+        } else if self.emoji_pending.is_some() {
+            ui.ctx().request_repaint_after(PANEL_PAUSE);
+        }
+        None
     }
 
     /// The next stamp, drawn as it would be placed with its centre at the origin: the
@@ -2765,15 +3232,39 @@ pub(crate) fn setup_text(ctx: &egui::Context) {
     });
 }
 
-/// `emoji` drawn about `px` pixels tall, cropped to the pixels it actually covers.
-/// Emoji differ in width and some reach beyond their box, so the toolbar and picker
-/// fit this whole image into their cells rather than drawing a fixed square.
-fn emoji_texture(ctx: &egui::Context, emoji: &str, px: u32) -> Option<egui::TextureHandle> {
-    // Room on every side for whatever spills out of the emoji's box.
-    let canvas = px * 2;
+/// `emoji` drawn about `px` pixels tall, cropped to the pixels it actually covers, with
+/// any kaomoji or symbol in `ink`. Emoji differ in width and some reach beyond their
+/// box, so the toolbar and picker fit this whole image into their cells rather than
+/// drawing a fixed square.
+/// `text` drawn as large as fits `fit` pixels once cropped: drawn at the height that
+/// fills it, then smaller if what it covers is wider or taller than that.
+fn fitted_texture(ctx: &egui::Context, text: &str, fit: [u32; 2], ink: Color32, plain: bool) -> Option<egui::TextureHandle> {
+    let mut px = fit[1];
+    for _ in 0..4 {
+        let texture = emoji_texture_with(ctx, text, px, ink, plain)?;
+        let [w, h] = texture.size().map(|n| n as u32);
+        if w <= fit[0] && h <= fit[1] || px <= 2 {
+            return Some(texture);
+        }
+        let scale = (fit[0] as f32 / w as f32).min(fit[1] as f32 / h as f32);
+        px = ((px as f32 * scale).floor() as u32).min(px - 1).max(1);
+    }
+    emoji_texture_with(ctx, text, px, ink, plain)
+}
+
+#[cfg(test)]
+fn emoji_texture(ctx: &egui::Context, emoji: &str, px: u32, ink: Color32) -> Option<egui::TextureHandle> {
+    emoji_texture_with(ctx, emoji, px, ink, false)
+}
+
+fn emoji_texture_with(ctx: &egui::Context, emoji: &str, px: u32, ink: Color32, plain: bool) -> Option<egui::TextureHandle> {
+    // Room on every side for whatever spills out of the emoji's box; a kaomoji is wide.
+    let wide = crate::emoji::bounds(emoji, px as f32, Pos2::ZERO).width().ceil() as u32;
+    let canvas = px.max(wide) * 2;
     let mut pixmap = tiny_skia::Pixmap::new(canvas, canvas)?;
     let centre = Pos2::new(canvas as f32 / 2.0, canvas as f32 / 2.0);
-    crate::emoji::rasterize(emoji, px as f32, centre, &mut pixmap.as_mut(), Pos2::ZERO);
+    let draw = if plain { crate::emoji::rasterize_plain } else { crate::emoji::rasterize };
+    draw(emoji, px as f32, centre, ink, &mut pixmap.as_mut(), Pos2::ZERO);
     let (mut x0, mut y0, mut x1, mut y1) = (canvas, canvas, 0, 0);
     for (i, p) in pixmap.pixels().iter().enumerate() {
         if p.alpha() > 0 {
@@ -2950,6 +3441,7 @@ impl eframe::App for Overlay {
         if self.cover_desktop(false) {
             ctx.request_repaint(); // check again next frame that the move stuck
         }
+        self.claim_focus(&ctx);
 
         // The whole window, across every monitor. (The content rect is only the monitor
         // popups are kept on; see `raw_input_hook`.)
@@ -3051,7 +3543,10 @@ impl eframe::App for Overlay {
             overlay.selection.filter(|s| s.contains(p)).and_then(|_| overlay.reading.as_ref()?.hit(p))
         };
         // A click while the shortcut sheet is up only closes it.
-        if response.drag_started() && !asking && !self.help_open && !self.panning {
+        // Only the left button draws and drags: right-click backs out (below), and the
+        // middle button pans an opened image.
+        let primary = egui::PointerButton::Primary;
+        if response.drag_started_by(primary) && !asking && !self.help_open && !self.panning {
             if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
                 if let (Some(hit), Some(reading)) = (read_hit(self, origin), self.reading.as_mut()) {
                     reading.toggle(hit, mods.shift);
@@ -3069,23 +3564,26 @@ impl eframe::App for Overlay {
                 }
             }
         }
-        if response.dragged() && !self.ignore_drag {
+        if response.dragged_by(primary) && !self.ignore_drag {
             if let Some(p) = response.interact_pointer_pos() {
                 self.apply_action(to_px(p), mods, bounds);
             }
         }
-        if response.drag_stopped() {
+        if response.drag_stopped_by(primary) {
             if std::mem::take(&mut self.ignore_drag) {
                 // The eyedropper's click: nothing to finish.
             } else {
                 self.end_action();
             }
         }
-        // Right-click on the rotation handle: back to no turn.
+        // Right-click on the rotation handle: back to no turn. Anywhere else it backs
+        // out one step, like Esc, but never closes the capture.
         let right_click = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary).then(|| i.pointer.interact_pos()).flatten());
         if let Some(p) = right_click.filter(|_| !asking && self.action.is_none()) {
             if matches!(self.pick_action(to_px(p), tol), Action::Rotate { .. }) && !self.rotation.is_none() {
                 self.reset_rotation();
+            } else {
+                self.back_out(&ctx);
             }
         }
         if std::mem::take(&mut self.reread) {
@@ -3395,7 +3893,7 @@ impl eframe::App for Overlay {
             };
             let show = self.help_level != HelpLevel::Off && !self.confirm_open && !self.help_open;
             if let Some(info) = id.and_then(help::tool_help).filter(|_| show) {
-                let key = self.tools.iter().find(|(t, _)| Some(t.id) == id).map(|(_, k)| k.symbol_or_name());
+                let key = self.tools.iter().find(|(t, _)| Some(t.id) == id).map(|(_, k)| crate::keys::label(*k));
                 let centre = sel_px.center();
                 let screen_px = self
                     .desktop
@@ -3426,7 +3924,7 @@ impl eframe::App for Overlay {
                 avoid.extend(self.strip_rect);
                 let floor = monitor.bottom();
                 let (at, docked) = help::place_box(self.help_box_size, sel, monitor, &avoid, floor, hover);
-                self.help_box_size = help::tool_box(&ctx, &info, key, self.help_level, at, docked);
+                self.help_box_size = help::tool_box(&ctx, &info, key.as_deref(), self.help_level, at, docked);
             }
         }
         self.restyle_selected();
@@ -3495,7 +3993,7 @@ impl eframe::App for Overlay {
                 && !egui::Popup::is_any_open(&ctx)
         });
         if let Some(p) = stamp_at.map(to_px).filter(|&p| matches!(self.pick_action(p, tol), Action::NewShape { .. })) {
-            let key = (self.emoji.clone(), self.width.to_bits());
+            let key = (self.emoji.clone(), self.width.to_bits(), self.color);
             if self.emoji_preview.as_ref().is_none_or(|(k, _, _)| *k != key) {
                 self.emoji_preview = self.emoji_preview_layer().map(|(image, area)| {
                     (key, ctx.load_texture("stamp-preview", image, egui::TextureOptions::LINEAR), area)
@@ -3700,7 +4198,7 @@ impl eframe::App for Overlay {
         }
         if self.help_open {
             let tools: Vec<(&'static str, String)> =
-                self.tools.iter().map(|(t, k)| (t.name, k.symbol_or_name().to_owned())).collect();
+                self.tools.iter().map(|(t, k)| (t.name, crate::keys::label(*k))).collect();
             help::sheet(&ctx, rect_to_pt(monitor), &tools);
         }
 
@@ -3752,7 +4250,7 @@ mod tests {
     const SHIFT: Modifiers = Modifiers { shift: true, ..Modifiers::NONE };
     const ALT: Modifiers = Modifiers { alt: true, ..Modifiers::NONE };
 
-    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
+    pub(super) fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
         Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1))
     }
 
@@ -3852,7 +4350,7 @@ mod tests {
         assert_eq!(overlay.width, 3.0);
     }
 
-    fn plain_overlay(w: u32, h: u32, shot: RgbaImage) -> Overlay {
+    pub(super) fn plain_overlay(w: u32, h: u32, shot: RgbaImage) -> Overlay {
         let desktop = Desktop::new(
             vec![shot],
             RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
@@ -4165,12 +4663,46 @@ mod tests {
         // Picker icons are cropped to what the emoji draws, so none is cut off.
         let ctx = egui::Context::default();
         for emoji in crate::emoji::FAVOURITES {
-            let texture = emoji_texture(&ctx, emoji, 40).unwrap();
+            let texture = emoji_texture(&ctx, emoji, 40, Color32::WHITE).unwrap();
             let [w, h] = texture.size();
             // Narrow glyphs (❗) can be a few pixels wide, depending on the emoji font.
             assert!(w > 2 && h > 10 && w <= 80 && h <= 80, "{emoji}: {w}x{h}");
         }
         assert!(crate::emoji::is_emoji("👍🏽") && !crate::emoji::is_emoji("ab") && !crate::emoji::is_emoji(""));
+
+        // Placing an emoji puts it first among the recent ones, pushing the oldest out;
+        // kaomoji and symbols are not recorded.
+        let before = overlay.recent_emoji.clone();
+        assert_eq!(before.len(), crate::emoji::FAVOURITES.len());
+        overlay.emoji = "🦀".into();
+        overlay.note_recent();
+        assert_eq!(overlay.recent_emoji[0], "🦀");
+        assert_eq!(overlay.recent_emoji.len(), before.len());
+        assert_eq!(overlay.recent_emoji.last(), before.get(before.len() - 2));
+        overlay.emoji = before[3].clone();
+        overlay.note_recent();
+        assert_eq!((overlay.recent_emoji[0].as_str(), overlay.recent_emoji[1].as_str()), (before[3].as_str(), "🦀"));
+        assert_eq!(overlay.recent_emoji.iter().filter(|e| **e == before[3]).count(), 1);
+        overlay.emoji = "(^_^)".into();
+        overlay.note_recent();
+        assert_eq!(overlay.recent_emoji[0], before[3]);
+
+        // The picker draws: recent, a group, and a search, without picking anything.
+        let ctx = egui::Context::default();
+        for (tab, search) in [(0, ""), (3, ""), (0, "cat")] {
+            overlay.emoji_tab = tab;
+            overlay.emoji_field = search.into();
+            let mut out = ctx.run_pass(Default::default(), |ctx| {
+                let shown = egui::Area::new(egui::Id::unique("picker")).show(ctx, |ui| {
+                    assert_eq!(overlay.emoji_panel(ui, false), None);
+                });
+                // Nine columns of emoji wide, no more.
+                assert!(shown.response.rect.width() < 300.0, "{:?}", shown.response.rect);
+            });
+            out.textures_delta.clear();
+        }
+        assert!(overlay.emoji_groups.contains_key(&2) && overlay.emoji_groups.len() == 1);
+        assert!(overlay.emoji_search.as_ref().is_some_and(|(q, found)| q == "cat" && !found.is_empty()));
     }
 
     fn key(key: Key) -> egui::Event {
@@ -4525,7 +5057,7 @@ mod view_tests {
                 ],
                 ..Default::default()
             };
-            let _ = ctx.run_pass(input, |ctx| overlay.zoom_and_pan(ctx, screen, fit));
+            ctx.run_pass(input, |ctx| overlay.zoom_and_pan(ctx, screen, fit)).textures_delta.clear();
         }
         assert!(overlay.zoom > 1.9, "zoomed: {}", overlay.zoom);
         assert!(to_px(&overlay, p).distance(before) < 0.5, "the pixel under the pointer stays put");
@@ -4537,7 +5069,7 @@ mod view_tests {
             events: vec![egui::Event::ModifiersChanged(ctrl), egui::Event::Key { key: Key::Num0, physical_key: None, pressed: true, repeat: false, modifiers: ctrl }],
             ..Default::default()
         };
-        let _ = ctx.run_pass(input, |ctx| overlay.zoom_and_pan(ctx, screen, fit));
+        ctx.run_pass(input, |ctx| overlay.zoom_and_pan(ctx, screen, fit)).textures_delta.clear();
         assert_eq!((overlay.zoom, overlay.pan), (1.0, Vec2::ZERO));
     }
 
@@ -4551,15 +5083,40 @@ mod view_tests {
     }
 
     #[test]
-    fn the_tray_and_the_overlay_share_the_kept_signal() {
-        let (a, b) = (crate::keep::kept().unwrap(), crate::keep::kept().unwrap());
-        let was = a.is_set();
-        a.set();
-        assert!(b.is_set());
-        b.reset();
-        assert!(!a.is_set());
-        if was {
-            a.set();
-        }
+    fn a_kept_capture_comes_back_as_it_was() {
+        use super::tests::{plain_overlay, rect};
+        let mut overlay = plain_overlay(40, 30, RgbaImage::from_fn(40, 30, |x, y| image::Rgba([x as u8, y as u8, 7, 255])));
+        overlay.selection = Some(rect(2.0, 3.0, 30.0, 20.0));
+        overlay.rotation = Rotation { angle: 0.25, offset: Vec2::new(1.0, -2.0) };
+        overlay.set_tool(Tool::Shape(ShapeKind::Arrow));
+        overlay.color = Color32::from_rgb(1, 2, 3);
+        overlay.emoji = "🦀".into();
+        overlay.border_on = true;
+        overlay.shadow = true;
+        let mut arrow = Annotation::stroked(ShapeKind::Arrow, Pos2::new(1.0, 1.0), Pos2::new(9.0, 9.0), Color32::RED, 4.0, Dash::Dot);
+        arrow.points = vec![Pos2::new(3.0, 4.0)];
+        overlay.history.record(&overlay.annotations, None);
+        overlay.annotations.push(arrow);
+        overlay.desktop.opened = Some(Opened { stem: Some("bild".into()), folder: Some("C:\\Bilder".into()), format: Some(Format::Jpeg) });
+
+        let bytes = overlay.kept_bytes();
+        let (desktop, kept) = read_kept(&bytes).unwrap();
+        assert_eq!(desktop.shots, overlay.desktop.shots);
+        assert_eq!((desktop.bounds.right, desktop.monitors.clone(), desktop.opened.clone()), (overlay.desktop.bounds.right, overlay.desktop.monitors.clone(), overlay.desktop.opened.clone()));
+        let mut back = Overlay::with_desktop(desktop, None, &Settings::default());
+        back.restore(kept);
+        assert_eq!(back.selection, overlay.selection);
+        assert_eq!(back.rotation, overlay.rotation);
+        assert_eq!((back.tool, back.color, back.width), (overlay.tool, overlay.color, overlay.width));
+        assert_eq!((back.emoji.as_str(), back.border_on, back.shadow), ("🦀", true, true));
+        assert_eq!(back.annotations, overlay.annotations);
+        assert_eq!(back.history.steps().0, overlay.history.steps().0);
+        assert_eq!(back.styles, overlay.styles);
+        assert_eq!(back.widths, overlay.widths);
+
+        // Damaged or cut short: an error, never a panic.
+        assert!(read_kept(&bytes[..bytes.len() - 1]).is_err());
+        assert!(read_kept(b"nope").is_err());
+        assert!(read_kept(&[]).is_err());
     }
 }

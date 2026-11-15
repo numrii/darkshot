@@ -21,7 +21,7 @@ pub struct ToolInfo {
 impl ToolInfo {
     /// The tooltip, naming the tool's key.
     pub fn tip(&self, key: Key) -> String {
-        self.tip.replace("{key}", key.name())
+        self.tip.replace("{key}", &crate::keys::label(key))
     }
 }
 
@@ -53,7 +53,7 @@ pub const TOOLS: [ToolInfo; 14] = [
         name: "Emoji stamp",
         icon: Icon::Emoji,
         key: Key::J,
-        tip: "Emoji stamp ({key}), Win+. in the picker for any emoji",
+        tip: "Emoji stamp ({key})",
     },
     ToolInfo {
         id: "eyedropper",

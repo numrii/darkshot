@@ -11,10 +11,11 @@ mod cursor;
 mod daemon;
 mod effects;
 mod emoji;
+mod handoff;
 mod help;
+mod keys;
 mod hdr;
 mod icons;
-mod keep;
 #[cfg(feature = "open-with")]
 mod openwith;
 mod overlay;
@@ -37,6 +38,8 @@ type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// `darkshot picture.png`  opens an image to edit (also: dragging it onto the exe).
 /// `darkshot --open`       asks which image to edit.
 /// `darkshot --clipboard`  edits the image on the clipboard.
+/// `darkshot --reopen`     reopens a kept capture, read from standard input (the tray's
+///                         Reopen last capture; see `handoff`).
 /// Add `--trace` to either to log frame timings to `darkshot-trace.log` in the temp folder
 /// (debug builds and builds with the `trace` feature only).
 fn main() -> AnyResult<()> {
@@ -52,6 +55,8 @@ fn main() -> AnyResult<()> {
     let file = args.iter().find(|a| !a.starts_with("--")).map(std::path::PathBuf::from);
     if flag("--capture") {
         overlay::run(overlay::Source::Capture)
+    } else if flag("--reopen") {
+        overlay::run(overlay::Source::Kept)
     } else if flag("--settings") {
         settings_window::run()
     } else if flag("--clipboard") {

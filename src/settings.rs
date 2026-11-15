@@ -169,7 +169,7 @@ impl Default for Settings {
             theme: ThemeSetting::System,
             include_cursor: false,
             confirm_discard: false,
-            help_level: crate::help::HelpLevel::Full,
+            help_level: crate::help::HelpLevel::Off,
             save: SaveSettings::default(),
             frame: FrameSettings::default(),
         }
@@ -303,6 +303,27 @@ impl Settings {
     }
 }
 
+/// The emoji stamped most recently, newest first, one per line. Kept in a file of
+/// its own beside the settings, so saving the settings never overwrites it.
+pub const RECENT_FILE: &str = "darkshot-recent.txt";
+
+/// The recently stamped emoji, if any were recorded.
+pub fn load_recent() -> Option<Vec<String>> {
+    let text = candidates().into_iter().find_map(|path| std::fs::read_to_string(path.with_file_name(RECENT_FILE)).ok())?;
+    let list: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Record the recently stamped emoji, where the settings go.
+pub fn store_recent(list: &[String]) {
+    let text = list.join("\n");
+    for path in candidates() {
+        if std::fs::write(path.with_file_name(RECENT_FILE), &text).is_ok() {
+            return;
+        }
+    }
+}
+
 /// Where the settings file may be, in order of preference: next to the exe (portable),
 /// then, with `appdata-fallback`, `%APPDATA%\Darkshot`.
 fn candidates() -> Vec<PathBuf> {
@@ -370,6 +391,8 @@ pub fn tool_key_allowed(key: Key) -> bool {
                 | Key::End
                 | Key::PageUp
                 | Key::PageDown
+                | Key::Plus
+                | Key::IntlBackslash
         )
 }
 
@@ -404,7 +427,7 @@ fn key_name(vk: u32) -> Option<String> {
 
 /// Named keys, as written in shortcuts (all understood by both the hotkey parser and
 /// [`key_spec`]), and their virtual-key codes.
-const NAMED_KEYS: [(&str, u32); 28] = [
+const NAMED_KEYS: [(&str, u32); 29] = [
     ("PrintScreen", 0x2C),
     ("Pause", 0x13),
     ("Insert", 0x2D),
@@ -433,6 +456,7 @@ const NAMED_KEYS: [(&str, u32); 28] = [
     ("BracketLeft", 0xDB),
     ("Backslash", 0xDC),
     ("BracketRight", 0xDD),
+    ("IntlBackslash", 0xE2),
 ];
 
 /// Modifier bits used by [`key_spec`].
@@ -469,8 +493,13 @@ pub fn key_spec(text: &str) -> Option<(u32, u8)> {
     Some((key?, mods))
 }
 
+/// The Windows key code for a punctuation key's name in a shortcut (`Backquote`),
+/// whose printed character depends on the keyboard layout.
+pub fn punctuation_key(name: &str) -> Option<u32> {
+    virtual_key(&name.to_ascii_uppercase()).filter(|vk| matches!(vk, 0xBA..=0xC0 | 0xDB..=0xDF | 0xE2))
+}
+
 /// The Windows virtual-key code for a key name as written in shortcuts.
-#[cfg_attr(not(any(test, feature = "free-shortcut")), allow(dead_code))]
 fn virtual_key(name: &str) -> Option<u32> {
     let name = name.strip_prefix("KEY").filter(|n| n.len() == 1).unwrap_or(name);
     let name = name.strip_prefix("DIGIT").filter(|n| n.len() == 1).unwrap_or(name);
@@ -511,6 +540,7 @@ fn virtual_key(name: &str) -> Option<u32> {
         "BRACKETLEFT" | "OPENBRACKET" => 0xDB,
         "BACKSLASH" => 0xDC,
         "BRACKETRIGHT" | "CLOSEBRACKET" => 0xDD,
+        "INTLBACKSLASH" => 0xE2,
         _ => return None,
     })
 }
