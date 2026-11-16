@@ -652,6 +652,18 @@ mod tests {
         t.set_tool_enabled("pen", false);
         assert_eq!(t.disabled_tools, ["pen"]);
 
+        // With no settings file, or an empty one, everything is at its default: Twilight,
+        // tool help off, nothing kept, a coarse grid with the horizon.
+        let d = Settings::from_toml("");
+        assert_eq!(d, Settings::default());
+        assert_eq!(d.theme, ThemeSetting::Twilight);
+        assert_eq!(d.help_level, crate::help::HelpLevel::Off);
+        assert_eq!(d.keep_minutes, 0);
+        assert_eq!(d.save.name, "duskshot-{date}_{time}");
+        assert_eq!(d.hotkey, DEFAULT_HOTKEY);
+        assert!(d.guides.horizon && d.guides.grid && d.guides.spacing == GridSpacing::Coarse);
+        assert!(d.disabled_tools.is_empty());
+
         // The newer options are off unless asked for, and out-of-range values are pulled in.
         let d = Settings::default();
         assert!(!d.include_cursor && !d.confirm_discard);
