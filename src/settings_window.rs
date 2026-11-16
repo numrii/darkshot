@@ -184,6 +184,8 @@ struct SettingsApp {
     /// While choosing a tool's key: that tool.
     tool_recording: Option<&'static ToolInfo>,
     message: Option<(String, bool)>,
+    /// Whether the window had focus last frame, to notice it gaining it.
+    was_focused: bool,
     /// Whether Duskshot starts with Windows. Kept in the registry, not the settings
     /// file, and changed as soon as the box is ticked.
     #[cfg(feature = "autostart")]
@@ -209,6 +211,7 @@ impl SettingsApp {
             open_with: crate::openwith::is_on(),
             tool_recording: None,
             message: None,
+            was_focused: false,
             #[cfg(feature = "autostart")]
             autostart: crate::autostart::status(),
             #[cfg(feature = "free-shortcut")]
@@ -477,6 +480,15 @@ impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         crate::theme::apply(&ctx, self.settings.theme);
+        // Windows sometimes leaves the title bar in the system's colours when the theme is
+        // set before the window is first activated, which can leave light text on a light
+        // bar. Sending the theme again whenever the window gains focus makes egui refresh
+        // the frame.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+        if focused && !self.was_focused {
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(crate::theme::window_theme(self.settings.theme)));
+        }
+        self.was_focused = focused;
         crate::icons::set_marker_color(&ctx, self.settings.marker());
         self.poll_recorder(&ctx);
         self.poll_tool_key(&ctx);

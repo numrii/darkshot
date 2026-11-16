@@ -40,6 +40,15 @@ pub fn apply(ctx: &egui::Context, setting: ThemeSetting) {
     ctx.data_mut(|d| d.insert_temp(id, setting));
 }
 
+/// The theme the native window frame (title bar) should use for `setting`.
+pub fn window_theme(setting: ThemeSetting) -> egui::SystemTheme {
+    match setting {
+        ThemeSetting::Twilight | ThemeSetting::Dark => egui::SystemTheme::Dark,
+        ThemeSetting::Light => egui::SystemTheme::Light,
+        ThemeSetting::System => egui::SystemTheme::SystemDefault,
+    }
+}
+
 fn twilight(v: &mut Visuals) {
     v.panel_fill = BACKGROUND;
     // Floating bars (the toolbar, popups) sit one step above the panels.

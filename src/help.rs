@@ -7,10 +7,11 @@
 //!   help level setting shows all of it, only the keys, or no box at all.
 //! - **The shortcut sheet** (F1, or ?), with everything in one place.
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2, vec2};
+use eframe::egui::{self, Align2, FontId, Pos2, Rect, RichText, Stroke, StrokeKind, Vec2, vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::icons::{self, Icon};
+use crate::theme;
 
 /// How much the tool box shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,7 +394,7 @@ fn flow<'a>(groups: &'a [Vec<Column>], gaps: &[f32], limit: f32) -> Vec<Vec<Piec
 /// bottom edge. Groups are set apart by a thin line. Entries wrap onto more rows when
 /// the strip would be wider than `max_width`. Returns the strip's rectangle.
 pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f32, groups: &[Vec<Entry>]) -> Rect {
-    let white = Color32::WHITE;
+    let white = theme::TEXT;
     let cap_font = FontId::monospace(STRIP_FONT);
     let word_font = FontId::proportional(WORD_FONT);
     let columns: Vec<Vec<Column>> = groups
@@ -414,7 +415,7 @@ pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f
                     let caps_width = caps.iter().map(|(_, w)| w).sum::<f32>() + 3.0 * (caps.len().saturating_sub(1)) as f32;
                     let (word, icon, what_width) = match e.what {
                         What::Word(w) => {
-                            let g = painter.layout_no_wrap(w.to_owned(), word_font.clone(), Color32::from_gray(215));
+                            let g = painter.layout_no_wrap(w.to_owned(), word_font.clone(), theme::TEXT_WEAK);
                             let width = g.size().x;
                             (Some(g), None, width)
                         }
@@ -433,10 +434,10 @@ pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f
     let size = vec2(width, height) + 2.0 * PAD;
     let min = if from_top { anchor - vec2(size.x / 2.0, 0.0) } else { anchor - vec2(size.x / 2.0, size.y) };
     let rect = Rect::from_min_size(min, size);
-    painter.rect_filled(rect, 6.0, Color32::from_black_alpha(200));
+    painter.rect_filled(rect, 6.0, theme::SURFACE.gamma_multiply(0.88));
 
-    let cap_fill = Color32::from_white_alpha(26);
-    let cap_line = Stroke::new(1.0, Color32::from_white_alpha(51));
+    let cap_fill = theme::ACCENT.gamma_multiply(0.14);
+    let cap_line = Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.32));
     for (r, row) in rows.iter().enumerate() {
         let top = rect.top() + PAD.y + r as f32 * (ROW_HEIGHT + ROW_SPACING);
         let mut x = rect.left() + PAD.x + (width - row_width(row)) / 2.0;
@@ -452,8 +453,8 @@ pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f
                 }
                 if c.active {
                     let lit = Rect::from_min_size(Pos2::new(x, top), vec2(c.width, ROW_HEIGHT)).expand2(vec2(4.0, 3.0));
-                    painter.rect_filled(lit, 4.0, Color32::from_rgba_unmultiplied(80, 150, 255, 90));
-                    painter.rect_stroke(lit, 4.0, Stroke::new(1.0, Color32::from_rgb(110, 170, 255)), StrokeKind::Inside);
+                    painter.rect_filled(lit, 4.0, theme::ACCENT.gamma_multiply(0.30));
+                    painter.rect_stroke(lit, 4.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
                 }
                 let caps_width = c.caps.iter().map(|(_, w)| w).sum::<f32>() + 3.0 * (c.caps.len().saturating_sub(1)) as f32;
                 let mut cx = x + (c.width - caps_width) / 2.0;
@@ -470,7 +471,7 @@ pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f
                 }
                 if let Some(icon) = c.icon {
                     let area = Rect::from_center_size(what.center(), Vec2::splat(WHAT_HEIGHT));
-                    icons::paint(painter, area, icon, Color32::from_gray(225), Color32::BLACK);
+                    icons::paint(painter, area, icon, theme::TEXT, theme::BACKGROUND);
                 }
                 x += c.width;
             }
