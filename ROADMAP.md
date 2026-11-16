@@ -45,7 +45,7 @@ annotations):
 
 ## Done
 
-- Next release (1.6.0):
+- Version 1.6.0:
   - Turn guides: while the round handle is dragged, a level horizon through the middle
     of the region and a grid are drawn over it, fixed on screen so the capture turns
     under them. Settings choose horizon, grid, both or neither, and the grid spacing
