@@ -3,7 +3,7 @@
 A screenshot and annotation tool for Windows. Captures go to the clipboard or to a
 file you save; Duskshot has no upload feature and needs no installer.
 
-![Duskshot's capture overlay: a selected region with numbered steps, arrows, a dashed circle, a highlighted label and a pixelated figure, above the toolbar](docs/screenshot.jpg)
+![Duskshot's capture overlay: a selected region with numbered steps, text, a highlighted label, stamps, an arrow, a dotted circle and a pixelated figure, above the toolbar](docs/screenshot.jpg)
 
 <sub>Background photo: "Alone in the unspoilt wilderness" by David Marcu, CC0, via Wikimedia Commons.</sub>
 
