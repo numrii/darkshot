@@ -704,7 +704,7 @@ Blueberry muffin 3.25"),
 
     #[test]
     fn reads_qr_codes() {
-        let url = "https://example.com/darkshot?q=1";
+        let url = "https://example.com/duskshot?q=1";
         let one = qr(&qr_image(url, 4)).unwrap();
         assert_eq!(joined(&one), url);
         // Its box covers the code, inside the quiet zone.

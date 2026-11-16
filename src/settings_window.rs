@@ -1,4 +1,4 @@
-//! The settings window (`darkshot --settings`), opened from the tray menu.
+//! The settings window (`duskshot --settings`), opened from the tray menu.
 
 use eframe::egui::{self, Color32, Key, RichText, Sense, Vec2};
 
@@ -134,7 +134,7 @@ mod recorder {
 pub fn run() -> AnyResult<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Darkshot settings")
+            .with_title("Duskshot settings")
             .with_icon(crate::appicon::window_icon())
             .with_inner_size([880.0, 700.0])
             .with_min_inner_size([680.0, 300.0])
@@ -143,7 +143,7 @@ pub fn run() -> AnyResult<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Darkshot settings",
+        "Duskshot settings",
         options,
         Box::new(|cc| {
             crate::overlay::setup_text(&cc.egui_ctx);
@@ -178,14 +178,14 @@ struct SettingsApp {
     recorder: Option<Recorder>,
     /// The shortcut being recorded.
     recording_for: Which,
-    /// Whether Explorer offers Darkshot under Open with. Kept in the registry, not the
+    /// Whether Explorer offers Duskshot under Open with. Kept in the registry, not the
     /// settings file, and changed as soon as the box is ticked.
     #[cfg(feature = "open-with")]
     open_with: bool,
     /// While choosing a tool's key: that tool.
     tool_recording: Option<&'static ToolInfo>,
     message: Option<(String, bool)>,
-    /// Whether Darkshot starts with Windows. Kept in the registry, not the settings
+    /// Whether Duskshot starts with Windows. Kept in the registry, not the settings
     /// file, and changed as soon as the box is ticked.
     #[cfg(feature = "autostart")]
     autostart: crate::autostart::Status,
@@ -317,7 +317,7 @@ impl SettingsApp {
     fn startup_setting(&mut self, ui: &mut egui::Ui) {
         use crate::autostart::{self, Status};
         let mut on = self.autostart == Status::On;
-        let toggle = ui.checkbox(&mut on, "Start with Windows").on_hover_text("Darkshot starts in the tray when you sign in.");
+        let toggle = ui.checkbox(&mut on, "Start with Windows").on_hover_text("Duskshot starts in the tray when you sign in.");
         if toggle.changed() {
             match autostart::set(on) {
                 Ok(()) => self.autostart = autostart::status(),
@@ -326,7 +326,7 @@ impl SettingsApp {
         }
         if let Status::Elsewhere(path) = &self.autostart {
             let weak = ui.visuals().weak_text_color();
-            let text = "Another copy of Darkshot starts with Windows. Tick to start this one instead.";
+            let text = "Another copy of Duskshot starts with Windows. Tick to start this one instead.";
             ui.label(RichText::new(text).color(weak).small()).on_hover_text(path.as_str());
         }
     }
@@ -341,7 +341,7 @@ impl SettingsApp {
             let shortcut = crate::keys::shortcut_label(&self.settings.hotkey);
             let mut on = self.freed.contains(letter);
             let tip = format!(
-                "Windows stops using Win+{letter} and its combinations with Ctrl, Alt or Shift, so Darkshot \
+                "Windows stops using Win+{letter} and its combinations with Ctrl, Alt or Shift, so Duskshot \
                  can use {shortcut}. Untick to give them back. Doesn't work on every version of Windows."
             );
             ui.horizontal(|ui| {
@@ -451,11 +451,11 @@ fn color_setting(ui: &mut egui::Ui, hex: &mut String, fallback: Color32, alpha: 
     response
 }
 
-/// Darkshot's source and releases, from Cargo.toml.
+/// Duskshot's source and releases, from Cargo.toml.
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Hand this one fixed address to Windows, which opens it in the default browser.
-/// Darkshot itself still connects to nothing, and nothing it reads (a QR code, say) is
+/// Duskshot itself still connects to nothing, and nothing it reads (a QR code, say) is
 /// ever opened: this is the only address it opens, and only when clicked.
 fn open_repository() {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -507,11 +507,11 @@ impl eframe::App for SettingsApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let link = ui
                         .link(REPOSITORY.trim_start_matches("https://"))
-                        .on_hover_text("Opens Darkshot's page on GitHub in your browser");
+                        .on_hover_text("Opens Duskshot's page on GitHub in your browser");
                     if link.clicked() {
                         open_repository();
                     }
-                    ui.label(RichText::new(concat!("Darkshot ", env!("CARGO_PKG_VERSION"))).color(weak));
+                    ui.label(RichText::new(concat!("Duskshot ", env!("CARGO_PKG_VERSION"))).color(weak));
                 });
             });
             if let Some((text, error)) = &self.message {
@@ -629,7 +629,7 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             let mut keep = self.settings.keep_minutes > 0;
             let tip = "Reopen it from the tray menu or its shortcut. Kept in memory only, until the next \
-                       capture or until Darkshot quits.";
+                       capture or until Duskshot quits.";
             if ui.checkbox(&mut keep, "Keep the last capture for").on_hover_text(tip).changed() {
                 self.settings.keep_minutes = if keep { 5 } else { 0 };
             }

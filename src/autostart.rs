@@ -1,4 +1,4 @@
-//! Starting Darkshot when you sign in to Windows (`autostart` feature).
+//! Starting Duskshot when you sign in to Windows (`autostart` feature).
 //!
 //! Uses the current user's `Run` key, so it needs no administrator rights and affects
 //! only this user. The entry holds the exe's full path; if the exe is moved, the old
@@ -13,14 +13,14 @@ use windows_sys::Win32::System::Registry::{
 };
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const VALUE_NAME: &str = "Darkshot";
+const VALUE_NAME: &str = "Duskshot";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Off,
     /// On, starting this exe.
     On,
-    /// On, but starting a Darkshot at another path.
+    /// On, but starting a Duskshot at another path.
     Elsewhere(String),
 }
 
@@ -37,7 +37,7 @@ fn quote(path: &Path) -> String {
     format!("\"{}\"", path.display())
 }
 
-/// Whether Darkshot starts with Windows, and if so whether it is this exe.
+/// Whether Duskshot starts with Windows, and if so whether it is this exe.
 pub fn status() -> Status {
     let Some(current) = read() else { return Status::Off };
     match command() {
@@ -98,6 +98,6 @@ mod tests {
 
     #[test]
     fn quotes_paths_with_spaces() {
-        assert_eq!(quote(Path::new(r"C:\My Tools\darkshot.exe")), r#""C:\My Tools\darkshot.exe""#);
+        assert_eq!(quote(Path::new(r"C:\My Tools\duskshot.exe")), r#""C:\My Tools\duskshot.exe""#);
     }
 }

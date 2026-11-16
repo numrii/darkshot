@@ -1,9 +1,9 @@
 [package]
-name = "darkshot"
+name = "duskshot"
 version = "1.5.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/numrii/darkshot"
+repository = "https://github.com/numrii/duskshot"
 description = "Privacy-first screenshot and annotation tool: clipboard or file, never uploaded"
 
 # Two builds from one source. The default is the restrictive build: settings only
@@ -15,19 +15,19 @@ personal = ["free-shortcut", "appdata-fallback", "trace", "autostart", "open-wit
 # A setting that frees a Win+ shortcut Windows keeps for itself (Win+Shift+S), through
 # the current user's DisabledHotkeys registry value, so it can be registered.
 free-shortcut = []
-# Store settings in %APPDATA%\Darkshot when the exe's folder cannot be written.
+# Store settings in %APPDATA%\Duskshot when the exe's folder cannot be written.
 appdata-fallback = []
-# `--trace` writes frame timings to darkshot-trace.log in the temp folder.
+# `--trace` writes frame timings to duskshot-trace.log in the temp folder.
 trace = []
 # A "Start with Windows" setting, stored in the current user's Run registry key.
 autostart = []
-# A setting that offers Darkshot under Explorer's "Open with" for PNG and JPEG files,
+# A setting that offers Duskshot under Explorer's "Open with" for PNG and JPEG files,
 # stored under the current user's HKCU\Software\Classes registry key.
 open-with = []
 
 [dependencies]
 arboard = "3.7.0"
-# Only what Darkshot uses. The default features include "links", which compiles in
+# Only what Duskshot uses. The default features include "links", which compiles in
 # code to open URLs in a browser (the webbrowser crate); a privacy-first tool has no
 # business with that. Also off: Linux backends, web screen reader, system font lookup.
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wgpu"] }
@@ -35,7 +35,7 @@ global-hotkey = "0.10.0"
 # Puts emoji sequences (skin tones, flags, families) together for emoji stamps. Already
 # in the build through egui, which shapes its own text with it.
 harfrust = "0.12.0"
-# Only the formats Darkshot reads or writes (PNG and JPEG output, the ICO app icon).
+# Only the formats Duskshot reads or writes (PNG and JPEG output, the ICO app icon).
 # The default set compiles in a dozen more decoders and an AVIF encoder.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "ico"] }
 raw-window-handle = "0.6"

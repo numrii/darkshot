@@ -1,4 +1,4 @@
-# Sums up darkshot-perf.log, the resource log `--trace` writes (see src/perf.rs).
+# Sums up duskshot-perf.log, the resource log `--trace` writes (see src/perf.rs).
 #
 #   scripts\perf-summary.ps1                  the log in the temp folder
 #   scripts\perf-summary.ps1 path\to\perf.log another one
@@ -8,9 +8,9 @@
 # first capture or two that then stays flat is not. For the capture windows: how long
 # each took from start until it was on screen, and its memory and GPU memory then.
 
-param([string]$Path = (Join-Path $env:TEMP 'darkshot-perf.log'))
+param([string]$Path = (Join-Path $env:TEMP 'duskshot-perf.log'))
 
-if (-not (Test-Path $Path)) { Write-Error "No log at $Path. Run Darkshot with --trace first."; exit 1 }
+if (-not (Test-Path $Path)) { Write-Error "No log at $Path. Run Duskshot with --trace first."; exit 1 }
 $rows = Import-Csv $Path | ForEach-Object {
     foreach ($n in 'time_ms','private_kb','working_set_kb','peak_working_set_kb','cpu_ms','handles',
                    'gdi_objects','user_objects','gpu_local_kb','gpu_shared_kb','sample_us') {

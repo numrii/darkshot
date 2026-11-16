@@ -1,10 +1,10 @@
-//! "Open with" in Explorer (`open-with` feature): Darkshot offered for PNG and JPEG
+//! "Open with" in Explorer (`open-with` feature): Duskshot offered for PNG and JPEG
 //! files.
 //!
 //! Registered for the current user only, under `HKCU\Software\Classes`, so it needs no
-//! administrator rights: the app itself (`Applications\darkshot.exe`, with the types it
-//! opens) and a file type (`Darkshot.Image`) listed under each extension's
-//! `OpenWithProgids`. Nothing becomes the default app; Windows only lists Darkshot.
+//! administrator rights: the app itself (`Applications\duskshot.exe`, with the types it
+//! opens) and a file type (`Duskshot.Image`) listed under each extension's
+//! `OpenWithProgids`. Nothing becomes the default app; Windows only lists Duskshot.
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
@@ -12,9 +12,9 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
-const APP_KEY: &str = r"Software\Classes\Applications\darkshot.exe";
-const PROG_ID: &str = "Darkshot.Image";
-const PROG_KEY: &str = r"Software\Classes\Darkshot.Image";
+const APP_KEY: &str = r"Software\Classes\Applications\duskshot.exe";
+const PROG_ID: &str = "Duskshot.Image";
+const PROG_KEY: &str = r"Software\Classes\Duskshot.Image";
 const EXTENSIONS: [&str; 3] = [".png", ".jpg", ".jpeg"];
 
 fn wide(s: &str) -> Vec<u16> {
@@ -71,9 +71,9 @@ pub fn is_on() -> bool {
 pub fn set(enabled: bool) -> std::io::Result<()> {
     if enabled {
         let command = command()?;
-        set_value(APP_KEY, Some("FriendlyAppName"), "Darkshot")?;
+        set_value(APP_KEY, Some("FriendlyAppName"), "Duskshot")?;
         set_value(&format!(r"{APP_KEY}\shell\open\command"), None, &command)?;
-        set_value(PROG_KEY, None, "Image (Darkshot)")?;
+        set_value(PROG_KEY, None, "Image (Duskshot)")?;
         set_value(&format!(r"{PROG_KEY}\shell\open\command"), None, &command)?;
         for ext in EXTENSIONS {
             set_value(&format!(r"{APP_KEY}\SupportedTypes"), Some(ext), "")?;

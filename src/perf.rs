@@ -1,5 +1,5 @@
 //! Resource log for `--trace`: memory, CPU, handles and GPU memory, one line per sample,
-//! appended to `darkshot-perf.log` in the temp folder.
+//! appended to `duskshot-perf.log` in the temp folder.
 //!
 //! Made for comparing versions and finding leaks, not for watching the app live, so it
 //! samples at moments that can be compared from run to run: the tray at start, after each
@@ -49,7 +49,7 @@ pub fn autoclose() -> bool {
 fn sink() -> Option<&'static Mutex<File>> {
     static SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
     SINK.get_or_init(|| {
-        let path = std::env::temp_dir().join("darkshot-perf.log");
+        let path = std::env::temp_dir().join("duskshot-perf.log");
         // Appended, not replaced: the tray and every capture window write to the same
         // log, and a log that spans versions is the point.
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;

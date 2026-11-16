@@ -209,7 +209,7 @@ pub fn help_mark(ui: &mut egui::Ui) -> Response {
 }
 
 fn marker_color_id() -> egui::Id {
-    egui::Id::unique("darkshot-marker-colour")
+    egui::Id::unique("duskshot-marker-colour")
 }
 
 /// The highlighter colour the highlighter icon shows.

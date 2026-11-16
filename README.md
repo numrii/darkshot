@@ -1,20 +1,20 @@
-# Darkshot
+# Duskshot
 
 A screenshot and annotation tool for Windows. Captures go to the clipboard or to a
-file you save; Darkshot has no upload feature and needs no installer.
+file you save; Duskshot has no upload feature and needs no installer.
 
-![Darkshot's capture overlay: a selected region with numbered steps, arrows, a dashed circle, a highlighted label and a pixelated figure, above the toolbar](docs/screenshot.jpg)
+![Duskshot's capture overlay: a selected region with numbered steps, arrows, a dashed circle, a highlighted label and a pixelated figure, above the toolbar](docs/screenshot.jpg)
 
 <sub>Background photo: "Alone in the unspoilt wilderness" by David Marcu, CC0, via Wikimedia Commons.</sub>
 
 ## Download
 
-Get an exe from the [Releases page](https://github.com/numrii/darkshot/releases/latest)
+Get an exe from the [Releases page](https://github.com/numrii/duskshot/releases/latest)
 and run it from any folder you can write to. There are two builds (see
 [Builds](#builds)):
 
-- `darkshot-restrictive-<version>.exe`: changes nothing outside its own folder.
-- `darkshot-personal-<version>.exe`: adds a few registry-based conveniences.
+- `duskshot-restrictive-<version>.exe`: changes nothing outside its own folder.
+- `duskshot-personal-<version>.exe`: adds a few registry-based conveniences.
 
 The exes are built by GitHub Actions from the tagged source and listed in
 `SHA256SUMS.txt`. They are not code-signed, so Windows SmartScreen may warn on first
@@ -22,12 +22,12 @@ run (More info → Run anyway). To verify a download with the
 [GitHub CLI](https://cli.github.com):
 
 ```
-gh attestation verify darkshot-restrictive-<version>.exe --repo numrii/darkshot
+gh attestation verify duskshot-restrictive-<version>.exe --repo numrii/duskshot
 ```
 
 ## Usage
 
-Darkshot runs in the notification area. Press the capture shortcut or click the tray
+Duskshot runs in the notification area. Press the capture shortcut or click the tray
 icon to capture; right-click the icon for Open image…, Edit clipboard image, Reopen
 last capture, Settings and Quit.
 
@@ -77,7 +77,7 @@ write outside their own folder:
 
 | | Restrictive (default) | Personal |
 | --- | --- | --- |
-| Settings | `darkshot.toml` beside the exe | Same; falls back to `%APPDATA%\Darkshot` if the folder is read-only |
+| Settings | `duskshot.toml` beside the exe | Same; falls back to `%APPDATA%\Duskshot` if the folder is read-only |
 | Registry | Never written | Only when you tick these, under `HKCU`: free a Win+ shortcut, start with Windows, list under Explorer's Open with |
 | Logs | None | Only with `--trace` (see [Performance logging](#performance-logging)) |
 
@@ -86,7 +86,7 @@ shortcut to it in `shell:startup`.
 
 ## Privacy and security
 
-- Darkshot contains no networking code. eframe's link-opening feature is compiled out;
+- Duskshot contains no networking code. eframe's link-opening feature is compiled out;
   the GitHub link in Settings opens in your browser when clicked. Links in QR codes
   are copied, never opened.
 - Copied images and text are marked to be excluded from Windows clipboard history
@@ -115,8 +115,8 @@ exe into `target\personal\release`. The exe is self-contained.
 
 Personal and debug builds accept:
 
-- `--trace`: logs memory, CPU, handles and GPU memory to `%TEMP%\darkshot-perf.log`,
-  and frame timings to `%TEMP%\darkshot-trace.log`.
+- `--trace`: logs memory, CPU, handles and GPU memory to `%TEMP%\duskshot-perf.log`,
+  and frame timings to `%TEMP%\duskshot-trace.log`.
 - `--trace-cycles <n>`: opens and closes the capture window `n` times, logging each.
 
 `scripts\perf-summary.ps1` summarises the log.

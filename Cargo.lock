@@ -881,31 +881,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "darkshot"
-version = "1.5.0"
-dependencies = [
- "arboard",
- "eframe",
- "embed-resource",
- "global-hotkey",
- "harfrust",
- "image",
- "qrcode",
- "raw-window-handle",
- "rfd",
- "rqrr",
- "serde",
- "tiny-skia 0.12.0",
- "toml 1.2.1+spec-1.1.0",
- "tray-icon",
- "ttf-parser",
- "windows",
- "windows-sys 0.61.2",
- "winit",
- "xcap",
-]
-
-[[package]]
 name = "dirs"
 version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1038,6 +1013,31 @@ checksum = "ecc8e1361066d91f5ffccff060a3c3be9c3ecde15be2959c1937595f7a82a9f8"
 dependencies = [
  "libc",
  "linux-raw-sys 0.9.4",
+]
+
+[[package]]
+name = "duskshot"
+version = "1.5.0"
+dependencies = [
+ "arboard",
+ "eframe",
+ "embed-resource",
+ "global-hotkey",
+ "harfrust",
+ "image",
+ "qrcode",
+ "raw-window-handle",
+ "rfd",
+ "rqrr",
+ "serde",
+ "tiny-skia 0.12.0",
+ "toml 1.2.1+spec-1.1.0",
+ "tray-icon",
+ "ttf-parser",
+ "windows",
+ "windows-sys 0.61.2",
+ "winit",
+ "xcap",
 ]
 
 [[package]]

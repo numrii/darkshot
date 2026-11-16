@@ -47,8 +47,8 @@ use crate::AnyResult;
 const GRAB_TOLERANCE: f32 = 6.0;
 const HANDLE_SIZE: f32 = 7.0;
 
-/// Where trace lines go: `--trace` writes `darkshot-trace.log` in the temp folder,
-/// the `DARKSHOT_TRACE` environment variable writes to stderr. `None` = tracing off.
+/// Where trace lines go: `--trace` writes `duskshot-trace.log` in the temp folder,
+/// the `DUSKSHOT_TRACE` environment variable writes to stderr. `None` = tracing off.
 /// Only builds with the `trace` feature, and debug builds, can trace at all.
 fn trace_sink() -> Option<&'static Mutex<Box<dyn Write + Send>>> {
     if !cfg!(any(feature = "trace", debug_assertions)) {
@@ -57,10 +57,10 @@ fn trace_sink() -> Option<&'static Mutex<Box<dyn Write + Send>>> {
     static SINK: OnceLock<Option<Mutex<Box<dyn Write + Send>>>> = OnceLock::new();
     SINK.get_or_init(|| {
         if std::env::args().any(|a| a == "--trace") {
-            let path = std::env::temp_dir().join("darkshot-trace.log");
+            let path = std::env::temp_dir().join("duskshot-trace.log");
             let file = std::fs::File::create(path).ok()?;
             Some(Mutex::new(Box::new(std::io::LineWriter::new(file)) as Box<dyn Write + Send>))
-        } else if std::env::var_os("DARKSHOT_TRACE").is_some() {
+        } else if std::env::var_os("DUSKSHOT_TRACE").is_some() {
             Some(Mutex::new(Box::new(std::io::stderr()) as Box<dyn Write + Send>))
         } else {
             None
@@ -169,7 +169,7 @@ pub fn run(source: Source) -> AnyResult<()> {
     let event_loop = EventLoop::<eframe::UserEvent>::with_user_event().build()?;
     event_loop.listen_device_events(DeviceEvents::Never);
     let mut app = eframe::create_native(
-        "Darkshot",
+        "Duskshot",
         options,
         Box::new(move |cc| {
             let mut overlay = Overlay::new(cc, desktop, &settings);
@@ -284,7 +284,7 @@ fn read_kept(bytes: &[u8]) -> crate::handoff::Result<(Desktop, Kept)> {
     Ok((desktop, kept))
 }
 
-/// How Darkshot's windows use the GPU, set to hold as little as it can:
+/// How Duskshot's windows use the GPU, set to hold as little as it can:
 /// - Direct3D 12 alone. By default wgpu starts Vulkan, Direct3D 12 and OpenGL to choose
 ///   between them, which alone commits over 100 MB, and then picks Vulkan, whose driver
 ///   reserves several times the graphics memory. Without a Direct3D 12 GPU, the usual
@@ -328,7 +328,7 @@ fn has_dx12_gpu() -> bool {
 fn complain(message: &str) -> AnyResult<()> {
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
-        .set_title("Darkshot")
+        .set_title("Duskshot")
         .set_description(message)
         .show();
     Ok(())
@@ -342,7 +342,7 @@ fn open_file(path: &std::path::Path) -> AnyResult<Desktop> {
     let unreadable = |e: image::ImageError| -> Box<dyn std::error::Error> {
         match e {
             image::ImageError::Unsupported(_) | image::ImageError::Decoding(_) => {
-                "Darkshot opens PNG and JPEG images, and could not read this file as either.".into()
+                "Duskshot opens PNG and JPEG images, and could not read this file as either.".into()
             }
             e => e.into(),
         }
@@ -2438,7 +2438,7 @@ impl Overlay {
         };
         let mut copy = None;
         let mut close = false;
-        egui::Area::new(egui::Id::unique("darkshot-reading-panel"))
+        egui::Area::new(egui::Id::unique("duskshot-reading-panel"))
             .order(egui::Order::Foreground)
             .pivot(pivot)
             .fixed_pos(pos)
@@ -2537,7 +2537,7 @@ impl Overlay {
 
     fn copy_text_to_clipboard(text: &str) -> AnyResult<()> {
         #[cfg(debug_assertions)]
-        if let Some(path) = std::env::var_os("DARKSHOT_COPY_TO") {
+        if let Some(path) = std::env::var_os("DUSKSHOT_COPY_TO") {
             std::fs::write(path, text)?;
             return Ok(());
         }
@@ -2559,7 +2559,7 @@ impl Overlay {
         } else {
             (toolbar.right_top() - vec2(0.0, 6.0), Align2::RIGHT_BOTTOM)
         };
-        egui::Area::new(egui::Id::unique("darkshot-decor-panel"))
+        egui::Area::new(egui::Id::unique("duskshot-decor-panel"))
             .order(egui::Order::Foreground)
             .pivot(pivot)
             .fixed_pos(pos)
@@ -2616,7 +2616,7 @@ impl Overlay {
     /// (in points). Returns `Some(true)` to discard and close, `Some(false)` to go back.
     fn confirm_panel(&self, ctx: &egui::Context, monitor: Rect) -> Option<bool> {
         let mut answer = None;
-        egui::Area::new(egui::Id::unique("darkshot-confirm-discard"))
+        egui::Area::new(egui::Id::unique("duskshot-confirm-discard"))
             .order(egui::Order::Foreground)
             .pivot(Align2::CENTER_CENTER)
             .fixed_pos(monitor.center())
@@ -2647,7 +2647,7 @@ impl Overlay {
         // can inspect the output without touching the user's clipboard. Debug builds
         // only: in a release build Copy always goes to the clipboard.
         #[cfg(debug_assertions)]
-        if let Some(path) = std::env::var_os("DARKSHOT_COPY_TO") {
+        if let Some(path) = std::env::var_os("DUSKSHOT_COPY_TO") {
             img.save(path)?;
             return Ok(());
         }
@@ -3039,7 +3039,7 @@ impl Overlay {
 
     fn toolbar(&mut self, ctx: &egui::Context, pos: Pos2, pivot: Align2, within: Rect) -> ToolbarOutput {
         let mut out = ToolbarOutput::default();
-        let shown = egui::Area::new(egui::Id::unique("darkshot-toolbar"))
+        let shown = egui::Area::new(egui::Id::unique("duskshot-toolbar"))
             .order(egui::Order::Foreground)
             .pivot(pivot)
             .fixed_pos(pos)
@@ -3167,7 +3167,7 @@ impl Overlay {
         };
         let mut save = false;
         let options = &mut self.save_options;
-        egui::Area::new(egui::Id::unique("darkshot-save-panel"))
+        egui::Area::new(egui::Id::unique("duskshot-save-panel"))
             .order(egui::Order::Foreground)
             .pivot(pivot)
             .fixed_pos(pos)
@@ -3946,9 +3946,9 @@ impl eframe::App for Overlay {
                     avoid.push(Rect::from_two_pos(c, Pos2::new(c.x, edge)).expand(20.0));
                 }
                 for (open, name) in [
-                    (self.save_open, "darkshot-save-panel"),
-                    (self.decor_open, "darkshot-decor-panel"),
-                    (self.reading.is_some(), "darkshot-reading-panel"),
+                    (self.save_open, "duskshot-save-panel"),
+                    (self.decor_open, "duskshot-decor-panel"),
+                    (self.reading.is_some(), "duskshot-reading-panel"),
                 ] {
                     if let Some(r) = ctx.memory(|m| m.area_rect(egui::Id::unique(name))).filter(|_| open) {
                         avoid.push(r);
@@ -4442,7 +4442,7 @@ mod tests {
 
     #[test]
     fn opens_image_files() {
-        let dir = std::env::temp_dir().join(format!("darkshot-open-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("duskshot-open-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("shot.png");
         let img = RgbaImage::from_fn(30, 20, |x, y| image::Rgba([x as u8 * 8, y as u8 * 12, 200, 255]));

@@ -1,6 +1,6 @@
-# Darkshot roadmap
+# Duskshot roadmap
 
-Darkshot is a privacy-first screenshot tool: captures leave the app only through the
+Duskshot is a privacy-first screenshot tool: captures leave the app only through the
 clipboard or a file on disk. There is no upload and no network code.
 
 ## Next
@@ -12,8 +12,8 @@ capture contains or how long it is kept.
   not look washed out. Not yet possible here.
 
 Considered and left out: scrolling capture (it would mean sending scroll input to other
-apps, which Darkshot avoids), GIF and video recording, uploads of any kind, and checking
-for or downloading updates (that needs network code, which Darkshot has none of).
+apps, which Duskshot avoids), GIF and video recording, uploads of any kind, and checking
+for or downloading updates (that needs network code, which Duskshot has none of).
 
 If GIF recording is reconsidered, this is what it would take (looked into in November
 2026; roughly two weeks for recording and saving, three to four with trimming and
@@ -45,6 +45,11 @@ annotations):
 
 ## Done
 
+- Renamed from Darkshot to Duskshot, because another screenshot app already used the
+  name. The exe, settings file (`duskshot.toml`), `%APPDATA%\Duskshot` folder, registry
+  entries and repository all follow. There is no migration: to carry settings over,
+  rename the old `darkshot.toml` and turn Start with Windows and Open with off in the
+  old version first.
 - Version 1.4.0:
   - The emoji stamp has a full emoji picker: recent emoji, a tab per group, and a
     search by name, tag or shortcode (Unicode's list and GitHub's gemoji). Kaomoji
@@ -78,7 +83,7 @@ annotations):
   tool, sizes remembered per tool, Enter finishes a text (Shift+Enter for a new line),
   and help on screen: the hotkey strip, the tool box beside the region, the F1 sheet
   and the Tool help setting.
-- Edit an existing image: a PNG or JPEG (dragged onto the exe, `darkshot.exe
+- Edit an existing image: a PNG or JPEG (dragged onto the exe, `duskshot.exe
   picture.png`, or Open image… in the tray menu) or the clipboard image (Edit clipboard
   image) opens in the overlay with the whole image selected. No window snapping; Save
   suggests the original name plus `-edited`, in its folder and format. Large images are
@@ -113,7 +118,7 @@ annotations):
   when the region reads as nothing or gibberish, it is read again turned a quarter, half
   and three-quarter turn, and the reading that looks most like words is kept.
 - Version and a link to the GitHub repository in Settings. The link is opened by the
-  browser, only when clicked; Darkshot itself still connects to nothing.
+  browser, only when clicked; Duskshot itself still connects to nothing.
 - Include the mouse cursor (a setting, off by default): the cursor is drawn into the
   capture where it was when the capture was asked for.
 - Ask before discarding (a setting, off by default): Esc or Close asks first when a
@@ -132,7 +137,7 @@ annotations):
 - Capture region with resize handles, move, arrow-key nudge, Ctrl+A for the current
   monitor; Shift constrains, Alt works from the centre.
 - Release build: the app icon embedded in the exe and used for the tray and settings
-  window; whole-program optimisation; eframe trimmed to the features Darkshot uses, so
+  window; whole-program optimisation; eframe trimmed to the features Duskshot uses, so
   no URL-opening code (and no networking crate at all) is compiled in.
 - Numbered step markers (N): click to place; each new one takes the next number.
 - Eyedropper (I): picks a colour from the capture itself. A round spotlight shows the
@@ -151,7 +156,7 @@ annotations):
   restart Explorer and a way to give letters back.
 - Enabled tools: Settings lists every tool with its icon; unticked ones leave the
   toolbar and their keys do nothing. All are on by default.
-- Start with Windows (personal build): a Settings checkbox that adds Darkshot to the
+- Start with Windows (personal build): a Settings checkbox that adds Duskshot to the
   current user's Run key, no administrator rights needed. Either build can instead be
   started from a shortcut in the Startup folder (see the README).
 - Privacy hardening: solid redactions are applied after pixelate and blur, so an
@@ -170,7 +175,7 @@ annotations):
 - Blur tool: pixelate, Gaussian or a solid redaction.
 - Context-based toolbar options that keep the toolbar's width fixed.
 - Copy to clipboard; save as PNG or JPEG (with quality) through a save panel.
-- Settings file next to the exe (the personal build falls back to `%APPDATA%\Darkshot`)
+- Settings file next to the exe (the personal build falls back to `%APPDATA%\Duskshot`)
   and a settings window in two columns: shortcut (including the Windows key), default
   colours, light, dark or system theme, file name, format, quality and default folder,
   with the enabled tools on the right. The window can be resized and scrolls; Save and

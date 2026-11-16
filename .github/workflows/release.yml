@@ -1,11 +1,11 @@
-# Builds both versions of Darkshot and publishes them as a GitHub release.
+# Builds both versions of Duskshot and publishes them as a GitHub release.
 #
 # Start it by pushing a version tag that matches the version in Cargo.toml:
 #   git tag v1.2.3 && git push origin v1.2.3
 #
 # The exes are built here on GitHub's machines from the tagged commit, not on anyone's
 # own computer. Each one gets a build provenance attestation, which anyone can check with
-#   gh attestation verify darkshot-restrictive-1.2.3.exe --repo numrii/darkshot
+#   gh attestation verify duskshot-restrictive-1.2.3.exe --repo numrii/duskshot
 name: Release
 
 on:
@@ -54,8 +54,8 @@ jobs:
       - name: Collect the files
         run: |
           New-Item -ItemType Directory out | Out-Null
-          Copy-Item target/release/darkshot.exe "out/darkshot-restrictive-$env:VERSION.exe"
-          Copy-Item target/personal/release/darkshot.exe "out/darkshot-personal-$env:VERSION.exe"
+          Copy-Item target/release/duskshot.exe "out/duskshot-restrictive-$env:VERSION.exe"
+          Copy-Item target/personal/release/duskshot.exe "out/duskshot-personal-$env:VERSION.exe"
           Get-ChildItem out/*.exe | ForEach-Object {
             "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           } | Set-Content out/SHA256SUMS.txt
@@ -74,4 +74,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" out/*.exe out/SHA256SUMS.txt `
-            --title "Darkshot $env:VERSION" --generate-notes --verify-tag
+            --title "Duskshot $env:VERSION" --generate-notes --verify-tag

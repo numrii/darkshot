@@ -3,8 +3,8 @@
 //! Windows keeps many Win+letter combinations for itself (Win+Shift+S opens its own
 //! snipping tool), so they cannot be registered as an ordinary hotkey. The current
 //! user's `DisabledHotkeys` value lists letters whose Win+ shortcuts Explorer should
-//! leave alone; with the letter there, Darkshot registers the shortcut like any other.
-//! Windows then also keeps the Start menu shut when it is pressed, so Darkshot needs no
+//! leave alone; with the letter there, Duskshot registers the shortcut like any other.
+//! Windows then also keeps the Start menu shut when it is pressed, so Duskshot needs no
 //! keyboard hook and never sends a key press of its own.
 //!
 //! Explorer reads the value when it starts, so a change takes effect after Explorer

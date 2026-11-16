@@ -35,7 +35,7 @@ impl Cursor {
                 return None;
             }
             // Starting the capture process makes Windows show the arrow with a busy ring
-            // for a moment. That is Darkshot's doing, not what was on screen: draw the
+            // for a moment. That is Duskshot's doing, not what was on screen: draw the
             // plain arrow instead.
             let mut handle = info.hCursor;
             if handle == LoadCursorW(std::ptr::null_mut(), IDC_APPSTARTING) {

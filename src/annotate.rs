@@ -1140,12 +1140,12 @@ mod tests {
 }
 
 /// Writes a sheet of every stroke style and arrowhead, drawn through the real output
-/// path, for eyeballing: `DARKSHOT_PREVIEW=out.png cargo test style_sheet -- --ignored`.
+/// path, for eyeballing: `DUSKSHOT_PREVIEW=out.png cargo test style_sheet -- --ignored`.
 #[cfg(test)]
 #[test]
 #[ignore]
 fn style_sheet() {
-    let Some(path) = std::env::var_os("DARKSHOT_PREVIEW") else { return };
+    let Some(path) = std::env::var_os("DUSKSHOT_PREVIEW") else { return };
     let mut img = RgbaImage::from_pixel(560, 400, image::Rgba([246, 246, 246, 255]));
     let mut shapes = Vec::new();
     let base = |kind, a: (f32, f32), b: (f32, f32), width| Annotation {

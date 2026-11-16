@@ -1,8 +1,8 @@
-//! User settings, stored as `darkshot.toml` next to the exe so Darkshot stays
+//! User settings, stored as `duskshot.toml` next to the exe so Duskshot stays
 //! portable. With the `appdata-fallback` feature, if that folder cannot be written
-//! (say, the exe is in Program Files), the file goes to `%APPDATA%\Darkshot` instead;
+//! (say, the exe is in Program Files), the file goes to `%APPDATA%\Duskshot` instead;
 //! without it, saving settings fails with an error. Missing or unreadable values fall back
-//! to their defaults, so an old or hand-edited file never stops Darkshot starting.
+//! to their defaults, so an old or hand-edited file never stops Duskshot starting.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::save::Format;
 
-pub const FILE_NAME: &str = "darkshot.toml";
+pub const FILE_NAME: &str = "duskshot.toml";
 
 /// Whether this build can free Win+ shortcuts from Windows (see `winkeys`).
 pub const FREE_SHORTCUT_AVAILABLE: bool = cfg!(feature = "free-shortcut");
@@ -146,7 +146,7 @@ impl From<Format> for FormatSetting {
 pub const DEFAULT_HOTKEY: &str = "Win+Shift+S";
 /// The longest Reopen last capture keeps a capture, in minutes.
 pub const MAX_KEEP_MINUTES: u32 = 60;
-pub const DEFAULT_NAME: &str = "darkshot-{date}_{time}";
+pub const DEFAULT_NAME: &str = "duskshot-{date}_{time}";
 pub const DEFAULT_SWATCHES: [Color32; 4] = [
     Color32::from_rgb(0xEF, 0x47, 0x6F),
     Color32::from_rgb(0xFF, 0xD1, 0x66),
@@ -226,7 +226,7 @@ impl Settings {
     }
 
     /// Write the settings next to the exe, or (with `appdata-fallback`) to
-    /// `%APPDATA%\Darkshot` if that fails.
+    /// `%APPDATA%\Duskshot` if that fails.
     /// Returns where they were written.
     pub fn store(&self) -> std::io::Result<PathBuf> {
         let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -305,7 +305,7 @@ impl Settings {
 
 /// The emoji stamped most recently, newest first, one per line. Kept in a file of
 /// its own beside the settings, so saving the settings never overwrites it.
-pub const RECENT_FILE: &str = "darkshot-recent.txt";
+pub const RECENT_FILE: &str = "duskshot-recent.txt";
 
 /// The recently stamped emoji, if any were recorded.
 pub fn load_recent() -> Option<Vec<String>> {
@@ -325,7 +325,7 @@ pub fn store_recent(list: &[String]) {
 }
 
 /// Where the settings file may be, in order of preference: next to the exe (portable),
-/// then, with `appdata-fallback`, `%APPDATA%\Darkshot`.
+/// then, with `appdata-fallback`, `%APPDATA%\Duskshot`.
 fn candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)) {
@@ -333,7 +333,7 @@ fn candidates() -> Vec<PathBuf> {
     }
     #[cfg(feature = "appdata-fallback")]
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        paths.push(PathBuf::from(appdata).join("Darkshot").join(FILE_NAME));
+        paths.push(PathBuf::from(appdata).join("Duskshot").join(FILE_NAME));
     }
     paths
 }

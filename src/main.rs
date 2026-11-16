@@ -1,4 +1,4 @@
-// Darkshot: a privacy-first screenshot tool. No network code, ever:
+// Duskshot: a privacy-first screenshot tool. No network code, ever:
 // a capture can only leave the app via the clipboard or a file on disk.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -33,22 +33,22 @@ mod winkeys;
 
 type AnyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// `darkshot`              sits in the tray and waits for the hotkey.
-/// `darkshot --capture`    takes one capture right now and exits.
-/// `darkshot --settings`   opens the settings window.
-/// `darkshot picture.png`  opens an image to edit (also: dragging it onto the exe).
-/// `darkshot --open`       asks which image to edit.
-/// `darkshot --clipboard`  edits the image on the clipboard.
-/// `darkshot --reopen`     reopens a kept capture, read from standard input (the tray's
+/// `duskshot`              sits in the tray and waits for the hotkey.
+/// `duskshot --capture`    takes one capture right now and exits.
+/// `duskshot --settings`   opens the settings window.
+/// `duskshot picture.png`  opens an image to edit (also: dragging it onto the exe).
+/// `duskshot --open`       asks which image to edit.
+/// `duskshot --clipboard`  edits the image on the clipboard.
+/// `duskshot --reopen`     reopens a kept capture, read from standard input (the tray's
 ///                         Reopen last capture; see `handoff`).
-/// Add `--trace` to either to log frame timings to `darkshot-trace.log` and memory, CPU
-/// and GPU use to `darkshot-perf.log`, both in the temp folder (debug builds and builds
+/// Add `--trace` to either to log frame timings to `duskshot-trace.log` and memory, CPU
+/// and GPU use to `duskshot-perf.log`, both in the temp folder (debug builds and builds
 /// with the `trace` feature only; see `perf`).
-/// `darkshot --trace-cycles 20` opens and closes the capture window 20 times, logging
+/// `duskshot --trace-cycles 20` opens and closes the capture window 20 times, logging
 ///                         resources after each, for numbers to compare across versions.
 fn main() -> AnyResult<()> {
     // Load DLLs only from System32, never from the exe's own folder or the current
-    // directory, so a DLL planted next to a portable darkshot.exe is not picked up.
+    // directory, so a DLL planted next to a portable duskshot.exe is not picked up.
     // This covers DLLs loaded at run time (graphics and dialog libraries); the linker
     // flag /DEPENDENTLOADFLAG in .cargo/config.toml covers those loaded at start.
     use windows_sys::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};

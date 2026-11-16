@@ -5,8 +5,8 @@
 use std::path::Path;
 
 fn main() {
-    println!("cargo:rerun-if-changed=assets/darkshot.ico");
-    println!("cargo:rerun-if-changed=assets/darkshot.manifest");
+    println!("cargo:rerun-if-changed=assets/duskshot.ico");
+    println!("cargo:rerun-if-changed=assets/duskshot.manifest");
 
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let asset = |name: &str| Path::new(&dir).join("assets").join(name).display().to_string().replace('\\', "\\\\");
@@ -15,7 +15,7 @@ fn main() {
     numbers.resize(4, 0);
     let numeric = numbers.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
     let edition = if std::env::var_os("CARGO_FEATURE_PERSONAL").is_some() { "personal" } else { "restrictive" };
-    let description = format!("Darkshot screenshot tool ({edition} build)");
+    let description = format!("Duskshot screenshot tool ({edition} build)");
 
     let rc = format!(
         r#"#pragma code_page(65001)
@@ -34,9 +34,9 @@ BEGIN
         BEGIN
             VALUE "FileDescription", "{description}"
             VALUE "FileVersion", "{version}"
-            VALUE "InternalName", "darkshot"
-            VALUE "OriginalFilename", "darkshot.exe"
-            VALUE "ProductName", "Darkshot"
+            VALUE "InternalName", "duskshot"
+            VALUE "OriginalFilename", "duskshot.exe"
+            VALUE "ProductName", "Duskshot"
             VALUE "ProductVersion", "{version}"
             VALUE "Comments", "Privacy-first screenshot and annotation tool. No network access."
         END
@@ -47,10 +47,10 @@ BEGIN
     END
 END
 "#,
-        icon = asset("darkshot.ico"),
-        manifest = asset("darkshot.manifest"),
+        icon = asset("duskshot.ico"),
+        manifest = asset("duskshot.manifest"),
     );
-    let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("darkshot.rc");
+    let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("duskshot.rc");
     std::fs::write(&out, rc).expect("could not write the resource script");
     embed_resource::compile(&out, embed_resource::NONE)
         .manifest_required()

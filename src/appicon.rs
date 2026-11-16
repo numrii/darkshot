@@ -1,5 +1,5 @@
 //! The app icon, drawn in code: four white selection corners on a dark tile. The same
-//! design is in assets/darkshot.ico (the exe's icon), generated from this drawing.
+//! design is in assets/duskshot.ico (the exe's icon), generated from this drawing.
 
 /// The icon as RGBA pixels, `size` x `size`. The design lives on a 32x32 grid; other
 /// sizes sample it (nearest neighbour), which keeps the lines crisp at multiples of 32.
@@ -35,7 +35,7 @@ mod tests {
     #[test]
     fn matches_the_ico_asset() {
         // The 32x32 image in the .ico was generated from this drawing.
-        let ico = image::load_from_memory_with_format(include_bytes!("../assets/darkshot.ico"), image::ImageFormat::Ico)
+        let ico = image::load_from_memory_with_format(include_bytes!("../assets/duskshot.ico"), image::ImageFormat::Ico)
             .unwrap()
             .to_rgba8();
         let at32 = image::imageops::resize(&ico, 32, 32, image::imageops::FilterType::Nearest);

@@ -220,7 +220,7 @@ impl SaveOptions {
         // Test hook: save straight into this folder, without a dialog. Debug builds
         // only: in a release build Save always asks.
         #[cfg(debug_assertions)]
-        if let Some(dir) = std::env::var_os("DARKSHOT_SAVE_TO") {
+        if let Some(dir) = std::env::var_os("DUSKSHOT_SAVE_TO") {
             return Some(PathBuf::from(dir).join(self.file_name()));
         }
         let mut dialog = rfd::FileDialog::new()
@@ -239,7 +239,7 @@ impl SaveOptions {
             let replace = rfd::MessageDialog::new()
                 .set_parent(parent)
                 .set_level(rfd::MessageLevel::Warning)
-                .set_title("Darkshot")
+                .set_title("Duskshot")
                 .set_description(format!("{name} already exists.\n\nDo you want to replace it?"))
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .show();
@@ -297,10 +297,10 @@ mod tests {
     #[test]
     fn file_names() {
         let stamp_len = "2026-11-12_21-50-03".len();
-        // Default: darkshot- and the date and time.
+        // Default: duskshot- and the date and time.
         let name = SaveOptions::default().file_name();
-        assert!(name.starts_with("darkshot-20") && name.ends_with(".png"), "{name}");
-        assert_eq!(name.len(), "darkshot-".len() + stamp_len + ".png".len());
+        assert!(name.starts_with("duskshot-20") && name.ends_with(".png"), "{name}");
+        assert_eq!(name.len(), "duskshot-".len() + stamp_len + ".png".len());
 
         // Characters Windows forbids are replaced.
         let mut options = SaveOptions { name: " my:shot?-{date}".into(), ..Default::default() };
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn macros() {
         let stamp = Stamp { year: 2026, month: 3, day: 7, hour: 9, minute: 5, second: 1 };
-        assert_eq!(expand(crate::settings::DEFAULT_NAME, &stamp, 1), "darkshot-2026-03-07_09-05-01");
+        assert_eq!(expand(crate::settings::DEFAULT_NAME, &stamp, 1), "duskshot-2026-03-07_09-05-01");
         assert_eq!(
             expand("{year}/{month}/{day} {hour}.{minute}.{second} #{counter}", &stamp, 42),
             "2026/03/07 09.05.01 #0042"
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn counter_takes_the_next_free_number() {
-        let dir = std::env::temp_dir().join(format!("darkshot-counter-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("duskshot-counter-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let options = SaveOptions { name: "shot {counter}".into(), folder: Some(dir.clone()), ..Default::default() };
         assert_eq!(options.file_name(), "shot 0001.png");
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn writes_png_and_jpeg() {
-        let dir = std::env::temp_dir().join(format!("darkshot-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("duskshot-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Left half opaque red, right half transparent.
         let img = RgbaImage::from_fn(40, 20, |x, _| {

@@ -1,4 +1,4 @@
-"""Make Darkshot's emoji list (src/emoji_list.txt) from Unicode's emoji-test.txt and
+"""Make Duskshot's emoji list (src/emoji_list.txt) from Unicode's emoji-test.txt and
 GitHub gemoji's emoji.json (shortcodes and tags).
 
     python scripts/emoji_list.py emoji-test.txt src/emoji_list.txt emoji.json

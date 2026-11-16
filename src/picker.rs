@@ -1,4 +1,4 @@
-//! Darkshot's colour picker: one popup used for every colour in the app.
+//! Duskshot's colour picker: one popup used for every colour in the app.
 //!
 //! A hue ring around a saturation and value square sits on top, the same in every
 //! tab; three tabs (RGB, HSV, CMYK) hold sliders for the exact values, and an alpha

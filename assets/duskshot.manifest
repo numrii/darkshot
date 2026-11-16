@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<!-- Darkshot runs as the signed-in user and never asks for administrator rights. -->
+<!-- Duskshot runs as the signed-in user and never asks for administrator rights. -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Darkshot" version="0.0.0.0" processorArchitecture="*"/>
+  <assemblyIdentity type="win32" name="Duskshot" version="0.0.0.0" processorArchitecture="*"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -10,7 +10,7 @@
     </security>
   </trustInfo>
   <!-- Sharp at any display scaling: sized for each monitor's DPI, with no bitmap
-       stretching of Darkshot's windows or of the Windows dialogs it opens. -->
+       stretching of Duskshot's windows or of the Windows dialogs it opens. -->
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>

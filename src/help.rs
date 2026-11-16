@@ -242,7 +242,7 @@ fn keycaps(ui: &mut egui::Ui, keys: &[&str]) {
 /// Draw the tool box for `help` (picked with `key`) at `at`. Returns its size, for
 /// placing it next frame.
 pub fn tool_box(ctx: &egui::Context, help: &ToolHelp, key: Option<&str>, level: HelpLevel, at: Pos2, docked: bool) -> Vec2 {
-    let response = egui::Area::new(egui::Id::unique("darkshot-tool-help"))
+    let response = egui::Area::new(egui::Id::unique("duskshot-tool-help"))
         .order(egui::Order::Middle)
         .fixed_pos(at)
         .interactable(false)
@@ -484,7 +484,7 @@ pub fn strip(painter: &egui::Painter, anchor: Pos2, from_top: bool, max_width: f
 /// Draw the shortcut sheet in the middle of `monitor`. `tools` are the enabled tools
 /// with their keys.
 pub fn sheet(ctx: &egui::Context, monitor: Rect, tools: &[(&'static str, String)]) {
-    egui::Area::new(egui::Id::unique("darkshot-help-sheet"))
+    egui::Area::new(egui::Id::unique("duskshot-help-sheet"))
         .order(egui::Order::Foreground)
         .pivot(Align2::CENTER_CENTER)
         .fixed_pos(monitor.center())

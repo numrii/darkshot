@@ -1,11 +1,11 @@
 //! The background process: a tray icon plus a global capture hotkey.
 //!
-//! Each capture runs as a short-lived child process (`darkshot --capture`), so the
+//! Each capture runs as a short-lived child process (`duskshot --capture`), so the
 //! background process holds no GPU resources and a crash in the overlay cannot take
 //! the hotkey down with it. With Reopen last capture on, a closing capture hands its
 //! state to this process, which keeps it in memory and passes it to the next overlay
 //! (see `handoff`). The settings window is a child process too
-//! (`darkshot --settings`); when it closes, the settings are read again.
+//! (`duskshot --settings`); when it closes, the settings are read again.
 
 use std::process::{Child, Command};
 use std::sync::{Arc, Condvar, Mutex};
@@ -99,11 +99,11 @@ pub fn run() -> AnyResult<()> {
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(MENU_SETTINGS, "Settings…", true, None),
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(MENU_QUIT, "Quit Darkshot", true, None),
+        &MenuItem::with_id(MENU_QUIT, "Quit Duskshot", true, None),
     ])?;
     let tray = TrayIconBuilder::new()
         .with_icon(tray_icon()?)
-        .with_tooltip("Darkshot")
+        .with_tooltip("Duskshot")
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .build()?;
@@ -214,7 +214,7 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
                 eprintln!("could not register {label}: {e}");
                 rfd::MessageDialog::new()
                     .set_level(rfd::MessageLevel::Warning)
-                    .set_title("Darkshot")
+                    .set_title("Duskshot")
                     .set_description(format!(
                         "The {name} shortcut {shown} could not be registered. Windows or another \
                          application may already use it. You can choose another under Settings."
@@ -234,19 +234,19 @@ fn apply_hotkey(hotkeys: &GlobalHotKeyManager, active: &Active, items: &Items, t
         Ok(shortcut) => {
             active.lock().unwrap().push((shortcut, Shortcut::Capture));
             capture_item.set_text(format!("Capture\t{shown}"));
-            let _ = tray.set_tooltip(Some(format!("Darkshot: press {shown} to capture")));
+            let _ = tray.set_tooltip(Some(format!("Duskshot: press {shown} to capture")));
         }
         Err(e) => {
             eprintln!("could not register {label}: {e}");
             capture_item.set_text("Capture");
-            let _ = tray.set_tooltip(Some(format!("Darkshot: {shown} is unavailable, click here to capture")));
+            let _ = tray.set_tooltip(Some(format!("Duskshot: {shown} is unavailable, click here to capture")));
             rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Warning)
-                .set_title("Darkshot")
+                .set_title("Duskshot")
                 .set_description(format!(
                     "The capture shortcut {shown} could not be registered. Windows or another \
                      application may already use it.\n\nYou can still capture by clicking the \
-                     Darkshot tray icon. Under Settings you can choose another shortcut{}.",
+                     Duskshot tray icon. Under Settings you can choose another shortcut{}.",
                     if crate::settings::FREE_SHORTCUT_AVAILABLE {
                         ", or free a Windows-key shortcut from Windows"
                     } else {
@@ -434,7 +434,7 @@ fn start_overlay(captures: &Shared, mode: &str, bytes: Option<Vec<u8>>) {
 /// capture is on), and log this process's resources after each. Growth in the tray
 /// rows from cycle to cycle is a leak in the tray; the capture windows' own rows give
 /// startup time and peak memory to compare across versions. Takes neither the hotkey
-/// nor the tray icon, so it runs beside a Darkshot already in the tray.
+/// nor the tray icon, so it runs beside a Duskshot already in the tray.
 pub fn cycles(n: u32) -> AnyResult<()> {
     let captures: Shared = Arc::default();
     crate::perf::sample("cycles start");
@@ -483,9 +483,9 @@ fn bring_forward(pid: u32) {
     }
 }
 
-/// Returns false if another Darkshot background process already holds the mutex.
+/// Returns false if another Duskshot background process already holds the mutex.
 fn acquire_single_instance() -> bool {
-    let name: Vec<u16> = "Local\\DarkshotSingleInstance\0".encode_utf16().collect();
+    let name: Vec<u16> = "Local\\DuskshotSingleInstance\0".encode_utf16().collect();
     // The handle is deliberately never closed: it must live as long as the process.
     unsafe {
         let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
