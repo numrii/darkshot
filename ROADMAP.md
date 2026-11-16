@@ -45,6 +45,11 @@ annotations):
 
 ## Done
 
+- Next release (1.6.0):
+  - Turn guides: while the round handle is dragged, a level horizon through the middle
+    of the region and a grid are drawn over it, fixed on screen so the capture turns
+    under them. Settings choose horizon, grid, both or neither, and the grid spacing
+    (fine, medium or coarse; coarse by default). The guides are never part of the copy or the saved file.
 - Renamed from Darkshot to Duskshot, because another screenshot app already used the
   name. The exe, settings file (`duskshot.toml`), `%APPDATA%\Duskshot` folder, registry
   entries and repository all follow. There is no migration: to carry settings over,

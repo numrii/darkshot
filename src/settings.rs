@@ -50,6 +50,46 @@ pub struct Settings {
     pub help_level: crate::help::HelpLevel,
     pub save: SaveSettings,
     pub frame: FrameSettings,
+    pub guides: GuideSettings,
+}
+
+/// Lines drawn over the region while the capture is being turned, to line things up
+/// against. They are fixed on screen while the capture turns under them, and are never
+/// part of the copy or the saved file.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuideSettings {
+    /// A level line through the middle of the region.
+    pub horizon: bool,
+    /// A grid of level and upright lines, centred on the region.
+    pub grid: bool,
+    pub spacing: GridSpacing,
+}
+
+/// How far apart the grid lines are, in screen points.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridSpacing {
+    Fine,
+    Medium,
+    #[default]
+    Coarse,
+}
+
+impl GridSpacing {
+    pub fn points(self) -> f32 {
+        match self {
+            Self::Fine => 40.0,
+            Self::Medium => 60.0,
+            Self::Coarse => 120.0,
+        }
+    }
+}
+
+impl Default for GuideSettings {
+    fn default() -> Self {
+        Self { horizon: true, grid: true, spacing: GridSpacing::Coarse }
+    }
 }
 
 /// A border and a drop shadow added around the image when it is copied or saved.
@@ -172,6 +212,7 @@ impl Default for Settings {
             help_level: crate::help::HelpLevel::Off,
             save: SaveSettings::default(),
             frame: FrameSettings::default(),
+            guides: GuideSettings::default(),
         }
     }
 }
@@ -621,6 +662,16 @@ mod tests {
             dash: crate::annotate::Dash::DashDot,
         };
         assert_eq!(f.border(), border);
+
+        // Rotation guides: horizon and a coarse grid unless changed; an unknown spacing
+        // falls back to the default along with the rest of the file.
+        let g = Settings::default().guides;
+        assert!(g.horizon && g.grid && g.spacing == GridSpacing::Coarse);
+        let g = Settings::from_toml("[guides]
+grid = false
+spacing = \"fine\"").guides;
+        assert!(g.horizon && !g.grid && g.spacing == GridSpacing::Fine);
+        assert_eq!(GridSpacing::Fine.points(), 40.0);
 
         // Tool keys: chosen ones are kept; unknown tools and unusable keys are dropped.
         let tools = &crate::tools::TOOLS;

@@ -58,7 +58,8 @@ the keys for the current tool. F1 lists every shortcut.
 
 Besides shapes, pen, highlighter, text, blur, numbered steps and stamps, there is
 copy text (OCR, using Windows' built-in text recognition) and a QR code reader. A
-handle above the region straightens a photographed document, and the Decoration
+handle above the region straightens a photographed document (a horizon line and a
+grid show while you turn, and can be changed in Settings), and the Decoration
 button adds a border or drop shadow to the output.
 
 ### Settings

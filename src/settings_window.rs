@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, Key, RichText, Sense, Vec2};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::{
-    self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, Settings, ThemeSetting, DEFAULT_HOTKEY,
+    self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, GridSpacing, Settings, ThemeSetting, DEFAULT_HOTKEY,
     DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
 };
 use crate::tools::{ToolInfo, TOOLS};
@@ -617,6 +617,27 @@ impl SettingsApp {
                 ] {
                     ui.selectable_value(&mut self.settings.help_level, value, name).on_hover_text(tip);
                 }
+            });
+            ui.end_row();
+            ui.label("Turn guides");
+            ui.horizontal(|ui| {
+                let guides = &mut self.settings.guides;
+                ui.checkbox(&mut guides.horizon, "Horizon")
+                    .on_hover_text("A level line through the middle of the region while you turn the capture.");
+                ui.checkbox(&mut guides.grid, "Grid")
+                    .on_hover_text("Level and upright lines over the region while you turn the capture.");
+                ui.add_enabled_ui(guides.grid, |ui| {
+                    let name = |s: GridSpacing| match s {
+                        GridSpacing::Fine => "Fine",
+                        GridSpacing::Medium => "Medium",
+                        GridSpacing::Coarse => "Coarse",
+                    };
+                    egui::ComboBox::from_id_salt("grid_spacing").selected_text(name(guides.spacing)).width(70.0).show_ui(ui, |ui| {
+                        for s in [GridSpacing::Fine, GridSpacing::Medium, GridSpacing::Coarse] {
+                            ui.selectable_value(&mut guides.spacing, s, name(s));
+                        }
+                    });
+                });
             });
             ui.end_row();
         });

@@ -36,7 +36,7 @@ use crate::effects;
 use crate::help::{self, HelpLevel};
 use crate::read;
 use crate::save::{self, Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
-use crate::settings::Settings;
+use crate::settings::{GuideSettings, Settings};
 use crate::snap::{self, Snap};
 use crate::text::Layout;
 use crate::tools::{ToolInfo, TOOLS};
@@ -1039,6 +1039,47 @@ impl Rotation {
     }
 }
 
+/// The horizon and grid shown over the region while the capture is turned, fixed on
+/// screen so something in the capture can be lined up against them. The grid is centred
+/// on the region, so its middle lines are the horizon and the upright through the centre.
+/// Each line has a dark edge so it shows on light and dark captures alike.
+fn rotation_guides(painter: &egui::Painter, sel: Rect, guides: &GuideSettings) {
+    if !guides.horizon && !guides.grid {
+        return;
+    }
+    let painter = painter.with_clip_rect(sel.intersect(painter.clip_rect()));
+    let line = |a: Pos2, b: Pos2, color: Color32, strong: bool| {
+        painter.line_segment([a, b], Stroke::new(if strong { 3.0 } else { 2.0 }, Color32::from_black_alpha(if strong { 60 } else { 35 })));
+        painter.line_segment([a, b], Stroke::new(if strong { 1.25 } else { 1.0 }, color));
+    };
+    let faint = Color32::from_white_alpha(45);
+    let accent = ACCENT.gamma_multiply(0.6);
+    let centre = sel.center();
+    if guides.grid {
+        let step = guides.spacing.points();
+        line(Pos2::new(centre.x, sel.top()), Pos2::new(centre.x, sel.bottom()), accent, true);
+        let mut k = step;
+        while k <= sel.width() / 2.0 {
+            for x in [centre.x - k, centre.x + k] {
+                line(Pos2::new(x, sel.top()), Pos2::new(x, sel.bottom()), faint, false);
+            }
+            k += step;
+        }
+        let mut k = step;
+        while k <= sel.height() / 2.0 {
+            for y in [centre.y - k, centre.y + k] {
+                line(Pos2::new(sel.left(), y), Pos2::new(sel.right(), y), faint, false);
+            }
+            k += step;
+        }
+    }
+    // The horizon goes last, over the grid's middle line.
+    if guides.horizon || guides.grid {
+        let colour = if guides.horizon { accent } else { faint };
+        line(Pos2::new(sel.left(), centre.y), Pos2::new(sel.right(), centre.y), colour, guides.horizon);
+    }
+}
+
 /// A turning arrow: most of a circle of radius `r` round `centre`, clockwise, with an
 /// arrowhead at its end.
 fn rotate_glyph(painter: &egui::Painter, centre: Pos2, r: f32, color: Color32) {
@@ -1191,6 +1232,8 @@ struct Overlay {
     confirm_open: bool,
     /// How much the box beside the selection explains about the current tool.
     help_level: HelpLevel,
+    /// Horizon and grid shown over the region while it is being turned.
+    guides: GuideSettings,
     /// The shortcut sheet (F1) is on screen.
     help_open: bool,
     /// The tool box's size last frame, to place it this frame.
@@ -1402,6 +1445,7 @@ impl Overlay {
             confirm_discard: settings.confirm_discard,
             confirm_open: false,
             help_level: settings.help_level,
+            guides: settings.guides.clone(),
             help_open: false,
             help_box_size: vec2(help::BOX_WIDTH, 200.0),
             strip_rect: None,
@@ -4057,11 +4101,14 @@ impl eframe::App for Overlay {
                 } else {
                     painter.rect_stroke(sel, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
                 }
+                let turning = matches!(self.action, Some(Action::Rotate { .. }));
+                if turning {
+                    rotation_guides(&painter, sel, &self.guides);
+                }
                 for point in handle_points(sel) {
                     handle(&painter, point, Color32::WHITE);
                 }
                 // The round handle that turns the capture, on a stem from the region.
-                let turning = matches!(self.action, Some(Action::Rotate { .. }));
                 if let Some(knob) = self.rotate_handle(sel_px, tol).map(to_pt) {
                     // From the nearest point of the region's edge; inside it, from the
                     // nearer of top and bottom.
