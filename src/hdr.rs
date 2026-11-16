@@ -215,7 +215,7 @@ unsafe fn duplicate(adapter: &IDXGIAdapter1, output: &IDXGIOutput, white_nits: f
             for (row, out) in pixels.chunks_exact_mut(w * 4).enumerate() {
                 let line = mapped.pData.cast::<u8>().add(row * mapped.RowPitch as usize).cast::<[u16; 4]>();
                 let line = std::slice::from_raw_parts(line, w);
-                for (dst, src) in out.chunks_exact_mut(4).zip(line) {
+                for (dst, src) in out.as_chunks_mut::<4>().0.iter_mut().zip(line) {
                     for c in 0..3 {
                         dst[c] = table[src[c] as usize];
                     }

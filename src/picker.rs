@@ -321,14 +321,13 @@ fn hex_row(ui: &mut egui::Ui, state_id: Id, state: &mut State, alpha: bool) {
                 .set_char_range(Some(CCursorRange::select_all_str(&state.hex)));
             text_state.store(ui.ctx(), id);
         }
-        if field.changed() {
-            if let Some((rgb, a)) = parse_hex(&state.hex) {
+        if field.changed()
+            && let Some((rgb, a)) = parse_hex(&state.hex) {
                 state.set_rgb(rgb.map(|c| f32::from(c) / 255.0));
                 if let (Some(a), true) = (a, alpha) {
                     state.a = a;
                 }
             }
-        }
         // Enter only finishes typing; it must not also reach the capture (copy and close).
         if field.lost_focus() {
             ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
@@ -376,13 +375,12 @@ fn slider(
         );
 
         let (rect, response) = ui.allocate_exact_size(TRACK, Sense::click_and_drag());
-        if response.is_pointer_button_down_on() {
-            if let Some(p) = response.interact_pointer_pos() {
+        if response.is_pointer_button_down_on()
+            && let Some(p) = response.interact_pointer_pos() {
                 let t = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                 *value = (t * max).round();
                 changed = true;
             }
-        }
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             if checker {

@@ -503,11 +503,10 @@ pub fn punctuation_key(name: &str) -> Option<u32> {
 fn virtual_key(name: &str) -> Option<u32> {
     let name = name.strip_prefix("KEY").filter(|n| n.len() == 1).unwrap_or(name);
     let name = name.strip_prefix("DIGIT").filter(|n| n.len() == 1).unwrap_or(name);
-    if let [c] = name.as_bytes() {
-        if c.is_ascii_uppercase() || c.is_ascii_digit() {
+    if let [c] = name.as_bytes()
+        && (c.is_ascii_uppercase() || c.is_ascii_digit()) {
             return Some(u32::from(*c));
         }
-    }
     if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()) {
         return (1..=24).contains(&n).then_some(0x70 + n - 1);
     }

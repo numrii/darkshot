@@ -645,7 +645,7 @@ Blueberry muffin 3.25"),
                 let upright = written(s, size);
                 let turned = Turn::ALL.map(|t| t.apply(&upright));
                 for img in std::iter::once(&upright).chain(&turned) {
-                    match text(&img) {
+                    match text(img) {
                         Ok(lines) => assert_eq!(joined(&lines), s, "{size}px"),
                         Err(e) if e.starts_with("Text recognition is not") => return eprintln!("skipped: {e}"),
                         Err(e) => panic!("{s} {size}px: {e}"),
@@ -664,11 +664,10 @@ Blueberry muffin 3.25"),
     #[test]
     fn reads_lone_codes_at_any_size() {
         let mut img = written("a7f3k9q2", 24.0);
-        if let Err(e) = text(&img) {
-            if e.starts_with("Text recognition is not") {
+        if let Err(e) = text(&img)
+            && e.starts_with("Text recognition is not") {
                 return eprintln!("skipped: {e}");
             }
-        }
         let cases = [("a7f3k9q2", 12.0), ("a7f3k9q2", 18.0), ("a7f3k9q2", 24.0), ("zz91ab", 12.0), ("zz91ab", 22.0), ("3f2a9c", 16.0), ("q8w7e6r5", 12.0)];
         for (code, size) in cases {
             img = written(code, size);

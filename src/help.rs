@@ -504,7 +504,8 @@ pub fn sheet(ctx: &egui::Context, monitor: Rect, tools: &[(&'static str, String)
                 let fixed = |rows: &[(&[&str], &str)]| -> Vec<(Vec<String>, String)> {
                     rows.iter().map(|(k, t)| (k.iter().map(|s| (*s).to_owned()).collect(), (*t).to_owned())).collect()
                 };
-                let groups: [(&str, Vec<(Vec<String>, String)>); 6] = [
+                type Rows = Vec<(Vec<String>, String)>;
+                let groups: [(&str, Rows); 6] = [
                     (
                         "Region",
                         fixed(&[

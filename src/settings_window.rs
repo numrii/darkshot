@@ -71,11 +71,10 @@ mod recorder {
     /// The virtual-key code for keys that can be part of a shortcut.
     fn vk_code(key: Key) -> Option<u32> {
         let name = key.name();
-        if let [c] = name.as_bytes() {
-            if c.is_ascii_uppercase() || c.is_ascii_digit() {
+        if let [c] = name.as_bytes()
+            && (c.is_ascii_uppercase() || c.is_ascii_digit()) {
                 return Some(u32::from(*c));
             }
-        }
         if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()) {
             return (1..=24).contains(&n).then_some(0x70 + n - 1);
         }

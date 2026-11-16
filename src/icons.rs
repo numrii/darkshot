@@ -122,12 +122,11 @@ pub fn picker<T: Copy + PartialEq>(
                 }
             }
         });
-        if let Some(option) = chosen {
-            if option != *value {
+        if let Some(option) = chosen
+            && option != *value {
                 *value = option;
                 response.mark_changed();
             }
-        }
     }
     response
 }

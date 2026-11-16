@@ -130,12 +130,11 @@ pub fn outline(text: &str, font_size: f32, origin: Pos2) -> Option<tiny_skia::Pa
         let baseline = origin.y + row as f32 * layout.line_height + layout.ascent;
         let mut x = origin.x;
         for ch in line.chars() {
-            if !ch.is_whitespace() {
-                if let Some(glyph) = face.glyph_index(ch) {
+            if !ch.is_whitespace()
+                && let Some(glyph) = face.glyph_index(ch) {
                     (builder.x, builder.y) = (x, baseline);
                     face.outline_glyph(glyph, &mut builder);
                 }
-            }
             x += advance(ch, font_size);
         }
     }

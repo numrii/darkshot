@@ -348,8 +348,7 @@ fn keep_for(captures: &Shared, mut bytes: Vec<u8>, time: Duration) {
     let captures = captures.clone();
     std::thread::spawn(move || {
         let mut c = captures.lock().unwrap();
-        loop {
-            let (true, Some(expires)) = (c.kept.is_some(), c.expires) else { break };
+        while let (true, Some(expires)) = (c.kept.is_some(), c.expires) {
             let left = expires.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 // Still holding the lock, so no new capture can slip in unwatched

@@ -6,7 +6,7 @@
 pub fn rgba(size: u32) -> Vec<u8> {
     let near_edge = |v: u32| (7..14).contains(&v) || (18..25).contains(&v);
     let on_line = |v: u32| (7..10).contains(&v) || (22..25).contains(&v);
-    let outer = |v: u32| v < 2 || v >= 30;
+    let outer = |v: u32| !(2..30).contains(&v);
 
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {

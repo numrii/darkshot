@@ -589,6 +589,8 @@ fn bump(f: impl FnOnce(&mut MsgStats)) {
 ///    wheel message, or by a short timer once the mouse stops.
 /// 2. Do not wait for an idle queue: when a move is passed on and the last frame is
 ///    older than `MAX_PAINT_DELAY`, paint synchronously right away.
+// WM_MOUSEMOVE is matched on its own first, then the rest of the mouse range.
+#[allow(clippy::match_overlapping_arm)]
 unsafe extern "system" fn pump_guard(
     hwnd: HWND,
     msg: u32,
@@ -1005,13 +1007,13 @@ impl Rotation {
     }
 
     /// Where captured point `s` shows on the desktop.
-    fn to_desktop(&self, s: Pos2) -> Pos2 {
+    fn to_desktop(self, s: Pos2) -> Pos2 {
         let (sin, cos) = self.angle.sin_cos();
         Pos2::new(cos * s.x - sin * s.y, sin * s.x + cos * s.y) + self.offset
     }
 
     /// The captured point that shows at desktop point `d`.
-    fn to_source(&self, d: Pos2) -> Pos2 {
+    fn to_source(self, d: Pos2) -> Pos2 {
         let v = d - self.offset;
         let (sin, cos) = self.angle.sin_cos();
         Pos2::new(cos * v.x + sin * v.y, -sin * v.x + cos * v.y)
@@ -1703,11 +1705,10 @@ impl Overlay {
 
         // Ctrl: whatever the tool, grab and move things as the Select tool does.
         let grab = self.tool == Tool::Select || self.mods.ctrl;
-        if let Some(edit) = self.editing.as_ref().filter(|_| !grab) {
-            if self.annotations[edit.index].hit(p, tol) {
+        if let Some(edit) = self.editing.as_ref().filter(|_| !grab)
+            && self.annotations[edit.index].hit(p, tol) {
                 return Action::Caret { at: p };
             }
-        }
 
         if let Some(index) = self.selected {
             let shape = &self.annotations[index];
@@ -1725,12 +1726,11 @@ impl Overlay {
             }
         }
 
-        if let Some(handle) = self.rotate_handle(sel, tol) {
-            if p.distance(handle) <= (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE {
+        if let Some(handle) = self.rotate_handle(sel, tol)
+            && p.distance(handle) <= (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE {
                 let pivot = sel.center();
                 return Action::Rotate { pivot, from: angle_of(p - pivot), orig: self.rotation };
             }
-        }
         if let Some((hx, hy)) = edges_at(sel, p, tol) {
             return Action::Region(Drag::Resize { start: p, orig: sel, hx, hy });
         }
@@ -1870,11 +1870,10 @@ impl Overlay {
             }
             Action::Region(drag) => {
                 // A stray click outside the region must not replace it with nothing.
-                if let Drag::Create { anchor } = drag {
-                    if anchor.distance(p) < 3.0 && !self.drag_moved {
+                if let Drag::Create { anchor } = drag
+                    && anchor.distance(p) < 3.0 && !self.drag_moved {
                         return;
                     }
-                }
                 self.drag_moved = true;
                 let mut region = drag.apply(p, mods, bounds);
                 // Ctrl: pull the edges being dragged onto nearby window or monitor edges
@@ -1973,11 +1972,10 @@ impl Overlay {
             Some(Action::PlaceText { anchor }) => self.start_text(anchor),
             Some(Action::NewShape { .. }) => {
                 self.stroke_points.clear();
-                if let Some(shape) = self.annotations.last_mut() {
-                    if shape.is_freehand() {
+                if let Some(shape) = self.annotations.last_mut()
+                    && shape.is_freehand() {
                         shape.points = annotate::simplify(&shape.points, 0.4);
                     }
-                }
                 // A click without a drag leaves no shape behind, and no undo step.
                 if self.annotations.last().is_some_and(Annotation::is_degenerate) {
                     self.annotations.pop();
@@ -1994,14 +1992,12 @@ impl Overlay {
             }
             Some(Action::Region(drag)) => {
                 // Ctrl+click: select the window under the pointer.
-                if let Drag::Create { anchor } = drag {
-                    if !self.drag_moved && self.mods.ctrl && self.rotation.is_none() {
-                        if let Some(window) = self.desktop.snap.window_at(anchor) {
+                if let Drag::Create { anchor } = drag
+                    && !self.drag_moved && self.mods.ctrl && self.rotation.is_none()
+                        && let Some(window) = self.desktop.snap.window_at(anchor) {
                             self.selection = Some(window.intersect(self.bounds()));
                             self.selected = None;
                         }
-                    }
-                }
                 if self.selection.is_some_and(|s| s.width() < 1.0 || s.height() < 1.0) {
                     self.selection = None;
                 }
@@ -3580,8 +3576,8 @@ impl eframe::App for Overlay {
         // Only the left button draws and drags: right-click backs out (below), and the
         // middle button pans an opened image.
         let primary = egui::PointerButton::Primary;
-        if response.drag_started_by(primary) && !asking && !self.help_open && !self.panning {
-            if let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
+        if response.drag_started_by(primary) && !asking && !self.help_open && !self.panning
+            && let Some(origin) = press_origin.or(response.interact_pointer_pos()) {
                 if let (Some(hit), Some(reading)) = (read_hit(self, origin), self.reading.as_mut()) {
                     reading.toggle(hit, mods.shift);
                     self.ignore_drag = true;
@@ -3597,12 +3593,10 @@ impl eframe::App for Overlay {
                     self.error = None;
                 }
             }
-        }
-        if response.dragged_by(primary) && !self.ignore_drag {
-            if let Some(p) = response.interact_pointer_pos() {
+        if response.dragged_by(primary) && !self.ignore_drag
+            && let Some(p) = response.interact_pointer_pos() {
                 self.apply_action(to_px(p), mods, bounds);
             }
-        }
         if response.drag_stopped_by(primary) {
             if std::mem::take(&mut self.ignore_drag) {
                 // The eyedropper's click: nothing to finish.
@@ -3835,14 +3829,13 @@ impl eframe::App for Overlay {
 
         // Double-click a text with the select tool to edit it.
         let double = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-        if double && self.tool == Tool::Select && response.hovered() && !asking {
-            if let Some(p) = hover.map(to_px) {
+        if double && self.tool == Tool::Select && response.hovered() && !asking
+            && let Some(p) = hover.map(to_px) {
                 let on_text = |a: &Annotation| a.kind == ShapeKind::Text && a.hit(p, tol);
                 if let Some(index) = self.annotations.iter().rposition(on_text) {
                     self.edit_text(index, p);
                 }
             }
-        }
 
         // --- Toolbar -------------------------------------------------------------------
         let creating_region = matches!(self.action, Some(Action::Region(Drag::Create { .. })));
@@ -3972,14 +3965,13 @@ impl eframe::App for Overlay {
         for i in self.blur_order() {
             let annotation = &self.annotations[i];
             let key = layer_key(annotation);
-            if !self.blur_layers.contains_key(&key) {
-                if let Some((img, area)) = self.blurred(annotation) {
+            if !self.blur_layers.contains_key(&key)
+                && let Some((img, area)) = self.blurred(annotation) {
                     let size = [img.width() as usize, img.height() as usize];
                     let image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
                     let texture = ctx.load_texture("blur", image, egui::TextureOptions::NEAREST);
                     self.blur_layers.insert(key, (texture, area));
                 }
-            }
             if let Some((texture, area)) = self.blur_layers.get(&key) {
                 painter.image(texture.id(), rect_to_pt(*area), uv, Color32::WHITE);
                 used.insert(key);
@@ -4002,12 +3994,11 @@ impl eframe::App for Overlay {
             // while being placed.
             if layered && !(drawing && i == last && annotation.kind != ShapeKind::Emoji) {
                 let key = layer_key(annotation);
-                if !self.layers.contains_key(&key) {
-                    if let Some((image, area)) = annotation.layer(bounds) {
+                if !self.layers.contains_key(&key)
+                    && let Some((image, area)) = annotation.layer(bounds) {
                         let texture = ctx.load_texture("stroke", image, egui::TextureOptions::LINEAR);
                         self.layers.insert(key, (texture, area));
                     }
-                }
                 if let Some((texture, area)) = self.layers.get(&key) {
                     painter.image(texture.id(), rect_to_pt(*area), uv, Color32::WHITE);
                     used.insert(key);
@@ -4108,10 +4099,10 @@ impl eframe::App for Overlay {
         // With Ctrl held over a spot where a click would start a new region, outline the
         // window a click would select. Only before an area is chosen: afterwards Ctrl is
         // mostly pressed for shortcuts (Ctrl+C, Ctrl+S), and the outline would flash.
-        if mods.ctrl && self.selection.is_none() && self.action.is_none() && self.rotation.is_none() && response.hovered() {
-            if let Some(p) = hover.map(to_px) {
-                if let Action::Region(Drag::Create { .. }) = self.pick_action(p, tol) {
-                    if let Some(window) = self.desktop.snap.window_at(p) {
+        if mods.ctrl && self.selection.is_none() && self.action.is_none() && self.rotation.is_none() && response.hovered()
+            && let Some(p) = hover.map(to_px)
+                && let Action::Region(Drag::Create { .. }) = self.pick_action(p, tol)
+                    && let Some(window) = self.desktop.snap.window_at(p) {
                         let window = window.intersect(bounds);
                         let r = rect_to_pt(window);
                         painter.rect_filled(r, 0.0, ACCENT.gamma_multiply(0.12));
@@ -4119,9 +4110,6 @@ impl eframe::App for Overlay {
                         let size = format!("{} x {}", window.width() as u32, window.height() as u32);
                         label(&painter, r.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, size, Color32::WHITE);
                     }
-                }
-            }
-        }
 
         self.paint_reading(&painter, to_pt, read_hover, mods.shift);
 
@@ -4237,14 +4225,12 @@ impl eframe::App for Overlay {
             label(&painter, pos, align, err.clone(), Color32::LIGHT_RED);
         }
         // Hovering the round handle says what it does.
-        if let (None, false, Some(p), Some(sel)) = (&self.action, asking || self.help_open, hover, self.selection) {
-            if let Some(handle) = self.rotate_handle(sel, tol) {
-                if to_px(p).distance(handle) <= (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE {
+        if let (None, false, Some(p), Some(sel)) = (&self.action, asking || self.help_open, hover, self.selection)
+            && let Some(handle) = self.rotate_handle(sel, tol)
+                && to_px(p).distance(handle) <= (ROTATE_HANDLE_RADIUS + 2.0) * tol / GRAB_TOLERANCE {
                     let tip = "Drag to turn the capture · Shift: 15° steps · right-click: reset".to_owned();
                     label(&painter, p + vec2(16.0, 20.0), Align2::LEFT_TOP, tip, Color32::WHITE);
                 }
-            }
-        }
         if self.help_open {
             let tools: Vec<(&'static str, String)> =
                 self.tools.iter().map(|(t, k)| (t.name, crate::keys::label(*k))).collect();

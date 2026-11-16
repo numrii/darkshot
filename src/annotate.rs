@@ -75,6 +75,8 @@ const MARKER_OPACITY: f32 = 0.4;
 /// How a stroke is broken up. Dash lengths scale with the stroke width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+// Variant names are the saved setting values; renaming them would orphan old files.
+#[allow(clippy::enum_variant_names)]
 pub enum Dash {
     #[default]
     Solid,
