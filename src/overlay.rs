@@ -879,17 +879,19 @@ enum Action {
 /// highlighter's default shows as a selected swatch). The settings can change them.
 #[cfg(test)]
 const SWATCHES: [Color32; 4] = crate::settings::DEFAULT_SWATCHES;
-const ACCENT: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xFF);
+const ACCENT: Color32 = crate::theme::ACCENT;
 /// Default highlighter colour (classic highlighter yellow) and thickness.
 #[cfg(test)]
 const MARKER_COLOR: Color32 = crate::settings::DEFAULT_MARKER_COLOR;
 const MARKER_WIDTH: f32 = 16.0;
 /// Default stroke width for the other drawing tools.
 const DEFAULT_WIDTH: f32 = 4.0;
-/// Width of the toolbar's context options: room for the largest set, the arrow's
-/// (stroke style, arrowhead, both-ends toggle), each followed by the toolbar's 2 px
-/// item spacing.
-const OPTIONS_WIDTH: f32 = icons::PICKER_WIDTH * 2.0 + icons::BUTTON + 3.0 * 2.0;
+/// Width of the kaomoji picker button, the widest of the stamp pickers.
+const KAOMOJI_BUTTON_WIDTH: f32 = 64.0;
+/// Width of the toolbar's context options: room for the largest set, the stamps' (emoji,
+/// kaomoji and symbol pickers; the arrow's stroke style, arrowhead and both-ends toggle
+/// are narrower), each followed by the toolbar's 2 px item spacing.
+const OPTIONS_WIDTH: f32 = icons::PICKER_WIDTH * 2.0 + KAOMOJI_BUTTON_WIDTH + 3.0 * 2.0;
 /// Default text size and blur strength, in pixels.
 const TEXT_SIZE: f32 = 24.0;
 const BLUR_STRENGTH: f32 = 12.0;
@@ -1469,7 +1471,7 @@ impl Overlay {
     fn new(cc: &eframe::CreationContext<'_>, desktop: Desktop, settings: &Settings) -> Self {
         trace("window created");
         setup_text(&cc.egui_ctx);
-        cc.egui_ctx.set_theme(settings.theme);
+        crate::theme::apply(&cc.egui_ctx, settings.theme);
         icons::set_marker_color(&cc.egui_ctx, settings.marker());
         let mut overlay = Self::with_desktop(desktop, hwnd_of(cc), settings);
         overlay.claim_focus_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
@@ -2863,7 +2865,7 @@ impl Overlay {
     fn stamp_picker(&mut self, ui: &mut egui::Ui, set: StampSet) {
         let (columns, cell, button_width, tip) = match set {
             StampSet::Emoji => (8, vec2(30.0, 30.0), icons::PICKER_WIDTH, "Emoji"),
-            StampSet::Kaomoji => (3, vec2(124.0, 30.0), 64.0, "Kaomoji"),
+            StampSet::Kaomoji => (3, vec2(124.0, 30.0), KAOMOJI_BUTTON_WIDTH, "Kaomoji"),
             StampSet::Symbols => (10, vec2(28.0, 28.0), icons::PICKER_WIDTH, "Symbols"),
         };
         let popup_id = ui.auto_id_with(("stamp-picker", tip));
@@ -3079,6 +3081,14 @@ impl Overlay {
 
     fn toolbar(&mut self, ctx: &egui::Context, pos: Pos2, pivot: Align2, within: Rect) -> ToolbarOutput {
         let mut out = ToolbarOutput::default();
+        // The highlighter icon shows the highlighter's colour: the one being picked while
+        // the highlighter is the tool, otherwise the one it was last left with.
+        let marker_color = if self.tool == Tool::Shape(ShapeKind::Marker) {
+            self.color
+        } else {
+            self.styles.get(&StyleSlot::Marker).copied().unwrap_or(crate::settings::DEFAULT_MARKER_COLOR)
+        };
+        icons::set_marker_color(ctx, marker_color);
         let shown = egui::Area::new(egui::Id::unique("duskshot-toolbar"))
             .order(egui::Order::Foreground)
             .pivot(pivot)
@@ -4713,6 +4723,46 @@ mod tests {
         // Every tool but the eyedropper and the readers is one you draw or select with.
         let actions = [Icon::Eyedropper, Icon::ReadText, Icon::ReadQr];
         assert!(TOOLS.iter().all(|t| tool_for(t.icon).is_some() == !actions.contains(&t.icon)));
+    }
+
+    #[test]
+    fn the_toolbar_keeps_its_width_whichever_tool_is_chosen() {
+        let desktop = Desktop::new(
+            vec![RgbaImage::new(10, 10)],
+            RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            vec![rect(0.0, 0.0, 10.0, 10.0)],
+            0,
+            Snap::default(),
+        );
+        let mut overlay = Overlay::with_desktop(desktop, None, &Settings::default());
+        let ctx = egui::Context::default();
+        let within = rect(0.0, 0.0, 1600.0, 900.0);
+        let width = |overlay: &mut Overlay| {
+            let mut found = 0.0;
+            // The first frame only measures; the second is the one that is shown.
+            for _ in 0..3 {
+                let input = egui::RawInput { screen_rect: Some(within), ..Default::default() };
+                ctx.run_pass(input, |ctx| {
+                    found = overlay.toolbar(ctx, Pos2::new(100.0, 100.0), Align2::LEFT_TOP, within).rect.unwrap().width();
+                })
+                .textures_delta
+                .clear();
+            }
+            found
+        };
+        overlay.set_tool(Tool::Shape(ShapeKind::Rect));
+        let rectangle = width(&mut overlay);
+        assert!(rectangle > 200.0, "{rectangle}");
+        for tool in [
+            Tool::Shape(ShapeKind::Arrow),
+            Tool::Shape(ShapeKind::Text),
+            Tool::Shape(ShapeKind::Blur),
+            Tool::Shape(ShapeKind::Step),
+            Tool::Shape(ShapeKind::Emoji),
+        ] {
+            overlay.set_tool(tool);
+            assert_eq!(width(&mut overlay), rectangle, "{tool:?}");
+        }
     }
 
     #[test]

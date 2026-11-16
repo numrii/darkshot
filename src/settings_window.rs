@@ -476,10 +476,8 @@ fn section(ui: &mut egui::Ui, title: &str) {
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let theme = self.settings.theme.into();
-        if ctx.options(|o| o.theme_preference) != theme {
-            ctx.set_theme(theme);
-        }
+        crate::theme::apply(&ctx, self.settings.theme);
+        crate::icons::set_marker_color(&ctx, self.settings.marker());
         self.poll_recorder(&ctx);
         self.poll_tool_key(&ctx);
         let weak = ui.visuals().weak_text_color();
@@ -603,7 +601,7 @@ impl SettingsApp {
         rows("general").show(ui, |ui| {
             ui.label("Theme");
             ui.horizontal(|ui| {
-                for (value, name) in [(ThemeSetting::System, "System"), (ThemeSetting::Light, "Light"), (ThemeSetting::Dark, "Dark")] {
+                for (value, name) in [(ThemeSetting::Twilight, "Twilight"), (ThemeSetting::System, "System"), (ThemeSetting::Light, "Light"), (ThemeSetting::Dark, "Dark")] {
                     ui.selectable_value(&mut self.settings.theme, value, name);
                 }
             });

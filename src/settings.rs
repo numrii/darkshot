@@ -143,6 +143,7 @@ pub struct SaveSettings {
 #[serde(rename_all = "lowercase")]
 pub enum ThemeSetting {
     #[default]
+    Twilight,
     System,
     Light,
     Dark,
@@ -151,6 +152,8 @@ pub enum ThemeSetting {
 impl From<ThemeSetting> for eframe::egui::ThemePreference {
     fn from(t: ThemeSetting) -> Self {
         match t {
+            // Twilight is a dark theme.
+            ThemeSetting::Twilight => Self::Dark,
             ThemeSetting::System => Self::System,
             ThemeSetting::Light => Self::Light,
             ThemeSetting::Dark => Self::Dark,
@@ -206,7 +209,7 @@ impl Default for Settings {
             disabled_tools: Vec::new(),
             tool_keys: BTreeMap::new(),
             marker_color: to_hex(DEFAULT_MARKER_COLOR),
-            theme: ThemeSetting::System,
+            theme: ThemeSetting::Twilight,
             include_cursor: false,
             confirm_discard: false,
             help_level: crate::help::HelpLevel::Off,
@@ -635,8 +638,9 @@ mod tests {
         assert_eq!(s.save.name, "shot {counter}"); // an old prefix and suffix carry over
         assert_eq!(s.save.jpeg_quality, 100);
         assert_eq!(s.swatch_colors(), DEFAULT_SWATCHES);
-        assert_eq!(s.theme, ThemeSetting::System);
+        assert_eq!(s.theme, ThemeSetting::Twilight);
         assert_eq!(Settings::from_toml("theme = \"light\"").theme, ThemeSetting::Light);
+        assert_eq!(Settings::from_toml("theme = \"system\"").theme, ThemeSetting::System);
 
         // Tools are all on by default; turning one off is remembered, and an old
         // file's `take_over` is ignored.

@@ -27,6 +27,7 @@ mod settings;
 mod settings_window;
 mod snap;
 mod text;
+mod theme;
 mod tools;
 #[cfg(feature = "free-shortcut")]
 mod winkeys;

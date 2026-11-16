@@ -176,7 +176,7 @@ pub fn effect_preview(painter: &egui::Painter, area: Rect, effect: Effect, color
         }
     } else {
         // 3x3 blocks in a fixed pattern of strengths.
-        let shades = [0.9, 0.35, 0.65, 0.3, 0.8, 0.45, 0.6, 0.25, 0.95];
+        let shades = [1.0, 0.5, 0.75, 0.5, 0.75, 1.0, 0.75, 1.0, 0.5];
         let cell = side / 3.0;
         for (i, alpha) in shades.into_iter().enumerate() {
             let min = square.min + vec2((i % 3) as f32, (i / 3) as f32) * cell;
@@ -212,8 +212,13 @@ fn marker_color_id() -> egui::Id {
 }
 
 /// The highlighter colour the highlighter icon shows.
+/// Asks for another frame when it changed, so a colour picked this frame shows at once.
 pub fn set_marker_color(ctx: &egui::Context, color: Color32) {
+    let previous = ctx.data_mut(|d| d.get_temp::<Color32>(marker_color_id()));
     ctx.data_mut(|d| d.insert_temp(marker_color_id(), color));
+    if previous.is_some() && previous != Some(color) {
+        ctx.request_repaint();
+    }
 }
 
 /// A colour-wheel button that opens the colour picker. The centre dot shows the
@@ -257,165 +262,440 @@ pub fn color_picker_button(ui: &mut egui::Ui, color: &mut Color32) -> Response {
 
 /// Draw `icon` into `area` (any square). `background` is what the icon sits on, used
 /// where one part of the icon must hide another.
-pub fn paint(painter: &egui::Painter, area: Rect, icon: Icon, color: Color32, background: Color32) {
+pub fn paint(
+    painter: &egui::Painter,
+    area: Rect,
+    icon: Icon,
+    color: Color32,
+    _background: Color32,
+) {
     let unit = area.width() / GRID;
     let p = |x: f32, y: f32| area.min + vec2(x, y) * unit;
-    let stroke = Stroke::new(STROKE, color);
-    let line = |points: &[(f32, f32)]| {
-        painter.add(Shape::line(points.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
-    };
-    let triangle = |points: [(f32, f32); 3]| {
-        let points = points.iter().map(|&(x, y)| p(x, y)).collect();
-        painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
-    };
-
+    let stroke = Stroke::new(STROKE * unit, color);
     match icon {
         Icon::Select => {
-            // A mouse pointer.
-            let outline = [
-                (5.0, 2.5),
-                (5.0, 16.5),
-                (8.6, 13.1),
-                (11.0, 18.3),
-                (13.3, 17.3),
-                (10.9, 12.1),
-                (15.6, 12.1),
-            ];
-            let points: Vec<Pos2> = outline.iter().map(|&(x, y)| p(x, y)).collect();
-            painter.add(Shape::closed_line(points, stroke));
+            painter.add(Shape::line(
+                vec![
+                    p(5.0, 2.5),
+                    p(5.0, 16.0),
+                    p(8.5, 12.7),
+                    p(11.0, 17.5),
+                    p(13.0, 16.5),
+                    p(10.6, 11.7),
+                    p(15.5, 11.7),
+                    p(5.0, 2.5),
+                ],
+                stroke,
+            ));
         }
         Icon::Rect => {
-            let r = Rect::from_min_max(p(3.0, 5.0), p(17.0, 15.0));
-            painter.rect_stroke(r, 1.0, stroke, StrokeKind::Middle);
+            painter.rect_stroke(
+                Rect::from_min_max(p(3.0, 5.0), p(17.0, 15.0)),
+                1.2 * unit,
+                stroke,
+                StrokeKind::Middle,
+            );
         }
         Icon::Ellipse => {
-            painter.add(egui::epaint::EllipseShape::stroke(p(10.0, 10.0), vec2(7.5, 5.5) * unit, stroke));
+            painter.add(egui::epaint::EllipseShape::stroke(
+                p(10.0, 10.0),
+                vec2(7.5, 5.5) * unit,
+                stroke,
+            ));
         }
-        Icon::Line => line(&[(3.5, 16.5), (16.5, 3.5)]),
+        Icon::Line => {
+            painter.add(Shape::line(vec![p(3.5, 16.5), p(16.5, 3.5)], stroke));
+        }
         Icon::Arrow => {
-            line(&[(3.5, 16.5), (13.0, 7.0)]);
-            triangle([(17.0, 3.0), (9.6, 5.4), (14.6, 10.4)]);
+            painter.add(Shape::line(vec![p(3.5, 16.5), p(15.5, 4.5)], stroke));
+            painter.add(Shape::line(
+                vec![p(9.0, 4.0), p(16.0, 4.0), p(16.0, 11.0)],
+                stroke,
+            ));
         }
         Icon::Pen => {
-            // A pencil, tip at the bottom left.
-            let body = [(13.0, 3.0), (17.0, 7.0), (7.0, 17.0), (3.0, 17.0), (3.0, 13.0)];
-            painter.add(Shape::closed_line(body.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
-            line(&[(11.0, 5.0), (15.0, 9.0)]);
-            line(&[(3.0, 13.0), (7.0, 17.0)]);
+            // A pen, tip at the bottom left: an outlined barrel with a band near the
+            // top, and a filled tip.
+            let tip = [p(9.92, 12.91), p(4.4, 15.6), p(7.09, 10.08)];
+            painter.add(Shape::convex_polygon(tip.to_vec(), color, Stroke::NONE));
+            painter.add(Shape::closed_line(
+                vec![p(14.59, 2.59), p(17.41, 5.41), tip[0], tip[1], tip[2]],
+                stroke,
+            ));
+            painter.add(Shape::line(vec![p(12.61, 4.57), p(15.43, 7.39)], stroke));
         }
         Icon::Marker => {
-            // A highlighter with a chisel tip, over a translucent stroke.
-            // The stripe shows the highlighter colour, so the icon reads as a highlighter.
-            let swatch = Rect::from_min_max(p(2.0, 15.5), p(18.0, 19.0));
-            let ink = painter
+            let marker_ink = painter
                 .ctx()
                 .data(|d| d.get_temp::<Color32>(marker_color_id()))
                 .unwrap_or(crate::settings::DEFAULT_MARKER_COLOR);
-            painter.rect_filled(swatch, 1.0, ink);
-            let body = [(12.0, 1.5), (17.5, 7.0), (11.0, 13.5), (5.5, 8.0)];
-            painter.add(Shape::closed_line(body.iter().map(|&(x, y)| p(x, y)).collect(), stroke));
-            triangle([(5.5, 8.0), (11.0, 13.5), (4.0, 14.0)]);
-        }
-        Icon::Text => {
-            // A serif-free "T".
-            line(&[(4.0, 4.5), (16.0, 4.5)]);
-            line(&[(10.0, 4.5), (10.0, 16.5)]);
-            line(&[(7.5, 16.5), (12.5, 16.5)]);
-        }
-        Icon::Blur => effect_preview(painter, area.shrink(2.0 * unit), Effect::Pixelate, color),
-        Icon::Step => {
-            // A filled disc with "1" knocked out.
-            painter.circle_filled(p(10.0, 10.0), 8.0 * unit, color);
-            painter.text(
-                p(10.0, 10.3),
-                egui::Align2::CENTER_CENTER,
-                "1",
-                egui::FontId::proportional(11.0 * unit),
-                background,
+            painter.add(Shape::convex_polygon(
+                vec![
+                    p(7.2, 8.0),
+                    p(13.0, 2.2),
+                    p(14.0, 1.8),
+                    p(15.0, 2.2),
+                    p(18.0, 5.2),
+                    p(18.4, 6.2),
+                    p(18.0, 7.2),
+                    p(12.2, 13.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::convex_polygon(
+                vec![p(6.4, 8.8), p(11.4, 13.8), p(7.0, 15.0), p(3.8, 11.8)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(Shape::convex_polygon(
+                vec![p(3.4, 12.6), p(6.2, 15.4), p(4.5, 16.3), p(1.7, 15.5)],
+                marker_ink,
+                Stroke::NONE,
+            ));
+            painter.rect_filled(
+                Rect::from_min_max(p(2.0, 18.0), p(18.0, 19.5)),
+                0.75 * unit,
+                marker_ink,
             );
         }
-        Icon::Emoji => {
-            // A smiling face: outline, two eyes and a smile.
+        Icon::Text => {
+            // A "T" with serifs on both arms and the foot.
+            painter.add(Shape::line(
+                vec![p(3.5, 7.0), p(3.5, 4.0), p(16.5, 4.0), p(16.5, 7.0)],
+                stroke,
+            ));
+            painter.add(Shape::line(vec![p(10.0, 4.0), p(10.0, 16.0)], stroke));
+            painter.add(Shape::line(vec![p(7.0, 16.0), p(13.0, 16.0)], stroke));
+        }
+        Icon::Blur => {
+            painter.rect_filled(
+                Rect::from_min_max(p(3.0, 3.0), p(7.0, 7.0)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(8.0, 3.0), p(12.0, 7.0)),
+                0.0 * unit,
+                color.gamma_multiply(0.5),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(13.0, 3.0), p(17.0, 7.0)),
+                0.0 * unit,
+                color.gamma_multiply(0.75),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(3.0, 8.0), p(7.0, 12.0)),
+                0.0 * unit,
+                color.gamma_multiply(0.5),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(8.0, 8.0), p(12.0, 12.0)),
+                0.0 * unit,
+                color.gamma_multiply(0.75),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(13.0, 8.0), p(17.0, 12.0)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(3.0, 13.0), p(7.0, 17.0)),
+                0.0 * unit,
+                color.gamma_multiply(0.75),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(8.0, 13.0), p(12.0, 17.0)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(13.0, 13.0), p(17.0, 17.0)),
+                0.0 * unit,
+                color.gamma_multiply(0.5),
+            );
+        }
+        Icon::Step => {
             painter.circle_stroke(p(10.0, 10.0), 7.5 * unit, stroke);
-            painter.circle_filled(p(7.4, 8.0), 1.2 * unit, color);
-            painter.circle_filled(p(12.6, 8.0), 1.2 * unit, color);
-            let smile: Vec<Pos2> = (0..=10)
-                .map(|i| {
-                    let a = (25.0 + 13.0 * i as f32).to_radians();
-                    p(10.0 + 4.2 * a.cos(), 10.0 + 4.2 * a.sin())
-                })
-                .collect();
-            painter.add(Shape::line(smile, stroke));
+            painter.add(Shape::line(
+                vec![p(8.0, 7.0), p(10.0, 5.5), p(10.0, 14.5)],
+                stroke,
+            ));
+            painter.add(Shape::line(vec![p(7.5, 14.5), p(12.5, 14.5)], stroke));
+        }
+        Icon::Emoji => {
+            painter.circle_stroke(p(10.0, 10.0), 7.5 * unit, stroke);
+            painter.circle_filled(p(7.4, 8.0), 1.0 * unit, color);
+            painter.circle_filled(p(12.6, 8.0), 1.0 * unit, color);
+            painter.add(Shape::line(
+                vec![
+                    p(13.80649, 11.775),
+                    p(13.62194, 12.1264),
+                    p(13.40504, 12.4588),
+                    p(13.15773, 12.76925),
+                    p(12.88221, 13.05497),
+                    p(12.58096, 13.3134),
+                    p(12.25666, 13.54224),
+                    p(11.9122, 13.73945),
+                    p(11.55067, 13.90326),
+                    p(11.17528, 14.03221),
+                    p(10.7894, 14.12515),
+                    p(10.39647, 14.18125),
+                    p(10.0, 14.2),
+                    p(9.60353, 14.18125),
+                    p(9.2106, 14.12515),
+                    p(8.82472, 14.03221),
+                    p(8.44933, 13.90326),
+                    p(8.0878, 13.73945),
+                    p(7.74334, 13.54224),
+                    p(7.41904, 13.3134),
+                    p(7.11779, 13.05497),
+                    p(6.84227, 12.76925),
+                    p(6.59496, 12.4588),
+                    p(6.37806, 12.1264),
+                    p(6.19351, 11.775),
+                ],
+                stroke,
+            ));
         }
         Icon::Eyedropper => {
-            // A pipette: bulb at the top right, tube running down to the tip.
-            line(&[(4.0, 16.0), (12.0, 8.0)]);
-            line(&[(9.5, 5.5), (14.5, 10.5)]);
-            painter.circle_filled(p(14.5, 5.5), 3.2 * unit, color);
-            painter.circle_filled(p(3.5, 16.5), 1.2 * unit, color);
+            painter.add(Shape::line(
+                vec![
+                    p(4.0, 13.0),
+                    p(11.0, 6.0),
+                    p(14.0, 9.0),
+                    p(7.0, 16.0),
+                    p(3.0, 17.0),
+                    p(4.0, 13.0),
+                ],
+                stroke,
+            ));
+            painter.add(Shape::line(vec![p(9.0, 5.0), p(15.0, 11.0)], stroke));
+            painter.add(Shape::convex_polygon(
+                vec![
+                    p(11.0, 5.0),
+                    p(13.0, 3.0),
+                    p(15.0, 2.5),
+                    p(17.5, 5.0),
+                    p(17.0, 7.0),
+                    p(15.0, 9.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
         }
         Icon::DoubleHead => {
-            line(&[(6.0, 10.0), (14.0, 10.0)]);
-            triangle([(2.0, 10.0), (7.5, 6.0), (7.5, 14.0)]);
-            triangle([(18.0, 10.0), (12.5, 6.0), (12.5, 14.0)]);
+            painter.add(Shape::line(vec![p(3.0, 10.0), p(17.0, 10.0)], stroke));
+            painter.add(Shape::line(
+                vec![p(7.0, 6.0), p(3.0, 10.0), p(7.0, 14.0)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(13.0, 6.0), p(17.0, 10.0), p(13.0, 14.0)],
+                stroke,
+            ));
         }
-        Icon::Undo | Icon::Redo => {
-            // An arrow pointing left that loops back round on the right (mirrored for redo).
-            let flip = |x: f32| if icon == Icon::Redo { GRID - x } else { x };
-            let mut path = vec![(7.0, 6.0), (11.5, 6.0)];
-            let (cx, cy, r) = (11.5, 10.75, 4.75);
-            for i in 1..=12 {
-                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 12.0;
-                path.push((cx + r * a.cos(), cy + r * a.sin()));
-            }
-            path.push((6.0, 15.5));
-            let path: Vec<(f32, f32)> = path.into_iter().map(|(x, y)| (flip(x), y)).collect();
-            line(&path);
-            triangle([(flip(3.0), 6.0), (flip(7.5), 2.5), (flip(7.5), 9.5)]);
+        Icon::Undo => {
+            painter.add(Shape::line(
+                vec![
+                    p(6.0, 6.0),
+                    p(11.5, 6.0),
+                    p(12.12, 6.04064),
+                    p(12.72939, 6.16185),
+                    p(13.31775, 6.36157),
+                    p(13.875, 6.63638),
+                    p(14.39162, 6.98157),
+                    p(14.85876, 7.39124),
+                    p(15.26843, 7.85838),
+                    p(15.61362, 8.375),
+                    p(15.88843, 8.93225),
+                    p(16.08815, 9.52061),
+                    p(16.20936, 10.13),
+                    p(16.25, 10.75),
+                    p(16.20936, 11.37),
+                    p(16.08815, 11.97939),
+                    p(15.88843, 12.56775),
+                    p(15.61362, 13.125),
+                    p(15.26843, 13.64162),
+                    p(14.85876, 14.10876),
+                    p(14.39162, 14.51843),
+                    p(13.875, 14.86362),
+                    p(13.31775, 15.13843),
+                    p(12.72939, 15.33815),
+                    p(12.12, 15.45936),
+                    p(11.5, 15.5),
+                    p(6.0, 15.5),
+                ],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(7.0, 2.5), p(3.5, 6.0), p(7.0, 9.5)],
+                stroke,
+            ));
         }
-        Icon::Copy => {
-            // Two overlapping sheets; the front one hides the back one's corner.
-            let back = Rect::from_min_max(p(7.0, 3.0), p(17.0, 13.0));
-            let front = Rect::from_min_max(p(3.0, 7.0), p(13.0, 17.0));
-            painter.rect_stroke(back, 1.5, stroke, StrokeKind::Middle);
-            painter.rect_filled(front, 1.5, background);
-            painter.rect_stroke(front, 1.5, stroke, StrokeKind::Middle);
-        }
-        Icon::ReadText => {
-            // Lines of text inside the corners of a scan frame.
-            for (x0, y0, dx, dy) in [(2.5, 2.5, 1.0, 1.0), (17.5, 2.5, -1.0, 1.0), (2.5, 17.5, 1.0, -1.0), (17.5, 17.5, -1.0, -1.0)] {
-                line(&[(x0, y0 + 4.0 * dy), (x0, y0), (x0 + 4.0 * dx, y0)]);
-            }
-            line(&[(6.0, 7.5), (14.0, 7.5)]);
-            line(&[(6.0, 10.5), (14.0, 10.5)]);
-            line(&[(6.0, 13.5), (11.0, 13.5)]);
-        }
-        Icon::ReadQr => {
-            // Three finder squares and a few modules.
-            for (x, y) in [(2.5, 2.5), (11.5, 2.5), (2.5, 11.5)] {
-                let r = Rect::from_min_max(p(x, y), p(x + 6.0, y + 6.0));
-                painter.rect_stroke(r, 0.5, stroke, StrokeKind::Middle);
-                painter.rect_filled(Rect::from_center_size(r.center(), Vec2::splat(2.0 * unit)), 0.0, color);
-            }
-            for (x, y) in [(12.0, 12.0), (15.5, 12.0), (12.0, 15.5), (15.5, 15.5), (13.75, 13.75)] {
-                painter.rect_filled(Rect::from_min_size(p(x, y), Vec2::splat(2.0 * unit)), 0.0, color);
-            }
+        Icon::Redo => {
+            painter.add(Shape::line(
+                vec![
+                    p(14.0, 6.0),
+                    p(8.5, 6.0),
+                    p(7.88, 6.04064),
+                    p(7.27061, 6.16185),
+                    p(6.68225, 6.36157),
+                    p(6.125, 6.63638),
+                    p(5.60838, 6.98157),
+                    p(5.14124, 7.39124),
+                    p(4.73157, 7.85838),
+                    p(4.38638, 8.375),
+                    p(4.11157, 8.93225),
+                    p(3.91185, 9.52061),
+                    p(3.79064, 10.13),
+                    p(3.75, 10.75),
+                    p(3.79064, 11.37),
+                    p(3.91185, 11.97939),
+                    p(4.11157, 12.56775),
+                    p(4.38638, 13.125),
+                    p(4.73157, 13.64162),
+                    p(5.14124, 14.10876),
+                    p(5.60838, 14.51843),
+                    p(6.125, 14.86362),
+                    p(6.68225, 15.13843),
+                    p(7.27061, 15.33815),
+                    p(7.88, 15.45936),
+                    p(8.5, 15.5),
+                    p(14.0, 15.5),
+                ],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(13.0, 2.5), p(16.5, 6.0), p(13.0, 9.5)],
+                stroke,
+            ));
         }
         Icon::Decoration => {
-            // A framed picture and the shadow it casts.
-            let r = Rect::from_min_max(p(3.0, 3.0), p(14.0, 14.0));
-            painter.rect_stroke(r, 1.0, stroke, StrokeKind::Middle);
-            line(&[(6.5, 17.0), (17.0, 17.0), (17.0, 6.5)]);
+            painter.rect_stroke(
+                Rect::from_min_max(p(2.5, 2.5), p(14.5, 14.5)),
+                1.0 * unit,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.add(Shape::line(
+                vec![p(6.0, 17.5), p(17.5, 17.5), p(17.5, 6.0)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(5.0, 12.0), p(8.0, 8.5), p(12.0, 12.0)],
+                stroke,
+            ));
+            painter.circle_filled(p(11.0, 6.0), 1.0 * unit, color);
+        }
+        Icon::ReadText => {
+            painter.add(Shape::line(
+                vec![p(2.5, 6.5), p(2.5, 2.5), p(6.5, 2.5)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(17.5, 6.5), p(17.5, 2.5), p(13.5, 2.5)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(2.5, 13.5), p(2.5, 17.5), p(6.5, 17.5)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(17.5, 13.5), p(17.5, 17.5), p(13.5, 17.5)],
+                stroke,
+            ));
+            painter.add(Shape::line(vec![p(6.0, 7.0), p(14.0, 7.0)], stroke));
+            painter.add(Shape::line(vec![p(6.0, 10.0), p(14.0, 10.0)], stroke));
+            painter.add(Shape::line(vec![p(6.0, 13.0), p(11.0, 13.0)], stroke));
+        }
+        Icon::ReadQr => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(3.0, 3.0), p(8.0, 8.0)),
+                0.2 * unit,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(4.75, 4.75), p(6.25, 6.25)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(p(12.0, 3.0), p(17.0, 8.0)),
+                0.2 * unit,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(13.75, 4.75), p(15.25, 6.25)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(p(3.0, 12.0), p(8.0, 17.0)),
+                0.2 * unit,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(4.75, 13.75), p(6.25, 15.25)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(12.0, 12.0), p(14.0, 14.0)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(15.0, 12.0), p(17.0, 14.0)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(12.0, 15.0), p(14.0, 17.0)),
+                0.0 * unit,
+                color,
+            );
+            painter.rect_filled(
+                Rect::from_min_max(p(15.0, 15.0), p(17.0, 17.0)),
+                0.0 * unit,
+                color,
+            );
+        }
+        Icon::Copy => {
+            painter.add(Shape::line(
+                vec![
+                    p(7.0, 5.0),
+                    p(7.0, 3.0),
+                    p(17.0, 3.0),
+                    p(17.0, 13.0),
+                    p(15.0, 13.0),
+                ],
+                stroke,
+            ));
+            painter.rect_stroke(
+                Rect::from_min_max(p(3.0, 7.0), p(13.0, 17.0)),
+                1.2 * unit,
+                stroke,
+                StrokeKind::Middle,
+            );
         }
         Icon::Save => {
-            // Download into a tray.
-            line(&[(10.0, 2.5), (10.0, 12.0)]);
-            line(&[(6.0, 8.5), (10.0, 12.5), (14.0, 8.5)]);
-            line(&[(3.5, 12.5), (3.5, 16.5), (16.5, 16.5), (16.5, 12.5)]);
+            painter.add(Shape::line(vec![p(10.0, 2.5), p(10.0, 12.0)], stroke));
+            painter.add(Shape::line(
+                vec![p(6.0, 8.0), p(10.0, 12.0), p(14.0, 8.0)],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![p(3.5, 12.5), p(3.5, 16.5), p(16.5, 16.5), p(16.5, 12.5)],
+                stroke,
+            ));
         }
         Icon::Close => {
-            line(&[(5.0, 5.0), (15.0, 15.0)]);
-            line(&[(15.0, 5.0), (5.0, 15.0)]);
+            painter.add(Shape::line(vec![p(5.0, 5.0), p(15.0, 15.0)], stroke));
+            painter.add(Shape::line(vec![p(15.0, 5.0), p(5.0, 15.0)], stroke));
         }
     }
 }
