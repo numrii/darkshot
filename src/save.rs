@@ -56,9 +56,16 @@ pub struct Stamp {
 
 impl Stamp {
     pub fn now() -> Self {
-        let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
-        unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
-        Self { year: t.wYear, month: t.wMonth, day: t.wDay, hour: t.wHour, minute: t.wMinute, second: t.wSecond }
+        let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let (date, clock) = (now.date(), now.time());
+        Self {
+            year: date.year() as u16,
+            month: u8::from(date.month()) as u16,
+            day: date.day() as u16,
+            hour: clock.hour() as u16,
+            minute: clock.minute() as u16,
+            second: clock.second() as u16,
+        }
     }
 
     /// `YYYY-MM-DD`.
