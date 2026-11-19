@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::str::FromStr;
 
 use eframe::egui::{Color32, Key};
@@ -16,7 +17,7 @@ use crate::save::Format;
 pub const FILE_NAME: &str = "duskshot.toml";
 
 /// Whether this build can free Win+ shortcuts from Windows (see `winkeys`).
-pub const FREE_SHORTCUT_AVAILABLE: bool = cfg!(feature = "free-shortcut");
+pub const FREE_SHORTCUT_AVAILABLE: bool = cfg!(all(windows, feature = "free-shortcut"));
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -248,12 +249,15 @@ impl Settings {
         // An older file's `take_over` (from when the personal build used a keyboard
         // hook) is ignored like any unknown key.
         let mut settings: Self = toml::from_str(text).unwrap_or_default();
-        if !shortcut_valid(&settings.hotkey) {
-            settings.hotkey = DEFAULT_HOTKEY.into();
-        }
-        for extra in [&mut settings.clipboard_hotkey, &mut settings.reopen_hotkey] {
-            if !extra.is_empty() && !shortcut_valid(extra) {
-                extra.clear();
+        #[cfg(windows)]
+        {
+            if !shortcut_valid(&settings.hotkey) {
+                settings.hotkey = DEFAULT_HOTKEY.into();
+            }
+            for extra in [&mut settings.clipboard_hotkey, &mut settings.reopen_hotkey] {
+                if !extra.is_empty() && !shortcut_valid(extra) {
+                    extra.clear();
+                }
             }
         }
         settings.keep_minutes = settings.keep_minutes.min(MAX_KEEP_MINUTES);
@@ -390,6 +394,7 @@ pub fn pictures_folder() -> Option<PathBuf> {
 
 /// Parse a shortcut such as `Ctrl+F9`, `Win+Shift+S` or `PrintScreen`. `Win` (or
 /// `Windows`) is accepted for the Windows key.
+#[cfg(windows)]
 pub fn parse_hotkey(text: &str) -> Option<global_hotkey::hotkey::HotKey> {
     let normalized: Vec<&str> = text
         .split('+')
@@ -442,7 +447,15 @@ pub fn tool_key_allowed(key: Key) -> bool {
 
 /// Whether `text` can be used as the capture shortcut: registrable as a hotkey.
 pub fn shortcut_valid(text: &str) -> bool {
-    parse_hotkey(text).is_some()
+    #[cfg(windows)]
+    {
+        return parse_hotkey(text).is_some();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        false
+    }
 }
 
 /// Write a recorded combination as shortcut text, Windows-style:
@@ -634,7 +647,12 @@ mod tests {
         // Missing fields and bad values fall back to defaults; good ones are kept.
         let partial = "hotkey = \"Banana+Q\"\n[save]\nprefix = \"shot \"\nsuffix = \"{counter}\"\njpeg_quality = 250\n";
         let s = Settings::from_toml(partial);
+        // A Linux run preserves global-shortcut settings for a future Windows run;
+        // it cannot validate or use those shortcuts itself.
+        #[cfg(windows)]
         assert_eq!(s.hotkey, DEFAULT_HOTKEY);
+        #[cfg(not(windows))]
+        assert_eq!(s.hotkey, "Banana+Q");
         assert_eq!(s.save.name, "shot {counter}"); // an old prefix and suffix carry over
         assert_eq!(s.save.jpeg_quality, 100);
         assert_eq!(s.swatch_colors(), DEFAULT_SWATCHES);
@@ -715,6 +733,7 @@ arrow = \"Banana\"");
     }
 
     #[test]
+    #[cfg(windows)]
     fn colours_hotkeys_and_templates() {
         assert_eq!(parse_hex("#ffe600"), Some(Color32::from_rgb(0xFF, 0xE6, 0x00)));
         assert_eq!(parse_hex("12345"), None);
@@ -735,6 +754,7 @@ arrow = \"Banana\"");
     }
 
     #[test]
+    #[cfg(windows)]
     fn key_specs() {
         assert_eq!(key_spec("Win+Shift+S"), Some((u32::from(b'S'), MOD_WIN | MOD_SHIFT)));
         assert_eq!(key_spec("ctrl + f9"), Some((0x78, MOD_CTRL)));

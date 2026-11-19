@@ -110,17 +110,34 @@ pub fn read(kind: Kind, img: &RgbaImage, as_is: bool) -> Outcome {
 
 /// The text in `img`, read the way up it is.
 pub fn text_as_is(img: &RgbaImage) -> Outcome {
-    outcome(ocr::recognize_any_size(img))
+    #[cfg(windows)]
+    {
+        return outcome(ocr::recognize_any_size(img));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = img;
+        Err("Text recognition is not available in this build.".to_owned())
+    }
 }
 
 /// The text in `img`, one line per line of text, or why there is none. Text that is
 /// tilted is straightened by Windows itself (tried up to about 40 degrees); text that
 /// is sideways or upside down is found by turning the region, see [`any_way_up`].
 pub fn text(img: &RgbaImage) -> Outcome {
-    outcome(any_way_up(img))
+    #[cfg(windows)]
+    {
+        return outcome(any_way_up(img));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = img;
+        Err("Text recognition is not available in this build.".to_owned())
+    }
 }
 
 /// What Windows read, or why there is nothing to show.
+#[cfg(windows)]
 fn outcome(read: windows::core::Result<Option<Vec<Line>>>) -> Outcome {
     match read {
         Err(e) => Err(format!("Text recognition failed: {}", e.message())),
@@ -223,6 +240,7 @@ pub fn qr(img: &RgbaImage) -> Outcome {
 }
 
 /// A quarter, half or three-quarter turn of the region, clockwise.
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Turn {
     Quarter,
@@ -230,6 +248,7 @@ enum Turn {
     ThreeQuarter,
 }
 
+#[cfg(windows)]
 impl Turn {
     const ALL: [Turn; 3] = [Turn::Quarter, Turn::Half, Turn::ThreeQuarter];
 
@@ -277,6 +296,7 @@ impl Turn {
 /// plausible itself, and more of it. Text the rule below does not know (a lowercase code such
 /// as a7f3k9q2, say) is then still read as it is, not swapped for gibberish that
 /// happens to look like words.
+#[cfg(windows)]
 fn any_way_up(img: &RgbaImage) -> windows::core::Result<Option<Vec<Line>>> {
     let Some(upright) = ocr::recognize_any_size(img)? else { return Ok(None) };
     let score = plausibility(&upright);
@@ -296,6 +316,7 @@ fn any_way_up(img: &RgbaImage) -> windows::core::Result<Option<Vec<Line>>> {
 }
 
 /// At least `percent` of a reading's characters are in plausible words.
+#[cfg(windows)]
 fn plausible_at_least((plausible, all): (usize, usize), percent: usize) -> bool {
     all > 0 && plausible * 100 >= all * percent
 }
@@ -316,6 +337,7 @@ fn plausible_at_least((plausible, all): (usize, usize), percent: usize) -> bool 
 /// those. A single letter of a script without capitals (a Chinese character) counts.
 ///
 /// This only chooses which way up to read; it never changes the text that is read.
+#[cfg(windows)]
 fn plausibility(lines: &[Line]) -> (usize, usize) {
     let mut plausible = 0;
     let mut all = 0;
@@ -348,6 +370,7 @@ fn plausibility(lines: &[Line]) -> (usize, usize) {
 
 /// Letters all small, all capitals, or capitalised, perhaps after one small letter
 /// (iPhone). Letters of scripts without capitals fit any of these.
+#[cfg(windows)]
 fn well_cased(part: &[char]) -> bool {
     let shaped = |p: &[char]| match p {
         [] => true,
@@ -363,6 +386,7 @@ fn well_cased(part: &[char]) -> bool {
     }
 }
 
+#[cfg(windows)]
 mod ocr {
     use eframe::egui::{Pos2, Rect};
     use image::RgbaImage;
@@ -467,7 +491,7 @@ mod ocr {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::annotate::{Annotation, ShapeKind};
@@ -762,4 +786,3 @@ Blueberry muffin 3.25"),
         assert!(found[0].rect().right() <= size as f32 + 1.0, "{:?}", found[0].rect());
     }
 }
-

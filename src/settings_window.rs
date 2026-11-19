@@ -4,14 +4,17 @@ use eframe::egui::{self, Color32, Key, RichText, Sense, Vec2};
 
 use crate::save::{Format, SaveOptions, QUALITY_HIGH, QUALITY_MEDIUM};
 use crate::settings::{
-    self, parse_hex, shortcut_text, shortcut_valid, to_hex, FormatSetting, GridSpacing, Settings, ThemeSetting, DEFAULT_HOTKEY,
-    DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
+    self, parse_hex, to_hex, FormatSetting, GridSpacing, Settings, ThemeSetting, DEFAULT_MARKER_COLOR, DEFAULT_SWATCHES,
 };
+#[cfg(windows)]
+use crate::settings::{shortcut_text, shortcut_valid, DEFAULT_HOTKEY};
 use crate::tools::{ToolInfo, TOOLS};
 use crate::AnyResult;
 
+#[cfg(windows)]
 use recorder::Recorder;
 
+#[cfg(windows)]
 const VK_ESCAPE: u32 = 0x1B;
 /// Errors and warnings.
 const ERROR_RED: Color32 = Color32::from_rgb(0xE5, 0x48, 0x4D);
@@ -19,6 +22,7 @@ const ERROR_RED: Color32 = Color32::from_rgb(0xE5, 0x48, 0x4D);
 /// Recording a shortcut from this window's own keyboard input, so only keys pressed
 /// while it has focus are seen. Combinations Windows keeps for itself never arrive
 /// (until they are freed from Windows, with `free-shortcut`). No keyboard hook.
+#[cfg(windows)]
 mod recorder {
     use eframe::egui::{self, Key};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LWIN, VK_RWIN};
@@ -131,13 +135,15 @@ mod recorder {
 }
 
 pub fn run() -> AnyResult<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
             .with_title("Duskshot settings")
-            .with_icon(crate::appicon::window_icon())
             .with_inner_size([880.0, 700.0])
             .with_min_inner_size([680.0, 300.0])
-            .with_resizable(true),
+            .with_resizable(true);
+    #[cfg(windows)]
+    let viewport = viewport.with_icon(crate::appicon::window_icon());
+    let options = eframe::NativeOptions {
+        viewport,
         wgpu_options: crate::overlay::gpu_options(eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT),
         ..Default::default()
     };
@@ -153,6 +159,7 @@ pub fn run() -> AnyResult<()> {
 }
 
 /// A shortcut set in this window.
+#[cfg(windows)]
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
     Capture,
@@ -160,6 +167,7 @@ enum Which {
     Reopen,
 }
 
+#[cfg(windows)]
 impl Which {
     fn name(self) -> &'static str {
         match self {
@@ -174,12 +182,14 @@ struct SettingsApp {
     settings: Settings,
     saved: Settings,
     /// While recording a shortcut: what catches it.
+    #[cfg(windows)]
     recorder: Option<Recorder>,
     /// The shortcut being recorded.
+    #[cfg(windows)]
     recording_for: Which,
     /// Whether Explorer offers Duskshot under Open with. Kept in the registry, not the
     /// settings file, and changed as soon as the box is ticked.
-    #[cfg(feature = "open-with")]
+    #[cfg(all(windows, feature = "open-with"))]
     open_with: bool,
     /// While choosing a tool's key: that tool.
     tool_recording: Option<&'static ToolInfo>,
@@ -188,14 +198,14 @@ struct SettingsApp {
     was_focused: bool,
     /// Whether Duskshot starts with Windows. Kept in the registry, not the settings
     /// file, and changed as soon as the box is ticked.
-    #[cfg(feature = "autostart")]
+    #[cfg(all(windows, feature = "autostart"))]
     autostart: crate::autostart::Status,
     /// The letters whose Win+ shortcuts Windows leaves alone (`DisabledHotkeys`). Kept
     /// in the registry, not the settings file, and changed as soon as a box is ticked.
-    #[cfg(feature = "free-shortcut")]
+    #[cfg(all(windows, feature = "free-shortcut"))]
     freed: String,
     /// The freed letters changed here, and Explorer has not been restarted since.
-    #[cfg(feature = "free-shortcut")]
+    #[cfg(all(windows, feature = "free-shortcut"))]
     explorer_stale: bool,
 }
 
@@ -205,23 +215,26 @@ impl SettingsApp {
         Self {
             saved: settings.clone(),
             settings,
+            #[cfg(windows)]
             recorder: None,
+            #[cfg(windows)]
             recording_for: Which::Capture,
-            #[cfg(feature = "open-with")]
+            #[cfg(all(windows, feature = "open-with"))]
             open_with: crate::openwith::is_on(),
             tool_recording: None,
             message: None,
             was_focused: false,
-            #[cfg(feature = "autostart")]
+            #[cfg(all(windows, feature = "autostart"))]
             autostart: crate::autostart::status(),
-            #[cfg(feature = "free-shortcut")]
+            #[cfg(all(windows, feature = "free-shortcut"))]
             freed: crate::winkeys::freed(),
-            #[cfg(feature = "free-shortcut")]
+            #[cfg(all(windows, feature = "free-shortcut"))]
             explorer_stale: false,
         }
     }
 
     /// The shortcut setting for `which`.
+    #[cfg(windows)]
     fn shortcut_mut(&mut self, which: Which) -> &mut String {
         match which {
             Which::Capture => &mut self.settings.hotkey,
@@ -231,6 +244,7 @@ impl SettingsApp {
     }
 
     /// Start or stop recording the shortcut for `which`.
+    #[cfg(windows)]
     fn toggle_recording(&mut self, which: Which) {
         self.message = None;
         self.tool_recording = None;
@@ -245,6 +259,7 @@ impl SettingsApp {
     }
 
     /// Pick up a combination caught by the recorder, if any.
+    #[cfg(windows)]
     fn poll_recorder(&mut self, ctx: &egui::Context) {
         let Some(recorder) = &self.recorder else { return };
         let Some((vk, mods)) = recorder.recorded(ctx) else {
@@ -315,7 +330,7 @@ impl SettingsApp {
     }
 
     /// The "Start with Windows" checkbox, applied at once.
-    #[cfg(feature = "autostart")]
+    #[cfg(all(windows, feature = "autostart"))]
     fn startup_setting(&mut self, ui: &mut egui::Ui) {
         use crate::autostart::{self, Status};
         let mut on = self.autostart == Status::On;
@@ -334,7 +349,7 @@ impl SettingsApp {
     }
 
     /// Free the capture shortcut from Windows, or give shortcuts back; applied at once.
-    #[cfg(feature = "free-shortcut")]
+    #[cfg(all(windows, feature = "free-shortcut"))]
     fn free_shortcut_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
         use crate::winkeys;
         let current = winkeys::letter_of(&self.settings.hotkey);
@@ -420,7 +435,10 @@ impl SettingsApp {
                     let tip = format!("The key that picks {}. Click, then press a key. Esc cancels.", info.name);
                     if button.on_hover_text(tip).clicked() {
                         self.message = None;
-                        self.recorder = None;
+                        #[cfg(windows)]
+                        {
+                            self.recorder = None;
+                        }
                         self.tool_recording = if recording { None } else { Some(info) };
                     }
                     let reset = custom && ui.small_button("Reset").on_hover_text(format!("Back to {}", crate::keys::label(info.key))).clicked();
@@ -459,6 +477,7 @@ const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 /// Hand this one fixed address to Windows, which opens it in the default browser.
 /// Duskshot itself still connects to nothing, and nothing it reads (a QR code, say) is
 /// ever opened: this is the only address it opens, and only when clicked.
+#[cfg(windows)]
 fn open_repository() {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -469,6 +488,9 @@ fn open_repository() {
         ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), url.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
     }
 }
+
+#[cfg(not(windows))]
+fn open_repository() {}
 
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(10.0);
@@ -490,6 +512,7 @@ impl eframe::App for SettingsApp {
         }
         self.was_focused = focused;
         crate::icons::set_marker_color(&ctx, self.settings.marker());
+        #[cfg(windows)]
         self.poll_recorder(&ctx);
         self.poll_tool_key(&ctx);
         let weak = ui.visuals().weak_text_color();
@@ -559,6 +582,13 @@ fn hint(ui: &mut egui::Ui, text: &str) {
 impl SettingsApp {
     /// The left column: shortcuts and tools.
     fn keys_column(&mut self, ui: &mut egui::Ui, weak: Color32) {
+        #[cfg(windows)]
+        self.global_shortcuts_setting(ui, weak);
+        self.tools_setting(ui, weak);
+    }
+
+    #[cfg(windows)]
+    fn global_shortcuts_setting(&mut self, ui: &mut egui::Ui, weak: Color32) {
         section(ui, "Shortcuts");
         hint(ui, "Click a button, then press the keys. Esc cancels.");
         ui.add_space(2.0);
@@ -603,7 +633,6 @@ impl SettingsApp {
                 ui.end_row();
             }
         });
-        self.tools_setting(ui, weak);
     }
 
     /// The right column: general options, colours and saving.
@@ -656,6 +685,7 @@ impl SettingsApp {
             .on_hover_text("Drawn where it was when you pressed the shortcut.");
         ui.checkbox(&mut self.settings.confirm_discard, "Ask before discarding annotations")
             .on_hover_text("When you press Esc or Close before copying or saving.");
+        #[cfg(windows)]
         ui.horizontal(|ui| {
             let mut keep = self.settings.keep_minutes > 0;
             let tip = "Reopen it from the tray menu or its shortcut. Kept in memory only, until the next \
@@ -672,9 +702,9 @@ impl SettingsApp {
                 ui.label("minutes");
             });
         });
-        #[cfg(feature = "autostart")]
+        #[cfg(all(windows, feature = "autostart"))]
         self.startup_setting(ui);
-        #[cfg(feature = "open-with")]
+        #[cfg(all(windows, feature = "open-with"))]
         {
             let toggle = ui
                 .checkbox(&mut self.open_with, "Show in Open with for images")

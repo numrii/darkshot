@@ -151,6 +151,7 @@ struct Process {
     user: u32,
 }
 
+#[cfg(windows)]
 fn process() -> Process {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
@@ -180,9 +181,15 @@ fn process() -> Process {
     p
 }
 
+#[cfg(not(windows))]
+fn process() -> Process {
+    Process::default()
+}
+
 /// This process's GPU memory in bytes, summed over the adapters: (local, shared).
 /// Local is the graphics card's own memory; shared is system memory the GPU uses (all
 /// of it, on integrated graphics).
+#[cfg(windows)]
 fn gpu_memory() -> (u64, u64) {
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{
@@ -206,4 +213,9 @@ fn gpu_memory() -> (u64, u64) {
         }
     }
     (local, shared)
+}
+
+#[cfg(not(windows))]
+fn gpu_memory() -> (u64, u64) {
+    (0, 0)
 }

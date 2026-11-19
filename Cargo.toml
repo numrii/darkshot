@@ -31,7 +31,6 @@ arboard = "3.7.0"
 # code to open URLs in a browser (the webbrowser crate); a privacy-first tool has no
 # business with that. Also off: Linux backends, web screen reader, system font lookup.
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "wgpu"] }
-global-hotkey = "0.10.0"
 # Puts emoji sequences (skin tones, flags, families) together for emoji stamps. Already
 # in the build through egui, which shapes its own text with it.
 harfrust = "0.12.0"
@@ -45,16 +44,28 @@ rqrr = { version = "0.11.0", default-features = false }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+time = { version = "0.3.47", features = ["local-offset"] }
 toml = "1.2.1"
-tray-icon = "0.26.1"
 ttf-parser = "0.25.1"
+winit = "0.30"
+
+[target.'cfg(windows)'.dependencies]
 # COM and WinRT interfaces, which windows-sys does not have: DXGI desktop duplication
-# (for monitors showing HDR) and Windows' own offline text recognition (OCR). Already in
-# the build through other crates.
+# (for monitors showing HDR) and Windows' own offline text recognition (OCR).
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Devices_Display", "Win32_Graphics_Gdi", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Foundation_Collections"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_ProcessStatus"] }
-winit = "0.30"
+# Retained only for the established Windows implementation. Linux capture uses the
+# wlroots protocol bindings below and never links this crate.
 xcap = "0.9.10"
+global-hotkey = "0.10.0"
+tray-icon = "0.26.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Initial Linux capture target: wlroots' screencopy v1.  It is supported by Sway,
+# Niri and LabWC and gives this native Wayland client a one-frame output copy.
+# A future `ext-image-copy-capture` implementation can live beside this fallback.
+wayland-client = "0.31.15"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 
 # Optimise dependencies even in dev builds: unoptimised egui/wgpu/image make the
 # overlay slow to open and sluggish, which hides real performance problems.

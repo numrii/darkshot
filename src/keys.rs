@@ -6,12 +6,14 @@
 //! find the key code a press really was, and the label printed on that key here.
 
 use eframe::egui::Key;
+#[cfg(windows)]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, MapVirtualKeyExW, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
 };
 
 /// The scan code of the key in `key`'s place on a US keyboard, for keys that type a
 /// letter, digit or punctuation (whose place differs between layouts).
+#[cfg(windows)]
 fn scan_code(key: Key) -> Option<u32> {
     const ROWS: [(&str, u32); 4] = [("1234567890", 0x02), ("QWERTYUIOP", 0x10), ("ASDFGHJKL", 0x1E), ("ZXCVBNM", 0x2C)];
     let name = key.name();
@@ -35,6 +37,7 @@ fn scan_code(key: Key) -> Option<u32> {
     })
 }
 
+#[cfg(windows)]
 fn layout() -> isize {
     // SAFETY: plain query of this thread's keyboard layout.
     unsafe { GetKeyboardLayout(0) as isize }
@@ -43,6 +46,7 @@ fn layout() -> isize {
 /// The Windows key code of the key at `physical` (a place on a US keyboard, as egui
 /// reports it) in the current layout. `None` for keys whose code does not depend on
 /// the layout.
+#[cfg(windows)]
 pub fn virtual_key_at(physical: Key) -> Option<u32> {
     let scan = scan_code(physical)?;
     // SAFETY: plain lookups in the current keyboard layout.
@@ -52,6 +56,7 @@ pub fn virtual_key_at(physical: Key) -> Option<u32> {
 
 /// The character the key with Windows key code `vk` types without Shift: `ö` for
 /// VK_OEM_3 on a Swedish keyboard.
+#[cfg(windows)]
 fn typed(vk: u32) -> Option<char> {
     // SAFETY: plain lookup in the current keyboard layout. Dead keys set the top bit.
     let code = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, layout() as _) } & 0x7FFF_FFFF;
@@ -59,6 +64,7 @@ fn typed(vk: u32) -> Option<char> {
 }
 
 /// The character as printed on the key: upper case.
+#[cfg(windows)]
 fn printed(vk: u32) -> Option<String> {
     typed(vk).map(|c| c.to_uppercase().collect())
 }
@@ -77,10 +83,13 @@ pub fn label(key: Key) -> String {
     // egui names a key after the character it types, unless it has no name for that
     // character (Ö): then after its place on a US keyboard, so show what the key in
     // that place types here.
-    match virtual_key_at(key).and_then(typed) {
-        Some(c) if Key::from_name(&c.to_string()).is_none() => c.to_uppercase().collect(),
-        _ => symbol.to_owned(),
+    #[cfg(windows)]
+    if let Some(c) = virtual_key_at(key).and_then(typed)
+        && Key::from_name(&c.to_string()).is_none()
+    {
+        return c.to_uppercase().collect();
     }
+    symbol.to_owned()
 }
 
 /// How to show a shortcut stored as text (`Ctrl+Backquote`): with punctuation keys
@@ -89,7 +98,16 @@ pub fn shortcut_label(text: &str) -> String {
     text.split('+')
         .map(|token| {
             let token = token.trim();
-            crate::settings::punctuation_key(token).and_then(printed).unwrap_or_else(|| token.to_owned())
+            #[cfg(windows)]
+            {
+                crate::settings::punctuation_key(token)
+                    .and_then(printed)
+                    .unwrap_or_else(|| token.to_owned())
+            }
+            #[cfg(not(windows))]
+            {
+                token.to_owned()
+            }
         })
         .collect::<Vec<_>>()
         .join("+")
@@ -105,9 +123,12 @@ mod tests {
         assert_eq!(label(Key::K), "K");
         assert_eq!(label(Key::F2), "F2");
         assert_eq!(label(Key::Home), "Home");
-        assert_eq!(scan_code(Key::Q), Some(0x10));
-        assert_eq!(scan_code(Key::Num0), Some(0x0B));
-        assert_eq!(scan_code(Key::M), Some(0x32));
+        #[cfg(windows)]
+        {
+            assert_eq!(scan_code(Key::Q), Some(0x10));
+            assert_eq!(scan_code(Key::Num0), Some(0x0B));
+            assert_eq!(scan_code(Key::M), Some(0x32));
+        }
         assert_eq!(shortcut_label("Win+Shift+S"), "Win+Shift+S");
         // Punctuation shows a single character, whatever the layout.
         for key in [Key::Semicolon, Key::Comma, Key::Backtick] {

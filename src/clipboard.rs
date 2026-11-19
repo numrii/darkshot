@@ -11,17 +11,23 @@
 //! not for images, so images are written here, with the Windows API directly.)
 
 use image::RgbaImage;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFOHEADER};
+#[cfg(windows)]
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+#[cfg(windows)]
 use windows_sys::Win32::System::Ole::CF_DIB;
 
 use crate::AnyResult;
 
 /// Put `img` on the clipboard, as PNG with its transparency and as a bitmap on white.
+#[cfg(windows)]
 pub fn set_image(img: &RgbaImage) -> AnyResult<()> {
     let png = png(img)?;
     let mut flat = img.clone();
@@ -43,7 +49,20 @@ pub fn set_image(img: &RgbaImage) -> AnyResult<()> {
     Ok(())
 }
 
+/// Put an RGBA image on a Wayland clipboard through the platform clipboard provider.
+#[cfg(not(windows))]
+pub fn set_image(img: &RgbaImage) -> AnyResult<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_image(arboard::ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: std::borrow::Cow::Owned(img.clone().into_raw()),
+    })?;
+    Ok(())
+}
+
 /// `img` as a PNG file's bytes.
+#[cfg(windows)]
 fn png(img: &RgbaImage) -> AnyResult<Vec<u8>> {
     let mut bytes = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)?;
@@ -52,6 +71,7 @@ fn png(img: &RgbaImage) -> AnyResult<Vec<u8>> {
 
 /// `img` as a device-independent bitmap: a header, then 32-bit blue-green-red pixels,
 /// bottom row first.
+#[cfg(windows)]
 fn dib(img: &RgbaImage) -> Vec<u8> {
     let (w, h) = img.dimensions();
     let header = BITMAPINFOHEADER {
@@ -82,6 +102,7 @@ fn dib(img: &RgbaImage) -> Vec<u8> {
 }
 
 /// The number of the clipboard format called `name`.
+#[cfg(windows)]
 fn format(name: &str) -> AnyResult<u32> {
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     match unsafe { RegisterClipboardFormatW(wide.as_ptr()) } {
@@ -91,6 +112,7 @@ fn format(name: &str) -> AnyResult<u32> {
 }
 
 /// Put `bytes` on the open clipboard as `format`. The clipboard owns the memory after.
+#[cfg(windows)]
 fn put(format: u32, bytes: &[u8]) -> AnyResult<()> {
     unsafe {
         let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
@@ -114,8 +136,10 @@ fn put(format: u32, bytes: &[u8]) -> AnyResult<()> {
 
 /// The clipboard, open until dropped. Another program may hold it for a moment, so
 /// opening is tried a few times.
+#[cfg(windows)]
 struct Open;
 
+#[cfg(windows)]
 impl Open {
     fn new() -> AnyResult<Self> {
         for _ in 0..20 {
@@ -128,13 +152,14 @@ impl Open {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Open {
     fn drop(&mut self) {
         unsafe { CloseClipboard() };
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

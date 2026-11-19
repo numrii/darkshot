@@ -2,8 +2,11 @@
 //! picking the window under a point, and pulling edges onto nearby window edges.
 
 use eframe::egui::{Pos2, Rect};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+#[cfg(windows)]
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, IsIconic, IsWindowVisible};
 
 /// How close (in desktop pixels) an edge must be to a window edge to snap to it.
@@ -94,6 +97,7 @@ fn nearest(sorted: &[(f32, usize)], v: f32) -> Option<f32> {
 /// Visible, on-screen top-level windows, front to back, as desktop-pixel rectangles
 /// relative to the desktop's top-left corner at (`left`, `top`). Uses the window's
 /// visible frame (without the invisible resize border Windows adds round it).
+#[cfg(windows)]
 pub fn visible_windows(left: i32, top: i32) -> Vec<Rect> {
     unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> i32 {
         let list = unsafe { &mut *(data as *mut Vec<HWND>) };
@@ -136,6 +140,13 @@ pub fn visible_windows(left: i32, top: i32) -> Vec<Rect> {
             (rect.width() >= 8.0 && rect.height() >= 8.0).then_some(rect)
         })
         .collect()
+}
+
+/// Wayland deliberately does not expose a universal toplevel-window list. Keep
+/// monitor-edge snapping, but do not pretend there are windows to snap to.
+#[cfg(not(windows))]
+pub fn visible_windows(_left: i32, _top: i32) -> Vec<Rect> {
+    Vec::new()
 }
 
 #[cfg(test)]

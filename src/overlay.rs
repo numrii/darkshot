@@ -1,32 +1,20 @@
 //! The capture overlay: freeze every monitor, show the frozen desktop in one window
 //! spanning all of them, let the user pick and adjust a region, then copy or save it.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui::{
     self, vec2, Align2, Color32, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
 };
 use image::RgbaImage;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_INTERNALPAINT, RDW_UPDATENOW};
-use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
-use windows_sys::Win32::UI::HiDpi::{
-    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, KillTimer, SetForegroundWindow, SetTimer, SetWindowPos,
-    HWND_TOPMOST, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
-};
-
-use winit::event_loop::{DeviceEvents, EventLoop};
+use winit::event_loop::EventLoop;
+#[cfg(windows)]
+use winit::event_loop::DeviceEvents;
 
 use crate::annotate::{
     self, Annotation, ArrowHead, Dash, Effect, History, Repeat, ShapeKind, TextStyle, MAX_WIDTH,
@@ -41,6 +29,7 @@ use crate::snap::{self, Snap};
 use crate::text::Layout;
 use crate::tools::{ToolInfo, TOOLS};
 use crate::icons::{self, Icon};
+use crate::platform::{self, DesktopRect, OverlayHandle};
 use crate::AnyResult;
 
 /// How close (in points) the pointer must be to an edge or handle to grab it.
@@ -94,7 +83,7 @@ pub enum Source {
 /// Open the overlay over `source` and run it until the user copies, saves or cancels.
 pub fn run(source: Source) -> AnyResult<()> {
     // Must happen first: without it Windows reports scaled, not physical, coordinates.
-    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    platform::prepare_editor_process();
 
     // Grab the screen before our own window exists so the overlay is never in the shot.
     trace("start");
@@ -138,7 +127,8 @@ pub fn run(source: Source) -> AnyResult<()> {
     // afterwards, the first frame would be drawn into the small surface and stretched.
     // egui takes points; `cover_desktop` corrects any rounding or mixed-DPI mismatch.
     let b = desktop.bounds;
-    let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+    let scale = platform::editor_scale();
+    let window_size = platform::editor_window_size(b);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
@@ -146,10 +136,7 @@ pub fn run(source: Source) -> AnyResult<()> {
             .with_active(true)
             .with_clamp_size_to_monitor_size(false)
             .with_position([b.left as f32 / scale, b.top as f32 / scale])
-            .with_inner_size([
-                (b.right - b.left) as f32 / scale,
-                (b.bottom - b.top) as f32 / scale,
-            ]),
+            .with_inner_size([window_size.0 / scale, window_size.1 / scale]),
         // Wait for the display's refresh with a one-frame queue: the lowest latency that
         // never draws more frames than the screen shows. Without the wait, moving the
         // mouse drew hundreds of frames a second, which kept the GPU busy in bursts
@@ -167,6 +154,7 @@ pub fn run(source: Source) -> AnyResult<()> {
     // delivers paint messages when the queue is empty, so repaints starve and anything
     // being dragged lags far behind the cursor.
     let event_loop = EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+    #[cfg(windows)]
     event_loop.listen_device_events(DeviceEvents::Never);
     let mut app = eframe::create_native(
         "Duskshot",
@@ -232,7 +220,7 @@ fn read_kept(bytes: &[u8]) -> crate::handoff::Result<(Desktop, Kept)> {
         let png = r.bytes()?;
         image::load_from_memory_with_format(png, image::ImageFormat::Png).map(|i| i.to_rgba8()).map_err(|_| "unreadable screen")
     })?;
-    let bounds = RECT { left: r.i32()?, top: r.i32()?, right: r.i32()?, bottom: r.i32()? };
+    let bounds = DesktopRect { left: r.i32()?, top: r.i32()?, right: r.i32()?, bottom: r.i32()? };
     let monitors = r.list(|r| r.rect())?;
     let home = r.u32()? as usize;
     let windows = r.list(|r| r.rect())?;
@@ -397,7 +385,7 @@ struct Desktop {
     /// up front) so opening the overlay stays fast on large multi-monitor desktops.
     shots: Vec<RgbaImage>,
     /// The virtual desktop's bounds in screen coordinates.
-    bounds: RECT,
+    bounds: DesktopRect,
     /// Each monitor's area in desktop pixels (origin = the desktop's top-left corner).
     /// Selections use the same coordinate space.
     monitors: Vec<Rect>,
@@ -419,27 +407,16 @@ struct Desktop {
 impl Desktop {
     /// Capture every monitor, with the mouse cursor drawn in if `include_cursor`.
     fn capture(include_cursor: bool) -> AnyResult<Self> {
-        let mut cursor = POINT { x: 0, y: 0 };
-        unsafe { GetCursorPos(&mut cursor) };
-        // Read first, so it is the cursor as it was when the capture was asked for.
-        let pointer = if include_cursor { crate::cursor::Cursor::current() } else { None };
-
-        // Monitors showing HDR are read in their own format and converted (see `hdr`);
-        // the ordinary capture of one looks washed out.
-        let hdr = crate::hdr::Hdr::detect();
-        let mut shots = Vec::new();
-        for monitor in xcap::Monitor::all()? {
-            let (x, y) = (monitor.x()?, monitor.y()?);
-            let shot = match hdr.as_ref().and_then(|hdr| hdr.capture(x, y)) {
-                Some(shot) => shot,
-                None => monitor.capture_image()?,
-            };
-            shots.push((x, y, shot));
-            trace("monitor captured");
-        }
-        if let Some(pointer) = pointer {
-            pointer.draw(&mut shots);
-        }
+        let capture = crate::platform::capture(include_cursor)?;
+        let cursor = capture.pointer.unwrap_or((0, 0));
+        let shots: Vec<_> = capture
+            .outputs
+            .into_iter()
+            .map(|output| {
+                trace("monitor captured");
+                (output.x, output.y, output.image)
+            })
+            .collect();
         let edge = |f: fn(&(i32, i32, RgbaImage)) -> i32| shots.iter().map(f);
         let (Some(left), Some(top), Some(right), Some(bottom)) = (
             edge(|s| s.0).min(),
@@ -459,12 +436,12 @@ impl Desktop {
                 )
             })
             .collect();
-        let cursor = Pos2::new((cursor.x - left) as f32, (cursor.y - top) as f32);
+        let cursor = Pos2::new((cursor.0 - left) as f32, (cursor.1 - top) as f32);
         let home = monitors.iter().position(|m| m.contains(cursor)).unwrap_or(0);
 
         Ok(Self {
             shots: shots.into_iter().map(|s| s.2).collect(),
-            bounds: RECT { left, top, right, bottom },
+            bounds: DesktopRect { left, top, right, bottom },
             snap: Snap::new(snap::visible_windows(left, top), &monitors),
             screens: monitors.clone(),
             space: vec2((right - left) as f32, (bottom - top) as f32),
@@ -476,29 +453,21 @@ impl Desktop {
 
     /// `img` opened for editing on the monitor under the mouse pointer.
     fn open(img: RgbaImage, opened: Opened) -> Self {
-        use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-        let mut cursor = POINT { x: 0, y: 0 };
-        let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
-        info.cbSize = size_of::<MONITORINFO>() as u32;
-        unsafe {
-            GetCursorPos(&mut cursor);
-            GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mut info);
-        }
-        Self::open_on(img, opened, info.rcMonitor)
+        Self::open_on(img, opened, platform::editor_monitor())
     }
 
     /// `img` opened for editing on the monitor at `monitor` (screen pixels).
-    fn open_on(img: RgbaImage, opened: Opened, monitor: RECT) -> Self {
+    fn open_on(img: RgbaImage, opened: Opened, monitor: DesktopRect) -> Self {
         let screen = vec2((monitor.right - monitor.left) as f32, (monitor.bottom - monitor.top) as f32);
         let size = vec2(img.width() as f32, img.height() as f32);
         // A window a little larger than the image when it fits, with room for the
         // toolbar, the strip and the tool box; otherwise the whole monitor.
-        let dpi = unsafe { GetDpiForSystem() } as f32 / 96.0;
+        let dpi = platform::editor_scale();
         let want = (size + vec2(120.0, 220.0) * dpi).max(vec2(960.0, 640.0) * dpi).ceil();
         let (bounds, space, image) = if want.x <= screen.x && want.y <= screen.y {
             let left = monitor.left + ((screen.x - want.x) / 2.0) as i32;
             let top = monitor.top + ((screen.y - want.y) / 2.0) as i32;
-            let bounds = RECT { left, top, right: left + want.x as i32, bottom: top + want.y as i32 };
+            let bounds = DesktopRect { left, top, right: left + want.x as i32, bottom: top + want.y as i32 };
             let at = ((want - size) / 2.0).floor().to_pos2();
             (bounds, want, Rect::from_min_size(at, size))
         } else {
@@ -520,7 +489,7 @@ impl Desktop {
 
     /// For tests: a capture of these monitors.
     #[cfg(test)]
-    fn new(shots: Vec<RgbaImage>, bounds: RECT, monitors: Vec<Rect>, home: usize, snap: Snap) -> Self {
+    fn new(shots: Vec<RgbaImage>, bounds: DesktopRect, monitors: Vec<Rect>, home: usize, snap: Snap) -> Self {
         let space = vec2((bounds.right - bounds.left) as f32, (bounds.bottom - bounds.top) as f32);
         Self { shots, bounds, screens: monitors.clone(), monitors, home, snap, space, opened: None }
     }
@@ -532,140 +501,6 @@ impl Desktop {
             Some(_) => self.monitors[0],
             None => self.screens[i.min(self.screens.len() - 1)],
         }
-    }
-}
-
-fn hwnd_of(window: &impl HasWindowHandle) -> Option<HWND> {
-    match window.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(h) => Some(h.hwnd.get() as HWND),
-        _ => None,
-    }
-}
-
-/// Minimum time between mouse-move messages passed on to the app (500 per second).
-const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(2);
-/// If the mouse is moving and no frame has been painted for this long, paint one now.
-const MAX_PAINT_DELAY: Duration = Duration::from_millis(5);
-const MOUSE_THROTTLE_ID: usize = 0xDA5C_5407;
-
-/// Message statistics gathered between two frames, for `--trace`.
-#[derive(Clone, Copy, Default)]
-struct MsgStats {
-    moves: u32,
-    moves_forwarded: u32,
-    other: u32,
-    forced_paints: u32,
-    /// The slowest single message: (message id, microseconds).
-    slowest: (u32, u32),
-    /// Duration of the last WM_PAINT (a whole frame including present), microseconds.
-    paint_us: u32,
-}
-
-thread_local! {
-    static LAST_FORWARDED: Cell<Option<Instant>> = const { Cell::new(None) };
-    static LAST_PAINT: Cell<Option<Instant>> = const { Cell::new(None) };
-    static PENDING: Cell<Option<(WPARAM, LPARAM)>> = const { Cell::new(None) };
-    static STATS: Cell<MsgStats> = const { Cell::new(MsgStats {
-        moves: 0, moves_forwarded: 0, other: 0, forced_paints: 0, slowest: (0, 0), paint_us: 0,
-    }) };
-}
-
-fn bump(f: impl FnOnce(&mut MsgStats)) {
-    let mut stats = STATS.get();
-    f(&mut stats);
-    STATS.set(stats);
-}
-
-/// Window subclass that keeps the overlay repainting under a flood of mouse input.
-///
-/// Windows only delivers paint messages when the message queue is otherwise empty. A
-/// mouse polling at up to 8000 Hz keeps a mouse-move pending almost all the time, so
-/// during fast movement repaints starve for hundreds of milliseconds and a dragged
-/// selection moves in jerks. Two measures, both applied before winit and egui see
-/// the message:
-///
-/// 1. Rate-limit `WM_MOUSEMOVE`, so most of the flood costs almost nothing. The
-///    latest dropped position is never lost: it is delivered before any button or
-///    wheel message, or by a short timer once the mouse stops.
-/// 2. Do not wait for an idle queue: when a move is passed on and the last frame is
-///    older than `MAX_PAINT_DELAY`, paint synchronously right away.
-// WM_MOUSEMOVE is matched on its own first, then the rest of the mouse range.
-#[allow(clippy::match_overlapping_arm)]
-unsafe extern "system" fn pump_guard(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_MOUSEMOVE => {
-                bump(|s| s.moves += 1);
-                let now = Instant::now();
-                let too_soon = LAST_FORWARDED
-                    .get()
-                    .is_some_and(|last| now.duration_since(last) < MOUSE_MOVE_INTERVAL);
-                if too_soon {
-                    if PENDING.replace(Some((wparam, lparam))).is_none() {
-                        SetTimer(hwnd, MOUSE_THROTTLE_ID, 10, None);
-                    }
-                    return 0;
-                }
-                LAST_FORWARDED.set(Some(now));
-                PENDING.set(None);
-                bump(|s| s.moves_forwarded += 1);
-                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-
-                let overdue = LAST_PAINT
-                    .get()
-                    .is_none_or(|last| now.duration_since(last) >= MAX_PAINT_DELAY);
-                if overdue {
-                    bump(|s| s.forced_paints += 1);
-                    // Sends WM_PAINT synchronously; it re-enters this function below.
-                    RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT | RDW_UPDATENOW);
-                }
-                return result;
-            }
-            WM_PAINT => {
-                let start = Instant::now();
-                LAST_PAINT.set(Some(start));
-                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-                let us = start.elapsed().as_micros() as u32;
-                bump(|s| s.paint_us = us);
-                return result;
-            }
-            WM_TIMER if wparam == MOUSE_THROTTLE_ID => {
-                KillTimer(hwnd, MOUSE_THROTTLE_ID);
-                if let Some((w, l)) = PENDING.take() {
-                    LAST_FORWARDED.set(Some(Instant::now()));
-                    return DefSubclassProc(hwnd, WM_MOUSEMOVE, w, l);
-                }
-                return 0;
-            }
-            // Clicks and wheel turns must act at the true cursor position, so deliver
-            // any held-back move first. Their lparam carries the same client coordinates.
-            WM_MOUSEFIRST..=WM_MOUSELAST => {
-                if let Some((w, _)) = PENDING.take() {
-                    DefSubclassProc(hwnd, WM_MOUSEMOVE, w, lparam);
-                }
-            }
-            WM_NCDESTROY => {
-                RemoveWindowSubclass(hwnd, Some(pump_guard), MOUSE_THROTTLE_ID);
-            }
-            _ => {}
-        }
-        let start = Instant::now();
-        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-        let us = start.elapsed().as_micros() as u32;
-        bump(|s| {
-            s.other += 1;
-            if us > s.slowest.1 {
-                s.slowest = (msg, us);
-            }
-        });
-        result
     }
 }
 
@@ -1144,7 +979,7 @@ struct Overlay {
     smooth_textures: Vec<egui::TextureHandle>,
     /// How the capture is turned under the region (see `Rotation`).
     rotation: Rotation,
-    hwnd: Option<HWND>,
+    native_overlay: Option<OverlayHandle>,
     /// The monitor the pointer was last on; Ctrl+A and the hint bar use it.
     current_monitor: usize,
     /// The monitor popups and tooltips are kept on (see `raw_input_hook`).
@@ -1368,7 +1203,7 @@ struct ToolbarOutput {
 }
 
 impl Overlay {
-    fn with_desktop(desktop: Desktop, hwnd: Option<HWND>, settings: &Settings) -> Self {
+    fn with_desktop(desktop: Desktop, native_overlay: Option<OverlayHandle>, settings: &Settings) -> Self {
         let swatches = settings.swatch_colors();
         // An opened image starts selected, and saves next to itself as "name-edited".
         let mut save_options = SaveOptions::from_settings(settings);
@@ -1390,7 +1225,7 @@ impl Overlay {
             textures: Vec::new(),
             smooth_textures: Vec::new(),
             rotation: Rotation::NONE,
-            hwnd,
+            native_overlay,
             selection,
             action: None,
             pending_undo: None,
@@ -1473,46 +1308,34 @@ impl Overlay {
         setup_text(&cc.egui_ctx);
         crate::theme::apply(&cc.egui_ctx, settings.theme);
         icons::set_marker_color(&cc.egui_ctx, settings.marker());
-        let mut overlay = Self::with_desktop(desktop, hwnd_of(cc), settings);
+        let mut overlay = Self::with_desktop(desktop, platform::overlay_handle(cc), settings);
         overlay.claim_focus_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
         if let Some(recent) = crate::settings::load_recent() {
             overlay.recent_emoji = recent;
         }
         overlay.persist_recent = true;
-        if let Some(hwnd) = overlay.hwnd {
+        if let Some(handle) = overlay.native_overlay {
             // Switch off the window's fade-in. During that animation the live desktop
             // shows through the frozen capture, which looks like ghosting when
             // something on screen is moving. The window is still hidden at this point.
-            let disable: i32 = 1;
-            unsafe {
-                SetWindowSubclass(hwnd, Some(pump_guard), MOUSE_THROTTLE_ID, 0);
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-                    std::ptr::from_ref(&disable).cast(),
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
+            platform::prepare_overlay(handle);
         }
         overlay.cover_desktop(true);
-        if let Some(hwnd) = overlay.hwnd {
-            unsafe { SetForegroundWindow(hwnd) };
+        if let Some(handle) = overlay.native_overlay {
+            platform::focus_overlay(handle);
         }
         overlay
     }
 
     /// Take the keyboard back while the overlay is opening, if something else took it.
     fn claim_focus(&mut self, ctx: &egui::Context) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-        let (Some(until), Some(hwnd)) = (self.claim_focus_until, self.hwnd) else { return };
+        let (Some(until), Some(handle)) = (self.claim_focus_until, self.native_overlay) else { return };
         if std::time::Instant::now() >= until {
             self.claim_focus_until = None;
             return;
         }
-        unsafe {
-            if GetForegroundWindow() != hwnd {
-                SetForegroundWindow(hwnd);
-            }
+        if !platform::overlay_has_focus(handle) {
+            platform::focus_overlay(handle);
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -1521,17 +1344,7 @@ impl Overlay {
     /// Returns true if it had to move. Checked every frame (`force` = false) because
     /// Windows may resize the window when it lands on a monitor with a different DPI scale.
     fn cover_desktop(&self, force: bool) -> bool {
-        let Some(hwnd) = self.hwnd else { return false };
-        let m = self.desktop.bounds;
-        unsafe {
-            let mut now: RECT = std::mem::zeroed();
-            let in_place = GetWindowRect(hwnd, &mut now) != 0
-                && (now.left, now.top, now.right, now.bottom) == (m.left, m.top, m.right, m.bottom);
-            if force || !in_place {
-                SetWindowPos(hwnd, HWND_TOPMOST, m.left, m.top, m.right - m.left, m.bottom - m.top, 0);
-            }
-            !in_place
-        }
+        self.native_overlay.is_some_and(|handle| platform::cover_desktop(handle, self.desktop.bounds, force))
     }
 
     /// Done: close. Started from the tray with Reopen last capture on, first hand the
@@ -1539,9 +1352,8 @@ impl Overlay {
     fn leave(&mut self, ctx: &egui::Context) {
         if self.handoff {
             // Gone from the screen at once; the capture is packed up after.
-            if let Some(hwnd) = self.hwnd {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-                unsafe { ShowWindow(hwnd, SW_HIDE) };
+            if let Some(handle) = self.native_overlay {
+                platform::hide_overlay(handle);
             }
             // As it was, without anything half done.
             self.finish_editing();
@@ -2583,10 +2395,7 @@ impl Overlay {
             std::fs::write(path, text)?;
             return Ok(());
         }
-        // Like images: kept out of clipboard history and cloud sync.
-        use arboard::SetExtWindows;
-        arboard::Clipboard::new()?.set().exclude_from_history().exclude_from_cloud().text(text)?;
-        Ok(())
+        platform::copy_text(text)
     }
 
     /// The border and shadow this capture gets.
@@ -3516,8 +3325,8 @@ impl eframe::App for Overlay {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.hwnd.is_none() {
-            self.hwnd = hwnd_of(frame);
+        if self.native_overlay.is_none() {
+            self.native_overlay = platform::overlay_handle(frame);
         }
         if self.cover_desktop(false) {
             ctx.request_repaint(); // check again next frame that the move stuck
@@ -3602,15 +3411,14 @@ impl eframe::App for Overlay {
         if trace_sink().is_some() {
             // Per frame: where egui thinks the pointer is vs. where Windows says it is
             // right now (both in desktop pixels), and where the selection was drawn.
-            let mut real = POINT { x: 0, y: 0 };
-            unsafe { GetCursorPos(&mut real) };
             let b = self.desktop.bounds;
             let seen = hover.map(to_px).unwrap_or(Pos2::new(-1.0, -1.0));
             let sel = self.selection.map_or(Pos2::new(-1.0, -1.0), |s| s.min);
-            let m = STATS.take();
+            let real = platform::trace_pointer().unwrap_or((-1, -1));
+            let m = platform::take_overlay_stats();
             trace(&format!(
                 "frame egui={:.0},{:.0} real={},{} sel={:.0},{:.0} drag={} moves={} fwd={} other={} forced={} slowest=0x{:04x}:{}us paint={}us",
-                seen.x, seen.y, real.x - b.left, real.y - b.top, sel.x, sel.y,
+                seen.x, seen.y, real.0 - b.left, real.1 - b.top, sel.x, sel.y,
                 self.action.is_some() as u8,
                 m.moves, m.moves_forwarded, m.other, m.forced_paints, m.slowest.0, m.slowest.1, m.paint_us
             ));
@@ -4393,7 +4201,7 @@ mod tests {
     fn highlighter_keeps_its_own_colour_and_width() {
         let desktop = Desktop::new(
             vec![RgbaImage::new(4, 4)],
-            RECT { left: 0, top: 0, right: 4, bottom: 4 },
+            DesktopRect { left: 0, top: 0, right: 4, bottom: 4 },
             vec![rect(0.0, 0.0, 4.0, 4.0)],
             0,
             Snap::default(),
@@ -4445,7 +4253,7 @@ mod tests {
     pub(super) fn plain_overlay(w: u32, h: u32, shot: RgbaImage) -> Overlay {
         let desktop = Desktop::new(
             vec![shot],
-            RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+            DesktopRect { left: 0, top: 0, right: w as i32, bottom: h as i32 },
             vec![rect(0.0, 0.0, w as f32, h as f32)],
             0,
             Snap::default(),
@@ -4471,7 +4279,7 @@ mod tests {
     fn an_opened_image_starts_selected_and_saves_beside_itself() {
         let photo = RgbaImage::from_fn(3000, 2000, |x, y| image::Rgba([(x % 251) as u8, (y % 241) as u8, 9, 255]));
         let opened = Opened { stem: Some("receipt".into()), folder: Some(r"C:\photos".into()), format: Some(Format::Jpeg) };
-        let monitor = RECT { left: 1920, top: 0, right: 3840, bottom: 1080 };
+        let monitor = DesktopRect { left: 1920, top: 0, right: 3840, bottom: 1080 };
         let overlay = Overlay::with_desktop(Desktop::open_on(photo.clone(), opened, monitor), None, &Settings::default());
         // The whole image is selected, and copied or saved at its own size.
         assert_eq!(overlay.selection, Some(overlay.desktop.monitors[0]));
@@ -4711,14 +4519,16 @@ mod tests {
         settings.set_tool_enabled("eyedropper", false);
         let desktop = Desktop::new(
             vec![RgbaImage::new(10, 10)],
-            RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            DesktopRect { left: 0, top: 0, right: 10, bottom: 10 },
             vec![rect(0.0, 0.0, 10.0, 10.0)],
             0,
             Snap::default(),
         );
         let overlay = Overlay::with_desktop(desktop, None, &settings);
         let ids: Vec<&str> = overlay.tools.iter().map(|(t, _)| t.id).collect();
-        assert_eq!(ids.len(), TOOLS.len() - 2);
+        // Emoji stamps are deliberately unavailable without Windows' emoji font.
+        let unavailable_emoji = usize::from(!crate::emoji::available());
+        assert_eq!(ids.len(), TOOLS.len() - 2 - unavailable_emoji);
         assert!(!ids.contains(&"blur") && !ids.contains(&"eyedropper") && ids.contains(&"pen"));
         // Every tool but the eyedropper and the readers is one you draw or select with.
         let actions = [Icon::Eyedropper, Icon::ReadText, Icon::ReadQr];
@@ -4729,7 +4539,7 @@ mod tests {
     fn the_toolbar_keeps_its_width_whichever_tool_is_chosen() {
         let desktop = Desktop::new(
             vec![RgbaImage::new(10, 10)],
-            RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            DesktopRect { left: 0, top: 0, right: 10, bottom: 10 },
             vec![rect(0.0, 0.0, 10.0, 10.0)],
             0,
             Snap::default(),
@@ -4771,7 +4581,7 @@ mod tests {
         settings.set_tool_key(&TOOLS[1], Some(Key::K));
         let desktop = Desktop::new(
             vec![RgbaImage::new(10, 10)],
-            RECT { left: 0, top: 0, right: 10, bottom: 10 },
+            DesktopRect { left: 0, top: 0, right: 10, bottom: 10 },
             vec![rect(0.0, 0.0, 10.0, 10.0)],
             0,
             Snap::default(),
@@ -4783,7 +4593,7 @@ mod tests {
         let mut with_region = Overlay::with_desktop(
             Desktop::new(
                 vec![RgbaImage::new(10, 10)],
-                RECT { left: 0, top: 0, right: 10, bottom: 10 },
+                DesktopRect { left: 0, top: 0, right: 10, bottom: 10 },
                 vec![rect(0.0, 0.0, 10.0, 10.0)],
                 0,
                 Snap::default(),
@@ -4938,7 +4748,7 @@ mod tests {
         };
         let desktop = || Desktop::new(
             vec![RgbaImage::new(100, 60)],
-            RECT { left: 0, top: 0, right: 100, bottom: 60 },
+            DesktopRect { left: 0, top: 0, right: 100, bottom: 60 },
             vec![rect(0.0, 0.0, 100.0, 60.0)],
             0,
             Snap::default(),
@@ -4972,7 +4782,7 @@ mod tests {
         settings.frame.border_color = "#FF0000".into();
         let desktop = Desktop::new(
             vec![RgbaImage::from_pixel(100, 60, blue)],
-            RECT { left: 0, top: 0, right: 100, bottom: 60 },
+            DesktopRect { left: 0, top: 0, right: 100, bottom: 60 },
             vec![rect(0.0, 0.0, 100.0, 60.0)],
             0,
             Snap::default(),
@@ -5129,7 +4939,7 @@ mod tests {
         let mut overlay = Overlay::with_desktop(
             Desktop::new(
                 vec![solid([255, 0, 0, 255]), solid([0, 0, 255, 255])],
-                RECT { left: -4, top: 0, right: 4, bottom: 6 },
+                DesktopRect { left: -4, top: 0, right: 4, bottom: 6 },
                 vec![rect(0.0, 0.0, 4.0, 4.0), rect(4.0, 2.0, 8.0, 6.0)],
                 0,
                 Snap::default(),
@@ -5181,7 +4991,7 @@ mod tests {
 mod view_tests {
     use super::*;
 
-    const MONITOR: RECT = RECT { left: 0, top: 0, right: 2560, bottom: 1440 };
+    const MONITOR: DesktopRect = DesktopRect { left: 0, top: 0, right: 2560, bottom: 1440 };
 
     #[test]
     fn small_opened_images_get_a_window_of_their_own() {
@@ -5198,7 +5008,7 @@ mod view_tests {
 
     #[test]
     fn ctrl_wheel_zooms_around_the_pointer_and_ctrl_0_fits() {
-        let monitor = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
+        let monitor = DesktopRect { left: 0, top: 0, right: 1280, bottom: 720 };
         let desktop = Desktop::open_on(RgbaImage::new(4000, 3000), Opened::default(), monitor);
         let mut overlay = Overlay::with_desktop(desktop, None, &Settings::default());
         let screen = Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0));
@@ -5243,7 +5053,12 @@ mod view_tests {
     #[test]
     fn extra_shortcuts_and_keep_minutes_are_checked() {
         let s = Settings::from_toml("clipboard_hotkey = \"Banana+Q\"\nreopen_hotkey = \"Ctrl+F10\"\nkeep_minutes = 999\n");
+        // Linux does not register global shortcuts and must not rewrite a shared
+        // settings file's Windows shortcut values while merely loading it.
+        #[cfg(windows)]
         assert_eq!(s.clipboard_hotkey, "");
+        #[cfg(not(windows))]
+        assert_eq!(s.clipboard_hotkey, "Banana+Q");
         assert_eq!(s.reopen_hotkey, "Ctrl+F10");
         assert_eq!(s.keep_minutes, crate::settings::MAX_KEEP_MINUTES);
         assert_eq!(Settings::default().keep_minutes, 0, "off by default");
